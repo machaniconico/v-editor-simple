@@ -20,14 +20,20 @@ public:
 private slots:
     void openFile();
     void exportVideo();
+    void splitClip();
+    void deleteClip();
     void about();
 
 private:
     void setupMenuBar();
     void setupToolBar();
     void setupUI();
+    void updateEditActions();
 
     VideoPlayer *m_player;
     Timeline *m_timeline;
     QStringList m_supportedFormats;
+
+    QAction *m_splitAction;
+    QAction *m_deleteAction;
 };

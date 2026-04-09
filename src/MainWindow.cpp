@@ -22,8 +22,13 @@ MainWindow::MainWindow(QWidget *parent)
     setupUI();
     setupMenuBar();
     setupToolBar();
+    updateEditActions();
 
     statusBar()->showMessage("Ready");
+
+    connect(m_timeline, &Timeline::clipSelected, this, [this](int) {
+        updateEditActions();
+    });
 }
 
 void MainWindow::setupUI()
@@ -45,10 +50,13 @@ void MainWindow::setupUI()
 
     mainLayout->addWidget(splitter);
     setCentralWidget(centralWidget);
+
+    connect(m_player, &VideoPlayer::positionChanged, m_timeline, &Timeline::setPlayheadPosition);
 }
 
 void MainWindow::setupMenuBar()
 {
+    // File menu
     auto *fileMenu = menuBar()->addMenu("&File");
 
     auto *openAction = fileMenu->addAction("&Open...");
@@ -65,6 +73,18 @@ void MainWindow::setupMenuBar()
     quitAction->setShortcut(QKeySequence::Quit);
     connect(quitAction, &QAction::triggered, qApp, &QApplication::quit);
 
+    // Edit menu
+    auto *editMenu = menuBar()->addMenu("&Edit");
+
+    m_splitAction = editMenu->addAction("&Split at Playhead");
+    m_splitAction->setShortcut(QKeySequence(Qt::Key_S));
+    connect(m_splitAction, &QAction::triggered, this, &MainWindow::splitClip);
+
+    m_deleteAction = editMenu->addAction("&Delete Clip");
+    m_deleteAction->setShortcut(QKeySequence::Delete);
+    connect(m_deleteAction, &QAction::triggered, this, &MainWindow::deleteClip);
+
+    // Help menu
     auto *helpMenu = menuBar()->addMenu("&Help");
     auto *aboutAction = helpMenu->addAction("&About");
     connect(aboutAction, &QAction::triggered, this, &MainWindow::about);
@@ -77,29 +97,57 @@ void MainWindow::setupToolBar()
 
     toolbar->addAction("Open", this, &MainWindow::openFile);
     toolbar->addSeparator();
+    toolbar->addAction("Split", this, &MainWindow::splitClip);
+    toolbar->addAction("Delete", this, &MainWindow::deleteClip);
+    toolbar->addSeparator();
     toolbar->addAction("Export", this, &MainWindow::exportVideo);
+}
+
+void MainWindow::updateEditActions()
+{
+    bool hasSel = m_timeline->hasSelection();
+    m_deleteAction->setEnabled(hasSel);
 }
 
 void MainWindow::openFile()
 {
-    QString filter = "Video Files (" + m_supportedFormats.join(" ").replace("(", "").replace(")", "").replace("MP4 ", "").replace("MKV ", "").replace("MOV ", "").replace("WebM ", "").replace("FLV ", "") + ")";
-    filter = "Video Files (*.mp4 *.mkv *.mov *.webm *.flv);;All Files (*)";
+    QString filter = "Video Files (*.mp4 *.mkv *.mov *.webm *.flv);;All Files (*)";
 
     QString filePath = QFileDialog::getOpenFileName(this, "Open Video", QString(), filter);
     if (!filePath.isEmpty()) {
         m_player->loadFile(filePath);
         m_timeline->addClip(filePath);
         statusBar()->showMessage("Loaded: " + filePath);
+        updateEditActions();
     }
 }
 
 void MainWindow::exportVideo()
 {
-    QString filePath = QFileDialog::getSaveFileName(this, "Export Video", QString(), "MP4 (*.mp4);;MKV (*.mkv);;WebM (*.webm)");
+    QString filePath = QFileDialog::getSaveFileName(this, "Export Video", QString(),
+        "MP4 - H.264 (*.mp4);;"
+        "MKV - H.265 (*.mkv);;"
+        "WebM - VP9 (*.webm);;"
+        "MP4 - AV1 (*.mp4)");
     if (!filePath.isEmpty()) {
         statusBar()->showMessage("Exporting: " + filePath);
         // TODO: Implement export via FFmpeg
     }
+}
+
+void MainWindow::splitClip()
+{
+    m_timeline->splitAtPlayhead();
+    statusBar()->showMessage("Split clip at playhead");
+    updateEditActions();
+}
+
+void MainWindow::deleteClip()
+{
+    if (!m_timeline->hasSelection()) return;
+    m_timeline->deleteSelectedClip();
+    statusBar()->showMessage("Deleted clip");
+    updateEditActions();
 }
 
 void MainWindow::about()
@@ -109,6 +157,10 @@ void MainWindow::about()
                 "A simple yet powerful video editor.\n"
                 "Built with Qt and FFmpeg.\n\n"
                 "Supported codecs: H.264, H.265, AV1\n"
-                "Containers: MP4, MKV, MOV, WebM, FLV")
+                "Containers: MP4, MKV, MOV, WebM, FLV\n\n"
+                "Shortcuts:\n"
+                "  S - Split at playhead\n"
+                "  Delete - Delete selected clip\n"
+                "  Drag clip edges to trim")
             .arg(APP_VERSION));
 }
