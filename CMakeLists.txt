@@ -81,6 +81,8 @@ add_executable(${PROJECT_NAME}
     src/NetworkRender.cpp
     src/RemotionExport.cpp
     src/PythonScript.cpp
+    src/SplashScreen.h
+    src/WelcomeWidget.h
     resources/resources.qrc
 )
 
