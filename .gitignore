@@ -1,0 +1,39 @@
+# Build
+build/
+cmake-build-*/
+out/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln.docstates
+CMakeSettings.json
+CMakeUserPresets.json
+
+# Compiled
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.pdb
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Qt
+*.pro.user
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# Package managers
+vcpkg_installed/

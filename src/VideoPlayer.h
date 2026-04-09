@@ -1,0 +1,53 @@
+#pragma once
+
+#include <QWidget>
+#include <QLabel>
+#include <QPushButton>
+#include <QSlider>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
+
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+}
+
+class VideoPlayer : public QWidget
+{
+    Q_OBJECT
+
+public:
+    explicit VideoPlayer(QWidget *parent = nullptr);
+    ~VideoPlayer();
+
+    void loadFile(const QString &filePath);
+
+public slots:
+    void play();
+    void pause();
+    void stop();
+    void seek(int position);
+
+signals:
+    void positionChanged(int position);
+    void durationChanged(int duration);
+    void stateChanged(bool playing);
+
+private:
+    void setupUI();
+    void updatePlayButton();
+    void displayFrame(const QImage &image);
+
+    QLabel *m_videoDisplay;
+    QPushButton *m_playButton;
+    QPushButton *m_stopButton;
+    QSlider *m_seekBar;
+    QLabel *m_timeLabel;
+
+    AVFormatContext *m_formatCtx = nullptr;
+    AVCodecContext *m_codecCtx = nullptr;
+    int m_videoStreamIndex = -1;
+    bool m_playing = false;
+    int64_t m_duration = 0;
+};
