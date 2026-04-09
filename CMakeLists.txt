@@ -10,14 +10,18 @@ set(CMAKE_AUTOUIC ON)
 # Qt6
 find_package(Qt6 REQUIRED COMPONENTS Widgets Gui Multimedia MultimediaWidgets OpenGL OpenGLWidgets Network)
 
-# FFmpeg via pkg-config
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(AVFORMAT REQUIRED libavformat)
-pkg_check_modules(AVCODEC REQUIRED libavcodec)
-pkg_check_modules(AVUTIL REQUIRED libavutil)
-pkg_check_modules(SWSCALE REQUIRED libswscale)
-pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
-pkg_check_modules(AVFILTER REQUIRED libavfilter)
+# FFmpeg — find headers and libraries (works with vcpkg on all platforms)
+find_path(FFMPEG_INCLUDE_DIR libavformat/avformat.h)
+find_library(AVFORMAT_LIBRARY avformat)
+find_library(AVCODEC_LIBRARY avcodec)
+find_library(AVUTIL_LIBRARY avutil)
+find_library(SWSCALE_LIBRARY swscale)
+find_library(SWRESAMPLE_LIBRARY swresample)
+find_library(AVFILTER_LIBRARY avfilter)
+
+if(NOT AVFORMAT_LIBRARY)
+    message(FATAL_ERROR "FFmpeg not found. Install via: vcpkg install ffmpeg")
+endif()
 
 add_executable(${PROJECT_NAME}
     src/main.cpp
@@ -82,12 +86,7 @@ add_executable(${PROJECT_NAME}
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${AVFORMAT_INCLUDE_DIRS}
-    ${AVCODEC_INCLUDE_DIRS}
-    ${AVUTIL_INCLUDE_DIRS}
-    ${SWSCALE_INCLUDE_DIRS}
-    ${SWRESAMPLE_INCLUDE_DIRS}
-    ${AVFILTER_INCLUDE_DIRS}
+    ${FFMPEG_INCLUDE_DIR}
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -98,12 +97,12 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt6::OpenGL
     Qt6::OpenGLWidgets
     Qt6::Network
-    ${AVFORMAT_LIBRARIES}
-    ${AVCODEC_LIBRARIES}
-    ${AVUTIL_LIBRARIES}
-    ${SWSCALE_LIBRARIES}
-    ${SWRESAMPLE_LIBRARIES}
-    ${AVFILTER_LIBRARIES}
+    ${AVFORMAT_LIBRARY}
+    ${AVCODEC_LIBRARY}
+    ${AVUTIL_LIBRARY}
+    ${SWSCALE_LIBRARY}
+    ${SWRESAMPLE_LIBRARY}
+    ${AVFILTER_LIBRARY}
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
