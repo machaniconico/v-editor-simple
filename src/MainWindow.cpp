@@ -28,14 +28,14 @@ MainWindow::MainWindow(QWidget *parent)
 
     m_exporter = new Exporter(this);
 
+    // Recent files setup (must be before setupMenuBar which uses m_recentFilesManager)
+    setupRecentFiles();
+
     setupUI();
     setupMenuBar();
     setupToolBar();
     updateEditActions();
     updateTitle();
-
-    // Recent files setup
-    setupRecentFiles();
 
     // Shortcut manager - load saved shortcuts
     ShortcutManager::instance().loadShortcuts();
