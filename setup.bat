@@ -166,8 +166,11 @@ echo.
 :: ---- Step 5: Done! ----
 echo [Step 5/5] Locating executable...
 set "EXE_PATH="
-for /r build %%f in (v-editor-simple.exe) do (
-    set "EXE_PATH=%%f"
+:: Check common output locations
+for %%d in (Release RelWithDebInfo Debug MinSizeRel) do (
+    if exist "build\%%d\v-editor-simple.exe" (
+        set "EXE_PATH=%PROJECT_DIR%build\%%d\v-editor-simple.exe"
+    )
 )
 
 echo.
