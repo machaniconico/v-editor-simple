@@ -20,6 +20,7 @@ QVector<CodecOption> CodecDetector::availableVideoEncoders()
         {"AV1 (SVT-AV1)",      "libsvtav1",    false, 5},
         {"AV1 NVENC",          "av1_nvenc",     false, 5},
         {"AV1 QSV",            "av1_qsv",      false, 5},
+        {"AV1 AMF",            "av1_amf",       false, 5},
         {"VP9",                "libvpx-vp9",    false, 4},
     };
 
@@ -73,6 +74,7 @@ QString CodecDetector::bestVideoEncoder(const QString &codecFamily)
     if (codecFamily == "av1") {
         if (isEncoderAvailable("av1_nvenc"))  return "av1_nvenc";
         if (isEncoderAvailable("av1_qsv"))    return "av1_qsv";
+        if (isEncoderAvailable("av1_amf"))    return "av1_amf";
         return "libsvtav1";
     }
     if (codecFamily == "vp9") {
