@@ -34,7 +34,9 @@ void AutoSave::start(const AutoSaveConfig &config)
         m_timer.start(m_config.interval * 1000);
     }
 
-    checkForRecovery();
+    // Defer recovery check to next event loop iteration
+    // (MainWindow must be fully constructed before showing dialogs)
+    QTimer::singleShot(0, this, &AutoSave::checkForRecovery);
 }
 
 void AutoSave::stop()

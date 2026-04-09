@@ -2456,6 +2456,6 @@ void MainWindow::dropEvent(QDropEvent *event)
 void MainWindow::closeEvent(QCloseEvent *event)
 {
     saveWindowState();
-    if (m_autoSave) m_autoSave->stop();
+    if (m_autoSave) m_autoSave->markCleanShutdown();
     QMainWindow::closeEvent(event);
 }
