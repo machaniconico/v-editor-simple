@@ -27,6 +27,7 @@ add_executable(${PROJECT_NAME}
     src/ExportDialog.cpp
     src/Exporter.cpp
     src/CodecDetector.cpp
+    src/UndoManager.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE

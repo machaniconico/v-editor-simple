@@ -26,6 +26,12 @@ private slots:
     void exportVideo();
     void splitClip();
     void deleteClip();
+    void rippleDelete();
+    void copyClip();
+    void pasteClip();
+    void undoAction();
+    void redoAction();
+    void toggleSnap();
     void about();
 
 private:
@@ -43,5 +49,11 @@ private:
 
     QAction *m_splitAction;
     QAction *m_deleteAction;
+    QAction *m_rippleDeleteAction;
+    QAction *m_copyAction;
+    QAction *m_pasteAction;
+    QAction *m_undoAction;
+    QAction *m_redoAction;
+    QAction *m_snapAction;
     Exporter *m_exporter;
 };

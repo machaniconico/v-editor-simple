@@ -2,6 +2,7 @@
 #include "VideoPlayer.h"
 #include "Timeline.h"
 #include "ExportDialog.h"
+#include "UndoManager.h"
 #include <QApplication>
 #include <QMessageBox>
 #include <QVBoxLayout>
@@ -13,11 +14,8 @@ MainWindow::MainWindow(QWidget *parent)
     resize(1280, 720);
 
     m_supportedFormats = {
-        "MP4 (*.mp4)",
-        "MKV (*.mkv)",
-        "MOV (*.mov)",
-        "WebM (*.webm)",
-        "FLV (*.flv)"
+        "MP4 (*.mp4)", "MKV (*.mkv)", "MOV (*.mov)",
+        "WebM (*.webm)", "FLV (*.flv)"
     };
 
     m_exporter = new Exporter(this);
@@ -31,6 +29,9 @@ MainWindow::MainWindow(QWidget *parent)
     statusBar()->showMessage("Ready — Use File > New Project to start");
 
     connect(m_timeline, &Timeline::clipSelected, this, [this](int) {
+        updateEditActions();
+    });
+    connect(m_timeline->undoManager(), &UndoManager::stateChanged, this, [this]() {
         updateEditActions();
     });
 }
@@ -84,6 +85,26 @@ void MainWindow::setupMenuBar()
     // Edit menu
     auto *editMenu = menuBar()->addMenu("&Edit");
 
+    m_undoAction = editMenu->addAction("&Undo");
+    m_undoAction->setShortcut(QKeySequence::Undo);
+    connect(m_undoAction, &QAction::triggered, this, &MainWindow::undoAction);
+
+    m_redoAction = editMenu->addAction("&Redo");
+    m_redoAction->setShortcut(QKeySequence::Redo);
+    connect(m_redoAction, &QAction::triggered, this, &MainWindow::redoAction);
+
+    editMenu->addSeparator();
+
+    m_copyAction = editMenu->addAction("&Copy Clip");
+    m_copyAction->setShortcut(QKeySequence::Copy);
+    connect(m_copyAction, &QAction::triggered, this, &MainWindow::copyClip);
+
+    m_pasteAction = editMenu->addAction("&Paste Clip");
+    m_pasteAction->setShortcut(QKeySequence::Paste);
+    connect(m_pasteAction, &QAction::triggered, this, &MainWindow::pasteClip);
+
+    editMenu->addSeparator();
+
     m_splitAction = editMenu->addAction("&Split at Playhead");
     m_splitAction->setShortcut(QKeySequence(Qt::Key_S));
     connect(m_splitAction, &QAction::triggered, this, &MainWindow::splitClip);
@@ -91,6 +112,18 @@ void MainWindow::setupMenuBar()
     m_deleteAction = editMenu->addAction("&Delete Clip");
     m_deleteAction->setShortcut(QKeySequence::Delete);
     connect(m_deleteAction, &QAction::triggered, this, &MainWindow::deleteClip);
+
+    m_rippleDeleteAction = editMenu->addAction("&Ripple Delete");
+    m_rippleDeleteAction->setShortcut(QKeySequence(Qt::SHIFT | Qt::Key_Delete));
+    connect(m_rippleDeleteAction, &QAction::triggered, this, &MainWindow::rippleDelete);
+
+    editMenu->addSeparator();
+
+    m_snapAction = editMenu->addAction("Toggle S&nap");
+    m_snapAction->setShortcut(QKeySequence(Qt::Key_N));
+    m_snapAction->setCheckable(true);
+    m_snapAction->setChecked(true);
+    connect(m_snapAction, &QAction::triggered, this, &MainWindow::toggleSnap);
 
     // Help menu
     auto *helpMenu = menuBar()->addMenu("&Help");
@@ -106,8 +139,13 @@ void MainWindow::setupToolBar()
     toolbar->addAction("New", this, &MainWindow::newProject);
     toolbar->addAction("Open", this, &MainWindow::openFile);
     toolbar->addSeparator();
+    toolbar->addAction("Undo", this, &MainWindow::undoAction);
+    toolbar->addAction("Redo", this, &MainWindow::redoAction);
+    toolbar->addSeparator();
     toolbar->addAction("Split", this, &MainWindow::splitClip);
     toolbar->addAction("Delete", this, &MainWindow::deleteClip);
+    toolbar->addAction("Copy", this, &MainWindow::copyClip);
+    toolbar->addAction("Paste", this, &MainWindow::pasteClip);
     toolbar->addSeparator();
     toolbar->addAction("Export", this, &MainWindow::exportVideo);
 }
@@ -116,6 +154,11 @@ void MainWindow::updateEditActions()
 {
     bool hasSel = m_timeline->hasSelection();
     m_deleteAction->setEnabled(hasSel);
+    m_rippleDeleteAction->setEnabled(hasSel);
+    m_copyAction->setEnabled(hasSel);
+    m_pasteAction->setEnabled(m_timeline->hasClipboard());
+    m_undoAction->setEnabled(m_timeline->canUndo());
+    m_redoAction->setEnabled(m_timeline->canRedo());
 }
 
 void MainWindow::updateTitle()
@@ -132,23 +175,19 @@ void MainWindow::applyProjectConfig(const ProjectConfig &config)
     m_player->setCanvasSize(config.width, config.height);
     updateTitle();
     statusBar()->showMessage(QString("Project: %1 — %2 %3fps")
-        .arg(config.name)
-        .arg(config.resolutionLabel())
-        .arg(config.fps));
+        .arg(config.name).arg(config.resolutionLabel()).arg(config.fps));
 }
 
 void MainWindow::newProject()
 {
     ProjectSettingsDialog dialog(this);
-    if (dialog.exec() == QDialog::Accepted) {
+    if (dialog.exec() == QDialog::Accepted)
         applyProjectConfig(dialog.config());
-    }
 }
 
 void MainWindow::openFile()
 {
     QString filter = "Video Files (*.mp4 *.mkv *.mov *.webm *.flv);;All Files (*)";
-
     QString filePath = QFileDialog::getOpenFileName(this, "Open Video", QString(), filter);
     if (!filePath.isEmpty()) {
         m_player->loadFile(filePath);
@@ -205,22 +244,64 @@ void MainWindow::deleteClip()
     updateEditActions();
 }
 
+void MainWindow::rippleDelete()
+{
+    if (!m_timeline->hasSelection()) return;
+    m_timeline->rippleDeleteSelectedClip();
+    statusBar()->showMessage("Ripple deleted clip");
+    updateEditActions();
+}
+
+void MainWindow::copyClip()
+{
+    m_timeline->copySelectedClip();
+    statusBar()->showMessage("Copied clip to clipboard");
+    updateEditActions();
+}
+
+void MainWindow::pasteClip()
+{
+    m_timeline->pasteClip();
+    statusBar()->showMessage("Pasted clip");
+    updateEditActions();
+}
+
+void MainWindow::undoAction()
+{
+    m_timeline->undo();
+    statusBar()->showMessage("Undo");
+    updateEditActions();
+}
+
+void MainWindow::redoAction()
+{
+    m_timeline->redo();
+    statusBar()->showMessage("Redo");
+    updateEditActions();
+}
+
+void MainWindow::toggleSnap()
+{
+    bool snap = !m_timeline->snapEnabled();
+    m_timeline->setSnapEnabled(snap);
+    m_snapAction->setChecked(snap);
+    statusBar()->showMessage(snap ? "Snap enabled" : "Snap disabled");
+}
+
 void MainWindow::about()
 {
     QMessageBox::about(this, "About V Editor Simple",
         QString("V Editor Simple v%1\n\n"
                 "A simple yet powerful video editor.\n"
                 "Built with Qt and FFmpeg.\n\n"
-                "Supported codecs: H.264, H.265, AV1\n"
-                "Containers: MP4, MKV, MOV, WebM, FLV\n\n"
-                "Export presets:\n"
-                "  YouTube, YouTube Shorts, TikTok/Reels,\n"
-                "  X/Twitter, Facebook, Twitch, Discord,\n"
-                "  Niconico, Instagram Square\n\n"
                 "Shortcuts:\n"
-                "  Ctrl+N - New project\n"
-                "  S - Split at playhead\n"
-                "  Delete - Delete selected clip\n"
-                "  Drag clip edges to trim")
+                "  Ctrl+Z / Ctrl+Y — Undo / Redo\n"
+                "  Ctrl+C / Ctrl+V — Copy / Paste clip\n"
+                "  S — Split at playhead\n"
+                "  Delete — Delete clip\n"
+                "  Shift+Delete — Ripple delete\n"
+                "  N — Toggle snap\n"
+                "  Drag clip — Reorder\n"
+                "  Drag edges — Trim")
             .arg(APP_VERSION));
 }
