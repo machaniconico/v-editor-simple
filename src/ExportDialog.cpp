@@ -1,10 +1,12 @@
 #include "ExportDialog.h"
+#include "CodecDetector.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QDialogButtonBox>
 #include <QFileDialog>
+#include <QStandardItemModel>
 
 QString ExportConfig::codecDisplayName() const
 {
@@ -64,16 +66,42 @@ void ExportDialog::setupUI()
     auto *codecForm = new QFormLayout(codecGroup);
 
     m_videoCodecCombo = new QComboBox(this);
-    m_videoCodecCombo->addItem("H.264 (libx264)", "libx264");
-    m_videoCodecCombo->addItem("H.265 / HEVC (libx265)", "libx265");
-    m_videoCodecCombo->addItem("AV1 (libsvtav1)", "libsvtav1");
-    m_videoCodecCombo->addItem("VP9 (libvpx-vp9)", "libvpx-vp9");
+    {
+        auto videoEncoders = CodecDetector::availableVideoEncoders();
+        for (const auto &enc : videoEncoders) {
+            QString stars = QString("★").repeated(enc.quality) + QString("☆").repeated(5 - enc.quality);
+            QString label = enc.available
+                ? QString("%1 %2").arg(enc.name, stars)
+                : QString("%1 (not found)").arg(enc.name);
+            m_videoCodecCombo->addItem(label, enc.ffmpegName);
+            if (!enc.available) {
+                auto *model = qobject_cast<QStandardItemModel*>(m_videoCodecCombo->model());
+                if (model) model->item(m_videoCodecCombo->count() - 1)->setEnabled(false);
+            }
+        }
+    }
     codecForm->addRow("Video Codec:", m_videoCodecCombo);
 
     m_audioCodecCombo = new QComboBox(this);
-    m_audioCodecCombo->addItem("AAC", "aac");
-    m_audioCodecCombo->addItem("Opus", "libopus");
-    m_audioCodecCombo->addItem("MP3", "libmp3lame");
+    {
+        auto audioEncoders = CodecDetector::availableAudioEncoders();
+        QString bestAAC = CodecDetector::bestAACEncoder();
+        int bestIdx = 0;
+        for (int i = 0; i < audioEncoders.size(); ++i) {
+            const auto &enc = audioEncoders[i];
+            QString stars = QString("★").repeated(enc.quality) + QString("☆").repeated(5 - enc.quality);
+            QString label = enc.available
+                ? QString("%1 %2").arg(enc.name, stars)
+                : QString("%1 (not found)").arg(enc.name);
+            m_audioCodecCombo->addItem(label, enc.ffmpegName);
+            if (!enc.available) {
+                auto *model = qobject_cast<QStandardItemModel*>(m_audioCodecCombo->model());
+                if (model) model->item(m_audioCodecCombo->count() - 1)->setEnabled(false);
+            }
+            if (enc.ffmpegName == bestAAC) bestIdx = i;
+        }
+        m_audioCodecCombo->setCurrentIndex(bestIdx);
+    }
     codecForm->addRow("Audio Codec:", m_audioCodecCombo);
 
     m_videoBitrateSpin = new QSpinBox(this);

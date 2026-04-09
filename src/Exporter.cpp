@@ -1,4 +1,5 @@
 #include "Exporter.h"
+#include "CodecDetector.h"
 #include <QFileInfo>
 
 Exporter::Exporter(QObject *parent)
@@ -89,16 +90,31 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
         return;
     }
 
-    // Find encoder
-    const AVCodec *encoder = avcodec_find_encoder_by_name(config.videoCodec.toUtf8().constData());
+    // Find encoder — use best available if requested isn't found
+    QString resolvedCodec = config.videoCodec;
+    const AVCodec *encoder = avcodec_find_encoder_by_name(resolvedCodec.toUtf8().constData());
     if (!encoder) {
-        // Fallback to libx264
-        encoder = avcodec_find_encoder_by_name("libx264");
+        // Auto-detect best encoder for this codec family
+        if (resolvedCodec.contains("264")) resolvedCodec = CodecDetector::bestVideoEncoder("h264");
+        else if (resolvedCodec.contains("265") || resolvedCodec.contains("hevc")) resolvedCodec = CodecDetector::bestVideoEncoder("h265");
+        else if (resolvedCodec.contains("av1")) resolvedCodec = CodecDetector::bestVideoEncoder("av1");
+        else if (resolvedCodec.contains("vp9")) resolvedCodec = CodecDetector::bestVideoEncoder("vp9");
+        else resolvedCodec = "libx264";
+        encoder = avcodec_find_encoder_by_name(resolvedCodec.toUtf8().constData());
     }
     if (!encoder) {
         avformat_free_context(outFmt);
         emit exportFinished(false, "Video encoder not found");
         return;
+    }
+
+    // Resolve audio encoder — auto-detect best AAC if needed
+    QString resolvedAudioCodec = config.audioCodec;
+    if (resolvedAudioCodec == "aac" || resolvedAudioCodec.isEmpty()) {
+        resolvedAudioCodec = CodecDetector::bestAACEncoder();
+    }
+    if (!CodecDetector::isEncoderAvailable(resolvedAudioCodec)) {
+        resolvedAudioCodec = "aac"; // final fallback
     }
 
     // Create output stream
