@@ -12,6 +12,11 @@
 #include "AutoEdit.h"
 #include "ThemeManager.h"
 #include "MultiCam.h"
+#include "MotionTracker.h"
+#include "NoiseReduction.h"
+#include "SubtitleGenerator.h"
+#include "EffectPreset.h"
+#include "ResourceGuide.h"
 
 class VideoPlayer;
 class Timeline;
@@ -67,6 +72,14 @@ private slots:
     void changeTheme();
     void multiCamSetup();
     void multiCamSwitch();
+    void motionTrackSetup();
+    void audioNoiseDenoise();
+    void videoNoiseDenoise();
+    void generateSubtitles();
+    void applyEffectPreset();
+    void saveEffectPreset();
+    void manageEffectPresets();
+    void showResourceGuide();
     void about();
 
 private:
@@ -93,4 +106,7 @@ private:
     Exporter *m_exporter;
     QString m_projectFilePath; // current .veditor file
     MultiCamSession *m_multiCam = nullptr;
+    MotionTracker *m_motionTracker = nullptr;
+    NoiseReduction *m_noiseReduction = nullptr;
+    SubtitleGenerator *m_subtitleGen = nullptr;
 };

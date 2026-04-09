@@ -17,6 +17,7 @@ pkg_check_modules(AVCODEC REQUIRED libavcodec)
 pkg_check_modules(AVUTIL REQUIRED libavutil)
 pkg_check_modules(SWSCALE REQUIRED libswscale)
 pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
+pkg_check_modules(AVFILTER REQUIRED libavfilter)
 
 add_executable(${PROJECT_NAME}
     src/main.cpp
@@ -42,6 +43,11 @@ add_executable(${PROJECT_NAME}
     src/MultiCam.cpp
     src/TextManager.cpp
     src/TextInteractive.cpp
+    src/EffectPreset.cpp
+    src/SubtitleGenerator.cpp
+    src/MotionTracker.cpp
+    src/NoiseReduction.cpp
+    src/ResourceGuide.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -51,6 +57,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${AVUTIL_INCLUDE_DIRS}
     ${SWSCALE_INCLUDE_DIRS}
     ${SWRESAMPLE_INCLUDE_DIRS}
+    ${AVFILTER_INCLUDE_DIRS}
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -64,6 +71,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     ${AVUTIL_LIBRARIES}
     ${SWSCALE_LIBRARIES}
     ${SWRESAMPLE_LIBRARIES}
+    ${AVFILTER_LIBRARIES}
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE

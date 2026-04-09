@@ -246,6 +246,18 @@ void MainWindow::setupMenuBar()
 
     effectsMenu->addSeparator();
 
+    auto *applyPresetAction = effectsMenu->addAction("Apply Effect &Preset...");
+    applyPresetAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_P));
+    connect(applyPresetAction, &QAction::triggered, this, &MainWindow::applyEffectPreset);
+
+    auto *savePresetAction = effectsMenu->addAction("&Save Current as Preset...");
+    connect(savePresetAction, &QAction::triggered, this, &MainWindow::saveEffectPreset);
+
+    auto *managePresetsAction = effectsMenu->addAction("&Manage Presets...");
+    connect(managePresetsAction, &QAction::triggered, this, &MainWindow::manageEffectPresets);
+
+    effectsMenu->addSeparator();
+
     auto *kfAction = effectsMenu->addAction("Edit &Keyframes...");
     kfAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_K));
     connect(kfAction, &QAction::triggered, this, &MainWindow::editKeyframes);
@@ -280,6 +292,24 @@ void MainWindow::setupMenuBar()
 
     toolsMenu->addSeparator();
 
+    auto *motionTrackAction = toolsMenu->addAction("&Motion Tracking...");
+    connect(motionTrackAction, &QAction::triggered, this, &MainWindow::motionTrackSetup);
+
+    toolsMenu->addSeparator();
+
+    auto *audioDenoiseAction = toolsMenu->addAction("Audio &Noise Reduction...");
+    connect(audioDenoiseAction, &QAction::triggered, this, &MainWindow::audioNoiseDenoise);
+
+    auto *videoDenoiseAction = toolsMenu->addAction("&Video Denoise...");
+    connect(videoDenoiseAction, &QAction::triggered, this, &MainWindow::videoNoiseDenoise);
+
+    toolsMenu->addSeparator();
+
+    auto *subtitleGenAction = toolsMenu->addAction("Auto-Generate &Subtitles (Whisper)...");
+    connect(subtitleGenAction, &QAction::triggered, this, &MainWindow::generateSubtitles);
+
+    toolsMenu->addSeparator();
+
     auto *multiCamSetupAction = toolsMenu->addAction("&Multi-Camera Setup...");
     connect(multiCamSetupAction, &QAction::triggered, this, &MainWindow::multiCamSetup);
 
@@ -292,6 +322,13 @@ void MainWindow::setupMenuBar()
 
     // Help menu
     auto *helpMenu = menuBar()->addMenu("&Help");
+
+    auto *resourceGuideAction = helpMenu->addAction("Free &Resource Guide...");
+    resourceGuideAction->setShortcut(QKeySequence(Qt::Key_F1));
+    connect(resourceGuideAction, &QAction::triggered, this, &MainWindow::showResourceGuide);
+
+    helpMenu->addSeparator();
+
     auto *aboutAction = helpMenu->addAction("&About");
     connect(aboutAction, &QAction::triggered, this, &MainWindow::about);
 }
@@ -987,6 +1024,308 @@ void MainWindow::multiCamSwitch()
     m_multiCam->switchToCamera(idx, m_timeline->playheadPosition());
     statusBar()->showMessage(QString("Switched to %1 at %2s")
         .arg(selected).arg(m_timeline->playheadPosition(), 0, 'f', 1));
+}
+
+void MainWindow::motionTrackSetup()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Motion Tracking", "Select a clip first.");
+        return;
+    }
+
+    const auto &clips = m_timeline->videoClips();
+    if (clips.isEmpty()) return;
+
+    // Let user define tracking region
+    bool ok;
+    int x = QInputDialog::getInt(this, "Motion Tracking", "Region X:", 100, 0, 9999, 1, &ok);
+    if (!ok) return;
+    int y = QInputDialog::getInt(this, "Motion Tracking", "Region Y:", 100, 0, 9999, 1, &ok);
+    if (!ok) return;
+    int w = QInputDialog::getInt(this, "Motion Tracking", "Region Width:", 64, 16, 512, 1, &ok);
+    if (!ok) return;
+    int h = QInputDialog::getInt(this, "Motion Tracking", "Region Height:", 64, 16, 512, 1, &ok);
+    if (!ok) return;
+
+    if (!m_motionTracker)
+        m_motionTracker = new MotionTracker(this);
+
+    connect(m_motionTracker, &MotionTracker::progressChanged, this, [this](int pct) {
+        statusBar()->showMessage(QString("Tracking... %1%").arg(pct));
+    }, Qt::UniqueConnection);
+
+    connect(m_motionTracker, &MotionTracker::trackingComplete, this, [this](const TrackingResult &result) {
+        statusBar()->showMessage(QString("Tracking complete: %1 frames tracked")
+            .arg(result.regions.size()));
+        QMessageBox::information(this, "Motion Tracking",
+            QString("Tracked %1 frames.\n\nUse Effects > Apply to Overlay to attach an overlay to the tracked path.")
+                .arg(result.regions.size()));
+    }, Qt::UniqueConnection);
+
+    QRect region(x, y, w, h);
+    m_motionTracker->startTracking(clips.first().filePath, region);
+    statusBar()->showMessage("Starting motion tracking...");
+}
+
+void MainWindow::audioNoiseDenoise()
+{
+    if (m_timeline->videoClips().isEmpty()) {
+        QMessageBox::information(this, "Audio Denoise", "Add clips first.");
+        return;
+    }
+
+    const auto &clip = m_timeline->videoClips().first();
+
+    bool ok;
+    double reduction = QInputDialog::getDouble(this, "Audio Noise Reduction",
+        "Noise reduction amount (0.0 = none, 1.0 = max):", 0.5, 0.0, 1.0, 2, &ok);
+    if (!ok) return;
+
+    double noiseFloor = QInputDialog::getDouble(this, "Audio Noise Reduction",
+        "Noise floor (dB, -80 to 0):", -40.0, -80.0, 0.0, 0, &ok);
+    if (!ok) return;
+
+    QString outputPath = QFileDialog::getSaveFileName(this, "Save Denoised Audio",
+        QFileInfo(clip.filePath).baseName() + "_denoised.wav",
+        "Audio Files (*.wav *.mp3 *.aac);;All Files (*)");
+    if (outputPath.isEmpty()) return;
+
+    if (!m_noiseReduction)
+        m_noiseReduction = new NoiseReduction(this);
+
+    AudioDenoiseConfig config;
+    config.reductionAmount = reduction;
+    config.noiseFloor = noiseFloor;
+
+    connect(m_noiseReduction, &NoiseReduction::progressChanged, this, [this](int pct) {
+        statusBar()->showMessage(QString("Denoising audio... %1%").arg(pct));
+    }, Qt::UniqueConnection);
+
+    connect(m_noiseReduction, &NoiseReduction::denoiseComplete, this, [this](bool success, const QString &msg) {
+        if (success)
+            statusBar()->showMessage("Audio denoise complete: " + msg);
+        else
+            QMessageBox::warning(this, "Audio Denoise Failed", msg);
+    }, Qt::UniqueConnection);
+
+    m_noiseReduction->denoiseAudio(clip.filePath, outputPath, config);
+    statusBar()->showMessage("Denoising audio...");
+}
+
+void MainWindow::videoNoiseDenoise()
+{
+    if (m_timeline->videoClips().isEmpty()) {
+        QMessageBox::information(this, "Video Denoise", "Add clips first.");
+        return;
+    }
+
+    const auto &clip = m_timeline->videoClips().first();
+
+    QStringList methods = {"HQDN3D (Fast)", "NLMeans (High Quality)"};
+    bool ok;
+    QString method = QInputDialog::getItem(this, "Video Denoise",
+        "Denoise method:", methods, 0, false, &ok);
+    if (!ok) return;
+
+    double spatial = QInputDialog::getDouble(this, "Video Denoise",
+        "Spatial strength (0-30):", 4.0, 0.0, 30.0, 1, &ok);
+    if (!ok) return;
+
+    double temporal = QInputDialog::getDouble(this, "Video Denoise",
+        "Temporal strength (0-30):", 6.0, 0.0, 30.0, 1, &ok);
+    if (!ok) return;
+
+    QString outputPath = QFileDialog::getSaveFileName(this, "Save Denoised Video",
+        QFileInfo(clip.filePath).baseName() + "_denoised.mp4",
+        "Video Files (*.mp4 *.mkv *.mov);;All Files (*)");
+    if (outputPath.isEmpty()) return;
+
+    if (!m_noiseReduction)
+        m_noiseReduction = new NoiseReduction(this);
+
+    VideoDenoiseConfig config;
+    config.spatialStrength = spatial;
+    config.temporalStrength = temporal;
+    config.method = method.startsWith("NLMeans") ? VideoDenoiseMethod::NLMeans : VideoDenoiseMethod::HQDN3D;
+
+    connect(m_noiseReduction, &NoiseReduction::progressChanged, this, [this](int pct) {
+        statusBar()->showMessage(QString("Denoising video... %1%").arg(pct));
+    }, Qt::UniqueConnection);
+
+    connect(m_noiseReduction, &NoiseReduction::denoiseComplete, this, [this](bool success, const QString &msg) {
+        if (success)
+            statusBar()->showMessage("Video denoise complete: " + msg);
+        else
+            QMessageBox::warning(this, "Video Denoise Failed", msg);
+    }, Qt::UniqueConnection);
+
+    m_noiseReduction->denoiseVideo(clip.filePath, outputPath, config);
+    statusBar()->showMessage("Denoising video...");
+}
+
+void MainWindow::generateSubtitles()
+{
+    if (m_timeline->videoClips().isEmpty()) {
+        QMessageBox::information(this, "Subtitle Generation", "Add clips first.");
+        return;
+    }
+
+    if (!SubtitleGenerator::isWhisperAvailable()) {
+        QMessageBox::warning(this, "Whisper Not Found",
+            "Whisper is not installed.\n\n"
+            "Install with: pip install openai-whisper\n"
+            "Or build whisper.cpp from source.");
+        return;
+    }
+
+    const auto &clip = m_timeline->videoClips().first();
+
+    QStringList languages = {"auto", "ja", "en", "zh", "ko", "fr", "de", "es", "it", "pt", "ru"};
+    bool ok;
+    QString lang = QInputDialog::getItem(this, "Subtitle Generation",
+        "Language (auto = auto-detect):", languages, 0, false, &ok);
+    if (!ok) return;
+
+    if (!m_subtitleGen)
+        m_subtitleGen = new SubtitleGenerator(this);
+
+    WhisperConfig config;
+    config.language = lang;
+
+    connect(m_subtitleGen, &SubtitleGenerator::progressChanged, this, [this](int pct) {
+        statusBar()->showMessage(QString("Generating subtitles... %1%").arg(pct));
+    }, Qt::UniqueConnection);
+
+    connect(m_subtitleGen, &SubtitleGenerator::generationComplete, this, [this](const QVector<SubtitleSegment> &segments) {
+        statusBar()->showMessage(QString("Generated %1 subtitle segment(s)").arg(segments.size()));
+
+        if (segments.isEmpty()) {
+            QMessageBox::information(this, "Subtitles", "No speech detected.");
+            return;
+        }
+
+        // Ask to export
+        QStringList options = {"Apply to clip as text overlays", "Export as SRT file", "Export as VTT file"};
+        bool ok2;
+        QString choice = QInputDialog::getItem(this, "Subtitles Generated",
+            QString("%1 segments found. What to do?").arg(segments.size()),
+            options, 0, false, &ok2);
+        if (!ok2) return;
+
+        if (choice.startsWith("Apply")) {
+            auto overlays = m_subtitleGen->toTextOverlays(segments);
+            auto clips = m_timeline->videoClips();
+            if (!clips.isEmpty()) {
+                for (const auto &o : overlays)
+                    clips[0].textManager.addOverlay(o);
+            }
+            statusBar()->showMessage(QString("Applied %1 subtitle overlay(s)").arg(overlays.size()));
+        } else {
+            QString ext = choice.contains("SRT") ? "srt" : "vtt";
+            QString filter = choice.contains("SRT") ? "SRT (*.srt)" : "WebVTT (*.vtt)";
+            QString path = QFileDialog::getSaveFileName(this, "Export Subtitles",
+                QString("subtitles.%1").arg(ext), filter);
+            if (!path.isEmpty()) {
+                bool exported = ext == "srt" ?
+                    SubtitleGenerator::exportSRT(segments, path) :
+                    SubtitleGenerator::exportVTT(segments, path);
+                if (exported)
+                    statusBar()->showMessage("Exported: " + path);
+                else
+                    QMessageBox::warning(this, "Export Failed", "Could not write subtitle file.");
+            }
+        }
+    }, Qt::UniqueConnection);
+
+    connect(m_subtitleGen, &SubtitleGenerator::errorOccurred, this, [this](const QString &error) {
+        QMessageBox::warning(this, "Subtitle Generation Failed", error);
+    }, Qt::UniqueConnection);
+
+    m_subtitleGen->generate(clip.filePath, config);
+    statusBar()->showMessage("Extracting audio and generating subtitles...");
+}
+
+void MainWindow::applyEffectPreset()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Effect Preset", "Select a clip first.");
+        return;
+    }
+
+    auto &library = PresetLibrary::instance();
+    QStringList presetNames;
+    for (const auto &p : library.allPresets())
+        presetNames << QString("%1 [%2]").arg(p.name, p.category);
+
+    if (presetNames.isEmpty()) {
+        QMessageBox::information(this, "Effect Preset", "No presets available.");
+        return;
+    }
+
+    bool ok;
+    QString selected = QInputDialog::getItem(this, "Apply Effect Preset",
+        "Select preset:", presetNames, 0, false, &ok);
+    if (!ok) return;
+
+    // Extract name before the bracket
+    QString name = selected.left(selected.lastIndexOf(" ["));
+    auto result = library.applyPreset(name);
+
+    m_timeline->setClipColorCorrection(result.first);
+    m_timeline->setClipEffects(result.second);
+    m_player->setColorCorrection(result.first);
+
+    statusBar()->showMessage(QString("Applied preset: %1 (%2 effect(s))")
+        .arg(name).arg(result.second.size()));
+}
+
+void MainWindow::saveEffectPreset()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Save Preset", "Select a clip first.");
+        return;
+    }
+
+    bool ok;
+    QString name = QInputDialog::getText(this, "Save Effect Preset",
+        "Preset name:", QLineEdit::Normal, "My Preset", &ok);
+    if (!ok || name.isEmpty()) return;
+
+    QString category = QInputDialog::getText(this, "Save Effect Preset",
+        "Category:", QLineEdit::Normal, "Custom", &ok);
+    if (!ok) return;
+
+    EffectPreset preset;
+    preset.name = name;
+    preset.category = category;
+    preset.colorCorrection = m_timeline->clipColorCorrection();
+    preset.effects = m_timeline->clipEffects();
+
+    PresetLibrary::instance().addPreset(preset);
+    PresetLibrary::instance().saveLibrary();
+    statusBar()->showMessage(QString("Saved preset: %1").arg(name));
+}
+
+void MainWindow::manageEffectPresets()
+{
+    auto &library = PresetLibrary::instance();
+    auto presets = library.allPresets();
+
+    QString info = QString("Effect Presets (%1 total):\n\n").arg(presets.size());
+    for (const auto &p : presets) {
+        info += QString("• %1 [%2]%3\n")
+            .arg(p.name, p.category)
+            .arg(p.isBuiltIn ? " (built-in)" : "");
+    }
+    info += "\nUse Effects > Apply Preset to use, or Save Current as Preset to create new ones.";
+
+    QMessageBox::information(this, "Manage Presets", info);
+}
+
+void MainWindow::showResourceGuide()
+{
+    ResourceGuideDialog dialog(this);
+    dialog.exec();
 }
 
 void MainWindow::about()
