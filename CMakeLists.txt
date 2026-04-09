@@ -46,6 +46,7 @@ add_executable(${PROJECT_NAME}
     src/EffectPreset.cpp
     src/SubtitleGenerator.cpp
     src/MotionTracker.cpp
+    src/TrackerLink.cpp
     src/NoiseReduction.cpp
     src/ResourceGuide.cpp
     src/AutoSave.cpp
@@ -58,6 +59,17 @@ add_executable(${PROJECT_NAME}
     src/AudioEQ.cpp
     src/ScreenRecorder.cpp
     src/AIHighlight.cpp
+    src/LayerCompositor.cpp
+    src/TransformAnimator.cpp
+    src/MaskSystem.cpp
+    src/ParticleSystem.cpp
+    src/TextAnimator.cpp
+    src/ShapeLayer.cpp
+    src/Camera3D.cpp
+    src/Expression.cpp
+    src/Precompose.cpp
+    src/Rotoscope.cpp
+    src/WarpDistortion.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE

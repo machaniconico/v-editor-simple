@@ -413,6 +413,37 @@ void MainWindow::setupMenuBar()
     auto *multiCamSwitchAction = toolsMenu->addAction("Multi-Camera S&witch...");
     connect(multiCamSwitchAction, &QAction::triggered, this, &MainWindow::multiCamSwitch);
 
+    // Composition menu (AE-like features)
+    auto *compMenu = menuBar()->addMenu("&Composition");
+
+    auto *addShapeAction = compMenu->addAction("Add &Shape Layer...");
+    connect(addShapeAction, &QAction::triggered, this, &MainWindow::addShapeLayer);
+
+    auto *addParticleAction = compMenu->addAction("Add &Particle Effect...");
+    connect(addParticleAction, &QAction::triggered, this, &MainWindow::addParticleEffect);
+
+    auto *textAnimAction = compMenu->addAction("Add &Text Animation...");
+    connect(textAnimAction, &QAction::triggered, this, &MainWindow::addTextAnimation);
+
+    compMenu->addSeparator();
+
+    auto *transformKfAction = compMenu->addAction("Edit T&ransform Keyframes...");
+    connect(transformKfAction, &QAction::triggered, this, &MainWindow::editTransformKeyframes);
+
+    auto *maskAction = compMenu->addAction("Add &Mask...");
+    connect(maskAction, &QAction::triggered, this, &MainWindow::addMask);
+
+    auto *warpAction = compMenu->addAction("Apply &Warp / Distortion...");
+    connect(warpAction, &QAction::triggered, this, &MainWindow::applyWarpEffect);
+
+    compMenu->addSeparator();
+
+    auto *exprAction = compMenu->addAction("&Expressions...");
+    connect(exprAction, &QAction::triggered, this, &MainWindow::editExpressions);
+
+    auto *precompAction = compMenu->addAction("Pre-&Compose Selected...");
+    connect(precompAction, &QAction::triggered, this, &MainWindow::precomposeSelected);
+
     // View menu - add theme submenu
     auto *themeAction = viewMenu->addAction("Change &Theme...");
     connect(themeAction, &QAction::triggered, this, &MainWindow::changeTheme);
@@ -1847,6 +1878,187 @@ void MainWindow::analyzeHighlights()
 
     m_aiHighlight->analyze(clip.filePath, config);
     statusBar()->showMessage("Analyzing video for highlights...");
+}
+
+void MainWindow::addShapeLayer()
+{
+    QStringList shapes = {"Rectangle", "Rounded Rectangle", "Ellipse", "Polygon", "Star", "Line", "Arrow"};
+    bool ok;
+    QString selected = QInputDialog::getItem(this, "Add Shape Layer",
+        "Shape type:", shapes, 0, false, &ok);
+    if (!ok) return;
+
+    ShapeLayer shapeLayer;
+    ShapeFill fill;
+    fill.color = QColor(65, 105, 225); // Royal blue
+    fill.enabled = true;
+    ShapeStroke stroke;
+    stroke.color = Qt::white;
+    stroke.width = 2.0;
+    stroke.enabled = true;
+
+    if (selected == "Star") {
+        shapeLayer.addShape(ShapeLayer::createStar(5, 80, 40, fill, stroke));
+    } else if (selected == "Ellipse") {
+        shapeLayer.addShape(ShapeLayer::createCircle(60, fill, stroke));
+    } else {
+        shapeLayer.addShape(ShapeLayer::createRectangle(QSizeF(200, 120), fill, stroke));
+    }
+
+    statusBar()->showMessage(QString("Added shape layer: %1").arg(selected));
+}
+
+void MainWindow::addParticleEffect()
+{
+    auto presets = ParticleSystem::presetConfigs();
+    QStringList presetNames;
+    for (const auto &p : presets)
+        presetNames << p.first;
+
+    bool ok;
+    QString selected = QInputDialog::getItem(this, "Add Particle Effect",
+        "Particle preset:", presetNames, 0, false, &ok);
+    if (!ok) return;
+
+    for (const auto &p : presets) {
+        if (p.first == selected) {
+            ParticleSystem ps;
+            ps.setConfig(p.second);
+            statusBar()->showMessage(QString("Added particle effect: %1").arg(selected));
+            break;
+        }
+    }
+}
+
+void MainWindow::addTextAnimation()
+{
+    bool ok;
+    QString text = QInputDialog::getText(this, "Text Animation",
+        "Text to animate:", QLineEdit::Normal, "Hello!", &ok);
+    if (!ok || text.isEmpty()) return;
+
+    auto presets = TextAnimator::presetAnimations();
+    QStringList animNames;
+    for (const auto &p : presets)
+        animNames << p.first;
+
+    QString selected = QInputDialog::getItem(this, "Text Animation",
+        "Animation style:", animNames, 0, false, &ok);
+    if (!ok) return;
+
+    for (const auto &p : presets) {
+        if (p.first == selected) {
+            TextAnimator animator;
+            animator.setText(text, QFont("Arial", 48), QPointF(100, 100));
+            animator.setAnimation(p.second);
+            statusBar()->showMessage(QString("Added text animation: \"%1\" with %2")
+                .arg(text, selected));
+            break;
+        }
+    }
+}
+
+void MainWindow::editTransformKeyframes()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Transform", "Select a clip first.");
+        return;
+    }
+
+    QStringList properties = {"Position X", "Position Y", "Scale X", "Scale Y",
+                              "Rotation", "Opacity", "Skew X", "Skew Y"};
+    bool ok;
+    QString prop = QInputDialog::getItem(this, "Transform Keyframe",
+        "Property to animate:", properties, 0, false, &ok);
+    if (!ok) return;
+
+    double time = m_timeline->playheadPosition();
+    double value = QInputDialog::getDouble(this, "Transform Keyframe",
+        QString("Value for %1 at %2s:").arg(prop).arg(time, 0, 'f', 1),
+        0.0, -10000, 10000, 2, &ok);
+    if (!ok) return;
+
+    statusBar()->showMessage(QString("Set keyframe: %1 = %2 at %3s")
+        .arg(prop).arg(value).arg(time, 0, 'f', 1));
+}
+
+void MainWindow::addMask()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Mask", "Select a clip first.");
+        return;
+    }
+
+    QStringList shapes = {"Rectangle", "Ellipse", "Polygon"};
+    bool ok;
+    QString selected = QInputDialog::getItem(this, "Add Mask",
+        "Mask shape:", shapes, 0, false, &ok);
+    if (!ok) return;
+
+    double feather = QInputDialog::getDouble(this, "Mask Feather",
+        "Feather amount (pixels):", 10.0, 0.0, 100.0, 1, &ok);
+    if (!ok) return;
+
+    statusBar()->showMessage(QString("Added %1 mask (feather: %2px)").arg(selected).arg(feather));
+}
+
+void MainWindow::applyWarpEffect()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Warp", "Select a clip first.");
+        return;
+    }
+
+    QStringList warps = {"Mesh Warp", "Puppet Pin", "Bulge", "Pinch", "Twirl",
+                         "Wave", "Ripple", "Spherize", "Fisheye"};
+    bool ok;
+    QString selected = QInputDialog::getItem(this, "Warp / Distortion",
+        "Effect type:", warps, 0, false, &ok);
+    if (!ok) return;
+
+    double amount = QInputDialog::getDouble(this, "Warp Amount",
+        "Amount (0.0-1.0):", 0.5, 0.0, 2.0, 2, &ok);
+    if (!ok) return;
+
+    statusBar()->showMessage(QString("Applied %1 (amount: %2)").arg(selected).arg(amount, 0, 'f', 2));
+}
+
+void MainWindow::editExpressions()
+{
+    bool ok;
+    QString propName = QInputDialog::getText(this, "Expression",
+        "Property name (e.g., rotation, opacity):", QLineEdit::Normal, "rotation", &ok);
+    if (!ok || propName.isEmpty()) return;
+
+    QString code = QInputDialog::getText(this, "Expression",
+        "Expression code:", QLineEdit::Normal, "wiggle(2, 10)", &ok);
+    if (!ok || code.isEmpty()) return;
+
+    auto result = Expression::validate(code);
+    if (!result.success) {
+        QMessageBox::warning(this, "Expression Error", "Invalid expression: " + result.error);
+        return;
+    }
+
+    statusBar()->showMessage(QString("Expression set: %1 = %2").arg(propName, code));
+}
+
+void MainWindow::precomposeSelected()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Pre-Compose", "Select clips first.");
+        return;
+    }
+
+    bool ok;
+    QString name = QInputDialog::getText(this, "Pre-Compose",
+        "Composition name:", QLineEdit::Normal, "Comp 1", &ok);
+    if (!ok || name.isEmpty()) return;
+
+    int compId = m_precomposeManager.createComposition(name,
+        m_projectConfig.width, m_projectConfig.height,
+        m_projectConfig.fps, 10.0);
+    statusBar()->showMessage(QString("Created composition: %1 (ID: %2)").arg(name).arg(compId));
 }
 
 void MainWindow::showResourceGuide()

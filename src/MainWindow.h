@@ -27,6 +27,18 @@
 #include "RenderQueue.h"
 #include "ScreenRecorder.h"
 #include "AIHighlight.h"
+#include "LayerCompositor.h"
+#include "TransformAnimator.h"
+#include "MaskSystem.h"
+#include "ParticleSystem.h"
+#include "Camera3D.h"
+#include "Expression.h"
+#include "ShapeLayer.h"
+#include "TextAnimator.h"
+#include "TrackerLink.h"
+#include "Precompose.h"
+#include "Rotoscope.h"
+#include "WarpDistortion.h"
 
 class VideoPlayer;
 class Timeline;
@@ -89,6 +101,14 @@ private slots:
     void applyEffectPreset();
     void saveEffectPreset();
     void manageEffectPresets();
+    void addShapeLayer();
+    void addParticleEffect();
+    void addTextAnimation();
+    void editTransformKeyframes();
+    void addMask();
+    void applyWarpEffect();
+    void editExpressions();
+    void precomposeSelected();
     void showResourceGuide();
     void stabilizeVideo();
     void applyLut();
@@ -142,4 +162,6 @@ private:
     RenderQueue *m_renderQueue = nullptr;
     ScreenRecorder *m_screenRecorder = nullptr;
     AIHighlight *m_aiHighlight = nullptr;
+    LayerCompositor m_layerCompositor;
+    PrecomposeManager m_precomposeManager;
 };
