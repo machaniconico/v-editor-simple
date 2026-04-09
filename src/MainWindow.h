@@ -201,7 +201,6 @@ private:
     PrecomposeManager m_precomposeManager;
 
     // Phase 14
-    ShortcutManager m_shortcutManager;
     RecentFilesManager *m_recentFilesManager = nullptr;
     RecentFilesMenu *m_recentFilesMenu = nullptr;
     ScriptEngine *m_scriptEngine = nullptr;

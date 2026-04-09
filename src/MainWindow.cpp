@@ -38,7 +38,7 @@ MainWindow::MainWindow(QWidget *parent)
     setupRecentFiles();
 
     // Shortcut manager - load saved shortcuts
-    m_shortcutManager.loadShortcuts();
+    ShortcutManager::instance().loadShortcuts();
 
     // Script engine
     m_scriptEngine = new ScriptEngine(this);
@@ -46,7 +46,7 @@ MainWindow::MainWindow(QWidget *parent)
 
     // Auto-save setup
     m_autoSave = new AutoSave(this);
-    m_autoSave->setProjectDataCallback([this]() -> QString {
+    m_autoSave->setProjectData([this]() -> QString {
         ProjectData data;
         data.config = m_projectConfig;
         data.videoTracks = m_timeline->allVideoTracks();
@@ -78,7 +78,7 @@ MainWindow::MainWindow(QWidget *parent)
             }
         }
     });
-    m_autoSave->start();
+    m_autoSave->start(AutoSaveConfig{});
 
     // Apply dark theme by default
     ThemeManager::instance().applyTheme(ThemeType::Dark, this);
@@ -2053,22 +2053,17 @@ void MainWindow::addShapeLayer()
 void MainWindow::addParticleEffect()
 {
     auto presets = ParticleSystem::presetConfigs();
-    QStringList presetNames;
-    for (const auto &p : presets)
-        presetNames << p.first;
+    QStringList presetNames = presets.keys();
 
     bool ok;
     QString selected = QInputDialog::getItem(this, "Add Particle Effect",
         "Particle preset:", presetNames, 0, false, &ok);
     if (!ok) return;
 
-    for (const auto &p : presets) {
-        if (p.first == selected) {
-            ParticleSystem ps;
-            ps.setConfig(p.second);
-            statusBar()->showMessage(QString("Added particle effect: %1").arg(selected));
-            break;
-        }
+    if (presets.contains(selected)) {
+        ParticleSystem ps;
+        ps.setConfig(presets.value(selected));
+        statusBar()->showMessage(QString("Added particle effect: %1").arg(selected));
     }
 }
 
@@ -2257,7 +2252,7 @@ void MainWindow::editShortcuts()
 {
     ShortcutEditorDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
-        m_shortcutManager.saveShortcuts();
+        ShortcutManager::instance().saveShortcuts();
         statusBar()->showMessage("Keyboard shortcuts updated");
     }
 }

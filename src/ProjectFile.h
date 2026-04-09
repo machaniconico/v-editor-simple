@@ -25,6 +25,9 @@ public:
     static bool save(const QString &filePath, const ProjectData &data);
     static bool load(const QString &filePath, ProjectData &data);
 
+    static QString toJsonString(const ProjectData &data);
+    static bool fromJsonString(const QString &json, ProjectData &data);
+
     static const QString fileFilter() { return "V Editor Project (*.veditor);;All Files (*)"; }
 
 private:

@@ -47,6 +47,41 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     return true;
 }
 
+QString ProjectFile::toJsonString(const ProjectData &data)
+{
+    QJsonObject root;
+    root["version"] = PROJECT_FORMAT_VERSION;
+    root["config"] = configToJson(data.config);
+    root["videoTracks"] = tracksToJson(data.videoTracks);
+    root["audioTracks"] = tracksToJson(data.audioTracks);
+    root["playheadPos"] = data.playheadPos;
+    root["markIn"] = data.markIn;
+    root["markOut"] = data.markOut;
+    root["zoomLevel"] = data.zoomLevel;
+
+    QJsonDocument doc(root);
+    return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
+}
+
+bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
+{
+    QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
+    if (doc.isNull()) return false;
+
+    QJsonObject root = doc.object();
+    if (!root.contains("version")) return false;
+
+    data.config = configFromJson(root["config"].toObject());
+    data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
+    data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
+    data.playheadPos = root["playheadPos"].toDouble();
+    data.markIn = root["markIn"].toDouble(-1.0);
+    data.markOut = root["markOut"].toDouble(-1.0);
+    data.zoomLevel = root["zoomLevel"].toInt(10);
+
+    return true;
+}
+
 // --- Config ---
 
 QJsonObject ProjectFile::configToJson(const ProjectConfig &c)
