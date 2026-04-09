@@ -497,6 +497,58 @@ void Timeline::setClipSpeed(double speed)
     updateInfoLabel();
 }
 
+void Timeline::setClipVolume(double volume)
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0) return;
+    volume = qMax(0.0, qMin(2.0, volume));
+    auto audioClips = m_audioTrack->clips();
+    if (sel < audioClips.size()) {
+        audioClips[sel].volume = volume;
+        m_audioTrack->setClips(audioClips);
+    }
+    saveUndoState(QString("Set volume %1%").arg(static_cast<int>(volume * 100)));
+}
+
+void Timeline::addAudioFile(const QString &filePath)
+{
+    AVFormatContext *fmt = nullptr;
+    double duration = 0.0;
+    if (avformat_open_input(&fmt, filePath.toUtf8().constData(), nullptr, nullptr) == 0) {
+        if (avformat_find_stream_info(fmt, nullptr) >= 0)
+            duration = static_cast<double>(fmt->duration) / AV_TIME_BASE;
+        avformat_close_input(&fmt);
+    }
+    ClipInfo clip;
+    clip.filePath = filePath;
+    clip.displayName = QFileInfo(filePath).fileName();
+    clip.duration = duration;
+
+    // Add to first audio track (or second if exists for BGM)
+    TimelineTrack *target = m_audioTracks.size() > 1 ? m_audioTracks[1] : m_audioTrack;
+    target->addClip(clip);
+    saveUndoState("Add audio");
+    updateInfoLabel();
+}
+
+void Timeline::toggleMuteTrack(int audioTrackIndex)
+{
+    if (audioTrackIndex < 0 || audioTrackIndex >= m_audioTracks.size()) return;
+    auto *track = m_audioTracks[audioTrackIndex];
+    track->setMuted(!track->isMuted());
+    updateInfoLabel();
+}
+
+void Timeline::toggleSoloTrack(int audioTrackIndex)
+{
+    if (audioTrackIndex < 0 || audioTrackIndex >= m_audioTracks.size()) return;
+    bool newSolo = !m_audioTracks[audioTrackIndex]->isSolo();
+    // Clear all solo first, then set the target
+    for (auto *t : m_audioTracks) t->setSolo(false);
+    if (newSolo) m_audioTracks[audioTrackIndex]->setSolo(true);
+    updateInfoLabel();
+}
+
 void Timeline::setPlayheadPosition(double seconds) { m_playheadPos = seconds; }
 
 double Timeline::totalDuration() const

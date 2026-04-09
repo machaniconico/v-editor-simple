@@ -182,6 +182,24 @@ void MainWindow::setupMenuBar()
     auto *addPipAction = insertMenu->addAction("Add &Picture in Picture...");
     connect(addPipAction, &QAction::triggered, this, &MainWindow::addPip);
 
+    // Audio menu
+    auto *audioMenu = menuBar()->addMenu("&Audio");
+
+    auto *volumeAction = audioMenu->addAction("Set Clip &Volume...");
+    connect(volumeAction, &QAction::triggered, this, &MainWindow::setClipVolume);
+
+    auto *bgmAction = audioMenu->addAction("Add &BGM / Audio File...");
+    connect(bgmAction, &QAction::triggered, this, &MainWindow::addBgm);
+
+    audioMenu->addSeparator();
+
+    auto *muteAction = audioMenu->addAction("Toggle &Mute (A1)");
+    muteAction->setShortcut(QKeySequence(Qt::Key_M));
+    connect(muteAction, &QAction::triggered, this, &MainWindow::toggleMute);
+
+    auto *soloAction = audioMenu->addAction("Toggle &Solo (A1)");
+    connect(soloAction, &QAction::triggered, this, &MainWindow::toggleSolo);
+
     // Playback menu
     auto *playbackMenu = menuBar()->addMenu("&Playback");
 
@@ -407,6 +425,43 @@ void MainWindow::setClipSpeed()
         m_timeline->setClipSpeed(speed);
         statusBar()->showMessage(QString("Clip speed: %1x").arg(speed));
     }
+}
+
+void MainWindow::setClipVolume()
+{
+    if (!m_timeline->hasSelection()) return;
+    bool ok;
+    double vol = QInputDialog::getDouble(this, "Set Clip Volume",
+        "Volume (0% = mute, 100% = normal, 200% = boost):", 100.0, 0.0, 200.0, 0, &ok);
+    if (ok) {
+        m_timeline->setClipVolume(vol / 100.0);
+        statusBar()->showMessage(QString("Volume: %1%").arg(static_cast<int>(vol)));
+    }
+}
+
+void MainWindow::addBgm()
+{
+    QString filter = "Audio Files (*.mp3 *.wav *.aac *.ogg *.flac *.m4a);;All Files (*)";
+    QString filePath = QFileDialog::getOpenFileName(this, "Add BGM / Audio", QString(), filter);
+    if (!filePath.isEmpty()) {
+        // Ensure we have a second audio track for BGM
+        if (m_timeline->audioTrackCount() < 2)
+            m_timeline->addAudioTrack();
+        m_timeline->addAudioFile(filePath);
+        statusBar()->showMessage("Added BGM: " + filePath);
+    }
+}
+
+void MainWindow::toggleMute()
+{
+    m_timeline->toggleMuteTrack(0);
+    statusBar()->showMessage(QString("A1: %1").arg(m_timeline->audioTrackCount() > 0 ? "Toggled mute" : "No track"));
+}
+
+void MainWindow::toggleSolo()
+{
+    m_timeline->toggleSoloTrack(0);
+    statusBar()->showMessage("A1: Toggled solo");
 }
 
 void MainWindow::addTextOverlay()

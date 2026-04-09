@@ -20,7 +20,8 @@ struct ClipInfo {
     double duration;
     double inPoint = 0.0;
     double outPoint = 0.0;
-    double speed = 1.0; // 0.25x - 4.0x
+    double speed = 1.0;   // 0.25x - 4.0x
+    double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
     double effectiveDuration() const {
         double out = (outPoint > 0.0) ? outPoint : duration;
         return (out - inPoint) / speed;
@@ -62,6 +63,10 @@ public:
     bool snapEnabled() const { return m_snapEnabled; }
     void setPixelsPerSecond(int pps);
     int pixelsPerSecond() const { return m_pixelsPerSecond; }
+    void setMuted(bool muted) { m_muted = muted; update(); }
+    bool isMuted() const { return m_muted; }
+    void setSolo(bool solo) { m_solo = solo; update(); }
+    bool isSolo() const { return m_solo; }
 
 signals:
     void clipClicked(int index);
@@ -89,6 +94,8 @@ private:
     int m_dropTargetIndex = -1;
 
     int m_pixelsPerSecond = 10;
+    bool m_muted = false;
+    bool m_solo = false;
     static constexpr int CLIP_HEIGHT = 50;
     static constexpr int TRIM_HANDLE_WIDTH = 6;
     static constexpr int SNAP_THRESHOLD = 8;
@@ -140,8 +147,14 @@ public:
     int videoTrackCount() const { return m_videoTracks.size(); }
     int audioTrackCount() const { return m_audioTracks.size(); }
 
-    // Clip speed
+    // Clip speed & volume
     void setClipSpeed(double speed);
+    void setClipVolume(double volume);
+
+    // Audio
+    void addAudioFile(const QString &filePath);
+    void toggleMuteTrack(int audioTrackIndex);
+    void toggleSoloTrack(int audioTrackIndex);
 
     void setPlayheadPosition(double seconds);
     double playheadPosition() const { return m_playheadPos; }
