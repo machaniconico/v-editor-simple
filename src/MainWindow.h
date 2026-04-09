@@ -7,9 +7,11 @@
 #include <QSplitter>
 #include <QFileDialog>
 #include "ProjectSettings.h"
+#include "Exporter.h"
 
 class VideoPlayer;
 class Timeline;
+class ExportDialog;
 
 class MainWindow : public QMainWindow
 {
@@ -41,4 +43,5 @@ private:
 
     QAction *m_splitAction;
     QAction *m_deleteAction;
+    Exporter *m_exporter;
 };

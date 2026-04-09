@@ -1,9 +1,11 @@
 #include "MainWindow.h"
 #include "VideoPlayer.h"
 #include "Timeline.h"
+#include "ExportDialog.h"
 #include <QApplication>
 #include <QMessageBox>
 #include <QVBoxLayout>
+#include <QProgressDialog>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -17,6 +19,8 @@ MainWindow::MainWindow(QWidget *parent)
         "WebM (*.webm)",
         "FLV (*.flv)"
     };
+
+    m_exporter = new Exporter(this);
 
     setupUI();
     setupMenuBar();
@@ -156,15 +160,34 @@ void MainWindow::openFile()
 
 void MainWindow::exportVideo()
 {
-    QString filePath = QFileDialog::getSaveFileName(this, "Export Video", QString(),
-        "MP4 - H.264 (*.mp4);;"
-        "MKV - H.265 (*.mkv);;"
-        "WebM - VP9 (*.webm);;"
-        "MP4 - AV1 (*.mp4)");
-    if (!filePath.isEmpty()) {
-        statusBar()->showMessage("Exporting: " + filePath);
-        // TODO: Implement export via FFmpeg using m_projectConfig
+    ExportDialog dialog(m_projectConfig, this);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    ExportConfig exportCfg = dialog.config();
+    const auto &clips = m_timeline->videoClips();
+
+    if (clips.isEmpty()) {
+        QMessageBox::warning(this, "Export", "No clips in timeline to export.");
+        return;
     }
+
+    auto *progress = new QProgressDialog("Exporting...", "Cancel", 0, 100, this);
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(0);
+
+    connect(m_exporter, &Exporter::progressChanged, progress, &QProgressDialog::setValue);
+    connect(m_exporter, &Exporter::exportFinished, this, [this, progress](bool success, const QString &msg) {
+        progress->close();
+        progress->deleteLater();
+        if (success)
+            statusBar()->showMessage(msg);
+        else
+            QMessageBox::critical(this, "Export Failed", msg);
+    });
+    connect(progress, &QProgressDialog::canceled, m_exporter, &Exporter::cancel);
+
+    statusBar()->showMessage("Exporting: " + exportCfg.outputPath);
+    m_exporter->startExport(exportCfg, clips);
 }
 
 void MainWindow::splitClip()

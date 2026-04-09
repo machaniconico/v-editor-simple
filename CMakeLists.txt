@@ -24,6 +24,8 @@ add_executable(${PROJECT_NAME}
     src/VideoPlayer.cpp
     src/Timeline.cpp
     src/ProjectSettings.cpp
+    src/ExportDialog.cpp
+    src/Exporter.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE

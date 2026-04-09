@@ -90,6 +90,7 @@ public:
     void setPlayheadPosition(double seconds);
     double playheadPosition() const { return m_playheadPos; }
     double totalDuration() const;
+    const QVector<ClipInfo> &videoClips() const { return m_videoTrack->clips(); }
 
 signals:
     void clipSelected(int index);
