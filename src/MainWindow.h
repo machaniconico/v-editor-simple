@@ -11,6 +11,7 @@
 #include <QDropEvent>
 #include <QMimeData>
 #include <QLabel>
+#include <QShowEvent>
 #include "ProjectSettings.h"
 #include "Exporter.h"
 #include "ProjectFile.h"
@@ -63,6 +64,14 @@ class MainWindow : public QMainWindow
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
+
+public slots:
+    // Used by main.cpp when the app is launched with a file argument.
+    // Loads the given file as a media clip (same code path as File > Open).
+    void testLoadFile(const QString &filePath);
+
+    // Used by main.cpp --play flag: start video playback.
+    void testStartPlayback();
 
 private slots:
     void newProject();
@@ -154,6 +163,7 @@ protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
+    void showEvent(QShowEvent *event) override;
 
 private:
     void setupMenuBar();
@@ -165,6 +175,7 @@ private:
     void restoreWindowState();
     void showWelcomeScreen();
     void hideWelcomeScreen();
+    void loadMediaFile(const QString &filePath, bool addToTimeline, const QString &statusPrefix);
     void updateStatusInfo();
     void updateEditActions();
     void applyProjectConfig(const ProjectConfig &config);
@@ -215,4 +226,5 @@ private:
     QLabel *m_statusDuration = nullptr;
     QLabel *m_statusTheme = nullptr;
     bool m_hasContent = false;
+    bool m_autoSaveStarted = false;
 };

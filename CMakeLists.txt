@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(v-editor-simple VERSION 0.14.0 LANGUAGES CXX)
+project(v-simple-editor VERSION 0.14.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,7 +23,14 @@ if(NOT AVFORMAT_LIBRARY)
     message(FATAL_ERROR "FFmpeg not found. Install via: vcpkg install ffmpeg")
 endif()
 
-add_executable(${PROJECT_NAME}
+set(APP_EXECUTABLE_TYPE "")
+set(APP_RESOURCES "")
+if(WIN32)
+    set(APP_EXECUTABLE_TYPE WIN32)
+    set(APP_RESOURCES resources/app-icon.rc)
+endif()
+
+add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/main.cpp
     src/MainWindow.cpp
     src/VideoPlayer.cpp
@@ -84,6 +91,7 @@ add_executable(${PROJECT_NAME}
     src/SplashScreen.h
     src/WelcomeWidget.h
     resources/resources.qrc
+    ${APP_RESOURCES}
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -106,6 +114,10 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     ${SWRESAMPLE_LIBRARY}
     ${AVFILTER_LIBRARY}
 )
+
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE dbghelp)
+endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     APP_VERSION="${PROJECT_VERSION}"

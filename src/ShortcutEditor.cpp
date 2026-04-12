@@ -47,14 +47,14 @@ void ShortcutManager::resetToDefaults()
 
 void ShortcutManager::saveShortcuts()
 {
-    QSettings settings("VEditorSimple", "Shortcuts");
+    QSettings settings("VSimpleEditor", "Shortcuts");
     for (const auto &entry : m_shortcuts)
         settings.setValue(entry.id, entry.currentKey.toString());
 }
 
 void ShortcutManager::loadShortcuts()
 {
-    QSettings settings("VEditorSimple", "Shortcuts");
+    QSettings settings("VSimpleEditor", "Shortcuts");
     for (auto &entry : m_shortcuts) {
         if (settings.contains(entry.id)) {
             QKeySequence key(settings.value(entry.id).toString());

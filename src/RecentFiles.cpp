@@ -82,7 +82,7 @@ int RecentFilesManager::maxFiles() const
 
 void RecentFilesManager::load()
 {
-    QSettings settings("VEditorSimple", "RecentFiles");
+    QSettings settings("VSimpleEditor", "RecentFiles");
     m_files = settings.value("recentFiles").toStringList();
 
     // Enforce cap in case maxFiles was changed externally
@@ -92,7 +92,7 @@ void RecentFilesManager::load()
 
 void RecentFilesManager::save()
 {
-    QSettings settings("VEditorSimple", "RecentFiles");
+    QSettings settings("VSimpleEditor", "RecentFiles");
     settings.setValue("recentFiles", m_files);
 }
 

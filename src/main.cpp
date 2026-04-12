@@ -1,29 +1,189 @@
 #include <QApplication>
 #include <QIcon>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QTextStream>
+#include <QDateTime>
+#include <QStandardPaths>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QDebug>
+#include <QTimer>
+#include <QMetaObject>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#endif
+
 #include "MainWindow.h"
 #include "SplashScreen.h"
 
+// ──────────────────────────────────────────────────────────────────────────
+// Lightweight file-backed logger + unhandled-exception reporter.
+//
+// Goal: when the app crashes, we want a log file we can read to understand
+// what was happening just before the crash. Everything here is best-effort —
+// it should never throw or hold locks that could deadlock on shutdown.
+// ──────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+QString g_logFilePath;
+QMutex  g_logMutex;
+
+QString defaultLogPath()
+{
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::HomeLocation)
+                        + "/.veditor/logs";
+    QDir().mkpath(dir);
+    const QString ts = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+    return dir + "/veditor_" + ts + ".log";
+}
+
+void writeLogLine(const QString &level, const QString &msg)
+{
+    QMutexLocker lock(&g_logMutex);
+    QFile f(g_logFilePath);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+        return;
+    QTextStream ts(&f);
+    ts.setEncoding(QStringConverter::Utf8);
+    ts << QDateTime::currentDateTime().toString("HH:mm:ss.zzz")
+       << " [" << level << "] " << msg << "\n";
+    ts.flush();
+    f.close();
+}
+
+void qtMessageHandler(QtMsgType type, const QMessageLogContext &ctx, const QString &msg)
+{
+    const char *level = "INFO";
+    switch (type) {
+        case QtDebugMsg:    level = "DEBUG"; break;
+        case QtInfoMsg:     level = "INFO";  break;
+        case QtWarningMsg:  level = "WARN";  break;
+        case QtCriticalMsg: level = "CRIT";  break;
+        case QtFatalMsg:    level = "FATAL"; break;
+    }
+    QString full = msg;
+    if (ctx.file && *ctx.file) {
+        full += QString(" (%1:%2)").arg(ctx.file).arg(ctx.line);
+    }
+    writeLogLine(level, full);
+
+    // Also emit to stderr so console users see it.
+    QTextStream(stderr) << "[" << level << "] " << msg << "\n";
+}
+
+#ifdef Q_OS_WIN
+LONG WINAPI crashHandler(EXCEPTION_POINTERS *info)
+{
+    if (!info) return EXCEPTION_EXECUTE_HANDLER;
+
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    const void *addr = info->ExceptionRecord->ExceptionAddress;
+
+    QString msg = QString("UNHANDLED EXCEPTION code=0x%1 addr=0x%2")
+        .arg(QString::number(code, 16))
+        .arg(quint64(addr), 0, 16);
+    writeLogLine("CRASH", msg);
+
+    // Capture stack frames.
+    HANDLE process = GetCurrentProcess();
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+    SymInitialize(process, nullptr, TRUE);
+
+    void *frames[64];
+    USHORT count = CaptureStackBackTrace(0, 64, frames, nullptr);
+
+    char symbolBuf[sizeof(SYMBOL_INFO) + 256] = {0};
+    SYMBOL_INFO *symbol = reinterpret_cast<SYMBOL_INFO*>(symbolBuf);
+    symbol->MaxNameLen = 255;
+    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+
+    QString stack;
+    for (USHORT i = 0; i < count; ++i) {
+        DWORD64 disp = 0;
+        if (SymFromAddr(process, DWORD64(frames[i]), &disp, symbol)) {
+            stack += QString("  #%1 %2 + 0x%3 @ 0x%4\n")
+                .arg(i)
+                .arg(QString::fromLocal8Bit(symbol->Name))
+                .arg(disp, 0, 16)
+                .arg(DWORD64(frames[i]), 0, 16);
+        } else {
+            stack += QString("  #%1 ?? @ 0x%2\n")
+                .arg(i).arg(DWORD64(frames[i]), 0, 16);
+        }
+    }
+    writeLogLine("CRASH", "STACK:\n" + stack);
+    SymCleanup(process);
+
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif // Q_OS_WIN
+
+} // anonymous namespace
+
 int main(int argc, char *argv[])
 {
+    // Install crash handling BEFORE QApplication so GL init crashes are caught.
+    g_logFilePath = defaultLogPath();
+    qInstallMessageHandler(qtMessageHandler);
+#ifdef Q_OS_WIN
+    SetUnhandledExceptionFilter(crashHandler);
+#endif
+    writeLogLine("INFO", "=== V Simple Editor starting ===");
+    writeLogLine("INFO", QString("log path: %1").arg(g_logFilePath));
+
     QApplication app(argc, argv);
-    app.setApplicationName("V Editor Simple");
+    app.setApplicationName("V Simple Editor");
     app.setApplicationVersion(APP_VERSION);
-    app.setOrganizationName("VEditorSimple");
+    app.setOrganizationName("VSimpleEditor");
     app.setWindowIcon(QIcon(":/icons/app-icon.svg"));
 
-    // Splash screen
+    writeLogLine("INFO", "QApplication constructed");
+
+    // スプラッシュ画面
     AppSplashScreen splash;
     splash.show();
 
-    splash.setProgress(10, "Loading core modules...");
-    splash.setProgress(30, "Initializing video engine...");
-    splash.setProgress(50, "Setting up timeline...");
-    splash.setProgress(70, "Loading plugins & presets...");
-    splash.setProgress(90, "Preparing workspace...");
+    splash.setProgress(10, "コアモジュールを読み込み中...");
+    splash.setProgress(30, "ビデオエンジンを初期化中...");
+    splash.setProgress(50, "タイムラインを構築中...");
+    splash.setProgress(70, "プラグインとプリセットを読み込み中...");
+    splash.setProgress(90, "ワークスペースを準備中...");
 
+    writeLogLine("INFO", "splash shown; constructing MainWindow");
     MainWindow window;
+    writeLogLine("INFO", "MainWindow constructed");
+
     splash.finishWithDelay(&window, 400);
     window.show();
+    writeLogLine("INFO", "window shown; entering event loop");
 
-    return app.exec();
+    // Auto-load a file passed on the command line for reproducible testing.
+    // Uses the public testLoadFile() slot on MainWindow.
+    if (argc >= 2) {
+        const QString filePath = QString::fromLocal8Bit(argv[1]);
+        writeLogLine("INFO", QString("argv[1] file load requested: %1").arg(filePath));
+        QTimer::singleShot(500, &window, [&window, filePath]() {
+            QMetaObject::invokeMethod(&window, "testLoadFile", Qt::QueuedConnection,
+                                      Q_ARG(QString, filePath));
+        });
+
+        // If a third arg "--play" is present, also start playback after load.
+        if (argc >= 3 && QString::fromLocal8Bit(argv[2]) == "--play") {
+            writeLogLine("INFO", "auto-play requested");
+            QTimer::singleShot(2000, &window, [&window]() {
+                QMetaObject::invokeMethod(&window, "testStartPlayback",
+                                          Qt::QueuedConnection);
+            });
+        }
+    }
+
+    const int rc = app.exec();
+    writeLogLine("INFO", QString("event loop exited rc=%1").arg(rc));
+    return rc;
 }

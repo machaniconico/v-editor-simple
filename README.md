@@ -1,4 +1,4 @@
-# V Editor Simple
+# V Simple Editor
 
 **Simple UI, Full-Featured Video Editor**
 
@@ -140,25 +140,29 @@ A professional video editing application built from scratch with C++17, Qt6, and
 
 ### Windows (One-Click Setup)
 
-**Visual Studio 2022 が必須です。** 先にインストールしてください：
-1. [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) をダウンロード（Community版は無料）
-2. インストーラーで **「C++によるデスクトップ開発」** ワークロードにチェックを入れてインストール
-
-VS2022が入っていれば、あとは `setup.bat` が全自動でやります：
+`setup.bat` が必要なツールを **すべて自動でインストール** します。手動での事前準備は不要です。
 
 ```bash
 # GitHub から取得（git clone または ZIP ダウンロード）
-git clone https://github.com/machaniconico/v-editor-simple.git
-cd v-editor-simple
+git clone https://github.com/machaniconico/v-simple-editor.git
+cd v-simple-editor
 
-# ワンクリックセットアップ（vcpkg, Qt6, FFmpeg 自動インストール & ビルド）
+# 右クリック → 「管理者として実行」で setup.bat を起動
 setup.bat
 ```
 
+> **Note:** 自動インストールには **管理者権限** が必要です。`setup.bat` を右クリック →「管理者として実行」してください。winget (Windows 10 1809+ / 11 に標準搭載) を使って不足ツールを自動導入します。
+
 `setup.bat` が行うこと：
-- vcpkg の自動インストール（C:\vcpkg）
-- Qt6, FFmpeg, pkgconf のインストール（初回は30-60分）
+- **Git** の自動インストール（未インストールの場合）
+- **CMake** の自動インストール（未インストールの場合）
+- **Visual Studio 2022 Build Tools** + C++ ワークロードの自動インストール（未インストールの場合）
+- **vcpkg** の自動インストール（C:\vcpkg）
+- **Qt6, FFmpeg, pkgconf** のインストール（初回は30-60分）
 - CMake configure & Release ビルド
+- DLL 配置 & FFmpeg CLI ツールのコピー
+- **Python** のインストール（任意 — スクリプト拡張機能用）
+- **Whisper** のインストール（任意 — AI字幕生成用）
 - 完了後にアプリを起動するか確認
 
 手動でビルドする場合：
@@ -223,7 +227,7 @@ All shortcuts are customizable via Edit > Keyboard Shortcuts.
 ## Project Structure
 
 ```
-v-editor-simple/
+v-simple-editor/
 ├── CMakeLists.txt
 ├── setup.bat                    # Windows env setup
 ├── resources/

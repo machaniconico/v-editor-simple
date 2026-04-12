@@ -1,5 +1,8 @@
 #include "GLPreview.h"
 #include <cmath>
+#include <QtGlobal>
+#include <QOpenGLContext>
+#include <QDebug>
 
 // Vertex shader — simple fullscreen quad
 static const char *vertexShaderSrc = R"(
@@ -130,11 +133,37 @@ GLPreview::GLPreview(QWidget *parent)
 
 GLPreview::~GLPreview()
 {
+    // Primary cleanup path is cleanupGL() via QOpenGLContext::aboutToBeDestroyed.
+    // Fallback: only touch GL state here if a current context is available — calling
+    // makeCurrent() on a destroyed context segfaults some drivers on shutdown.
+    if (QOpenGLContext::currentContext() || context()) {
+        cleanupGL();
+    } else {
+        // Context already gone — clear raw pointers to skip double-free, but don't
+        // touch GL state.
+        m_texture = nullptr;
+        m_program = nullptr;
+    }
+}
+
+void GLPreview::cleanupGL()
+{
+    if (!context())
+        return;
+
     makeCurrent();
-    delete m_texture;
-    delete m_program;
-    m_vbo.destroy();
-    m_vao.destroy();
+    if (m_texture) {
+        delete m_texture;
+        m_texture = nullptr;
+    }
+    if (m_program) {
+        delete m_program;
+        m_program = nullptr;
+    }
+    if (m_vbo.isCreated())
+        m_vbo.destroy();
+    if (m_vao.isCreated())
+        m_vao.destroy();
     doneCurrent();
 }
 
@@ -142,6 +171,13 @@ void GLPreview::initializeGL()
 {
     initializeOpenGLFunctions();
     glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+
+    // Qt recommends cleaning up GL resources when the context is about to be
+    // destroyed rather than in the widget destructor (Qt 5/6 QOpenGLWidget docs).
+    if (auto *ctx = context()) {
+        connect(ctx, &QOpenGLContext::aboutToBeDestroyed,
+                this, &GLPreview::cleanupGL, Qt::UniqueConnection);
+    }
 
     createShaderProgram();
 
@@ -176,9 +212,18 @@ void GLPreview::initializeGL()
 void GLPreview::createShaderProgram()
 {
     m_program = new QOpenGLShaderProgram(this);
-    m_program->addShaderFromSourceCode(QOpenGLShader::Vertex, vertexShaderSrc);
-    m_program->addShaderFromSourceCode(QOpenGLShader::Fragment, fragmentShaderSrc);
-    m_program->link();
+    if (!m_program->addShaderFromSourceCode(QOpenGLShader::Vertex, vertexShaderSrc)) {
+        qWarning() << "GLPreview: vertex shader compile failed:" << m_program->log();
+    }
+    if (!m_program->addShaderFromSourceCode(QOpenGLShader::Fragment, fragmentShaderSrc)) {
+        qWarning() << "GLPreview: fragment shader compile failed:" << m_program->log();
+    }
+    if (!m_program->link()) {
+        qWarning() << "GLPreview: shader link failed:" << m_program->log();
+        delete m_program;
+        m_program = nullptr;
+        return;
+    }
 
     m_locTexture        = m_program->uniformLocation("uTexture");
     m_locBrightness     = m_program->uniformLocation("uBrightness");
@@ -201,8 +246,24 @@ void GLPreview::resizeGL(int w, int h)
 
 void GLPreview::displayFrame(const QImage &frame)
 {
+    if (frame.isNull()) {
+        qWarning() << "GLPreview::displayFrame called with null image";
+        return;
+    }
     m_currentFrame = frame.convertToFormat(QImage::Format_RGBA8888);
+    if (m_currentFrame.isNull()) {
+        qWarning() << "GLPreview: convertToFormat returned null";
+        return;
+    }
+    if (m_displayAspectRatio <= 0.0 && m_currentFrame.height() > 0)
+        m_displayAspectRatio = static_cast<double>(m_currentFrame.width()) / m_currentFrame.height();
     m_needsUpload = true;
+    update();
+}
+
+void GLPreview::setDisplayAspectRatio(double aspectRatio)
+{
+    m_displayAspectRatio = (aspectRatio > 0.0) ? aspectRatio : 0.0;
     update();
 }
 
@@ -214,27 +275,94 @@ void GLPreview::setColorCorrection(const ColorCorrection &cc)
 
 void GLPreview::paintGL()
 {
+    static int paintCount = 0;
+    if (++paintCount <= 5 || (paintCount % 100) == 0) {
+        qInfo() << "GLPreview::paintGL #" << paintCount
+                << "widget(logical)=" << width() << "x" << height()
+                << "dpr=" << devicePixelRatioF()
+                << "frame=" << m_currentFrame.width() << "x" << m_currentFrame.height()
+                << "upload=" << m_needsUpload;
+    }
+
     glClear(GL_COLOR_BUFFER_BIT);
 
     if (m_currentFrame.isNull()) return;
 
-    // Upload texture if new frame
-    if (m_needsUpload) {
-        if (m_texture) {
-            delete m_texture;
-            m_texture = nullptr;
+    // glViewport expects PHYSICAL pixels, but QWidget::width()/height() are
+    // LOGICAL (device-independent) pixels. On a high-DPI display with DPR=1.5
+    // or 2.0, using logical coordinates makes the video render in a fraction
+    // of the widget — which is what the "small video in big panel" bug was.
+    const qreal dpr = devicePixelRatioF();
+    const int physW = qMax(1, qRound(width() * dpr));
+    const int physH = qMax(1, qRound(height() * dpr));
+
+    const double frameAspect =
+        (m_displayAspectRatio > 0.0 && std::isfinite(m_displayAspectRatio))
+            ? m_displayAspectRatio
+            : ((m_currentFrame.height() > 0)
+                   ? static_cast<double>(m_currentFrame.width()) / m_currentFrame.height()
+                   : 1.0);
+    const double widgetAspect =
+        (physH > 0) ? static_cast<double>(physW) / physH : frameAspect;
+
+    int viewportX = 0;
+    int viewportY = 0;
+    int viewportW = physW;
+    int viewportH = physH;
+
+    if (frameAspect > 0.0 && widgetAspect > 0.0) {
+        if (widgetAspect > frameAspect) {
+            viewportW = qMax(1, qRound(physH * frameAspect));
+            viewportX = (physW - viewportW) / 2;
+        } else {
+            viewportH = qMax(1, qRound(physW / frameAspect));
+            viewportY = (physH - viewportH) / 2;
         }
-        m_texture = new QOpenGLTexture(m_currentFrame);
-        m_texture->setMinificationFilter(QOpenGLTexture::Linear);
-        m_texture->setMagnificationFilter(QOpenGLTexture::Linear);
-        m_texture->setWrapMode(QOpenGLTexture::ClampToEdge);
+    }
+
+    // Upload texture if new frame.
+    //
+    // Re-use a single QOpenGLTexture across frames — allocating a new texture
+    // per frame (~8 MB for 1080p RGBA) thrashes driver memory and has been
+    // observed to crash Intel/AMD drivers after a few hundred frames.
+    if (m_needsUpload) {
+        const int fw = m_currentFrame.width();
+        const int fh = m_currentFrame.height();
+        if (fw <= 0 || fh <= 0) {
+            m_needsUpload = false;
+            return;
+        }
+
+        const bool sizeChanged = !m_texture
+            || m_texture->width() != fw
+            || m_texture->height() != fh;
+
+        if (sizeChanged) {
+            if (m_texture) {
+                delete m_texture;
+                m_texture = nullptr;
+            }
+            m_texture = new QOpenGLTexture(QOpenGLTexture::Target2D);
+            m_texture->setSize(fw, fh);
+            m_texture->setFormat(QOpenGLTexture::RGBA8_UNorm);
+            m_texture->setMinificationFilter(QOpenGLTexture::Linear);
+            m_texture->setMagnificationFilter(QOpenGLTexture::Linear);
+            m_texture->setWrapMode(QOpenGLTexture::ClampToEdge);
+            m_texture->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt8);
+        }
+
+        // Upload pixel data into the already-allocated texture.
+        m_texture->setData(0, 0,
+                           QOpenGLTexture::RGBA, QOpenGLTexture::UInt8,
+                           static_cast<const void*>(m_currentFrame.constBits()));
         m_needsUpload = false;
     }
 
-    if (!m_texture) return;
+    if (!m_texture || !m_program) return;
 
     m_program->bind();
     m_texture->bind();
+    glViewport(viewportX, viewportY, viewportW, viewportH);
 
     // Set uniforms
     m_program->setUniformValue(m_locTexture, 0);
@@ -257,4 +385,5 @@ void GLPreview::paintGL()
 
     m_texture->release();
     m_program->release();
+    glViewport(0, 0, physW, physH);
 }

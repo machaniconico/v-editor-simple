@@ -18,6 +18,7 @@ public:
     ~GLPreview();
 
     void displayFrame(const QImage &frame);
+    void setDisplayAspectRatio(double aspectRatio);
     void setColorCorrection(const ColorCorrection &cc);
     void setEffectsEnabled(bool enabled) { m_effectsEnabled = enabled; update(); }
     bool effectsEnabled() const { return m_effectsEnabled; }
@@ -26,6 +27,9 @@ protected:
     void initializeGL() override;
     void resizeGL(int w, int h) override;
     void paintGL() override;
+
+private slots:
+    void cleanupGL();
 
 private:
     void createShaderProgram();
@@ -40,6 +44,7 @@ private:
     ColorCorrection m_cc;
     bool m_effectsEnabled = true;
     bool m_needsUpload = false;
+    double m_displayAspectRatio = 0.0;
 
     // Uniform locations
     int m_locTexture = -1;

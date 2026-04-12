@@ -20,19 +20,19 @@ public:
         layout->setSpacing(16);
 
         // Logo / title
-        auto *titleLabel = new QLabel("V Editor Simple");
+        auto *titleLabel = new QLabel("V Simple Editor");
         titleLabel->setAlignment(Qt::AlignCenter);
         QFont titleFont("Segoe UI", 32, QFont::Bold);
         titleLabel->setFont(titleFont);
         titleLabel->setStyleSheet("color: #e94560;");
 
-        auto *subtitleLabel = new QLabel("Simple UI. Full-Featured Video Editing.");
+        auto *subtitleLabel = new QLabel("シンプルUI、フル機能の動画編集ソフト");
         subtitleLabel->setAlignment(Qt::AlignCenter);
         QFont subFont("Segoe UI", 14);
         subtitleLabel->setFont(subFont);
         subtitleLabel->setStyleSheet("color: #888;");
 
-        auto *versionLabel = new QLabel(QString("Version %1").arg(APP_VERSION));
+        auto *versionLabel = new QLabel(QString("バージョン %1").arg(APP_VERSION));
         versionLabel->setAlignment(Qt::AlignCenter);
         versionLabel->setStyleSheet("color: #555; font-size: 11px;");
 
@@ -41,7 +41,7 @@ public:
         buttonLayout->setAlignment(Qt::AlignCenter);
         buttonLayout->setSpacing(10);
 
-        auto *newBtn = new QPushButton("  New Project  ");
+        auto *newBtn = new QPushButton("  新規プロジェクト  ");
         newBtn->setFixedWidth(240);
         newBtn->setFixedHeight(40);
         newBtn->setStyleSheet(
@@ -50,7 +50,7 @@ public:
             "QPushButton:hover { background: #ff6b6b; }");
         connect(newBtn, &QPushButton::clicked, this, &WelcomeWidget::newProjectClicked);
 
-        auto *openBtn = new QPushButton("  Open File  ");
+        auto *openBtn = new QPushButton("  ファイルを開く  ");
         openBtn->setFixedWidth(240);
         openBtn->setFixedHeight(40);
         openBtn->setStyleSheet(
@@ -59,7 +59,7 @@ public:
             "QPushButton:hover { background: #1a4a8a; }");
         connect(openBtn, &QPushButton::clicked, this, &WelcomeWidget::openFileClicked);
 
-        auto *openProjectBtn = new QPushButton("  Open Project (.veditor)  ");
+        auto *openProjectBtn = new QPushButton("  プロジェクトを開く (.veditor)  ");
         openProjectBtn->setFixedWidth(240);
         openProjectBtn->setFixedHeight(40);
         openProjectBtn->setStyleSheet(
@@ -72,9 +72,9 @@ public:
         buttonLayout->addWidget(openBtn);
         buttonLayout->addWidget(openProjectBtn);
 
-        // Shortcuts hint
+        // ショートカットヒント
         auto *hintLabel = new QLabel(
-            "Ctrl+N  New  |  Ctrl+O  Open  |  Ctrl+Shift+O  Open Project  |  F1  Resource Guide");
+            "Ctrl+N 新規  |  Ctrl+O 開く  |  Ctrl+Shift+O プロジェクトを開く  |  F1 素材ガイド");
         hintLabel->setAlignment(Qt::AlignCenter);
         hintLabel->setStyleSheet("color: #555; font-size: 10px; margin-top: 20px;");
 
@@ -100,12 +100,12 @@ public:
     void setRecentFiles(const QStringList &files)
     {
         if (files.isEmpty()) {
-            m_recentLabel->setText("No recent files");
+            m_recentLabel->setText("最近使用したファイルはありません");
         } else {
             QStringList display;
             for (int i = 0; i < qMin(5, files.size()); ++i)
                 display << QFileInfo(files[i]).fileName();
-            m_recentLabel->setText("Recent: " + display.join("  |  "));
+            m_recentLabel->setText("最近: " + display.join("  |  "));
         }
     }
 

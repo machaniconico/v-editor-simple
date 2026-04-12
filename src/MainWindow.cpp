@@ -13,12 +13,17 @@
 #include <QShortcut>
 #include <QInputDialog>
 #include <QCloseEvent>
+#include <QFile>
 #include <QFileInfo>
+#include <QTimer>
+#include <QPointer>
 #include <QUrl>
+#include <QDebug>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
 {
+    qInfo() << "MainWindow::ctor begin";
     resize(1280, 720);
 
     m_supportedFormats = {
@@ -32,7 +37,9 @@ MainWindow::MainWindow(QWidget *parent)
     setupRecentFiles();
 
     setupUI();
+    qInfo() << "MainWindow::setupUI done";
     setupMenuBar();
+    qInfo() << "MainWindow::setupMenuBar done";
     setupToolBar();
     updateEditActions();
     updateTitle();
@@ -77,9 +84,9 @@ MainWindow::MainWindow(QWidget *parent)
                 }
             }
         }
+        for (const QString &path : files)
+            QFile::remove(path);
     });
-    m_autoSave->start(AutoSaveConfig{});
-
     // Apply dark theme by default
     ThemeManager::instance().applyTheme(ThemeType::Dark, this);
 
@@ -90,7 +97,7 @@ MainWindow::MainWindow(QWidget *parent)
     setupStatusBarWidgets();
     updateStatusInfo();
 
-    statusBar()->showMessage("Ready — Use File > New Project to start");
+    statusBar()->showMessage("準備完了 — ファイル > 新規プロジェクトから開始してください");
 
     connect(m_timeline, &Timeline::clipSelected, this, [this](int) {
         updateEditActions();
@@ -104,6 +111,8 @@ MainWindow::MainWindow(QWidget *parent)
 
     // Restore saved window state
     restoreWindowState();
+
+    qInfo() << "MainWindow::ctor end";
 }
 
 void MainWindow::setupUI()
@@ -134,6 +143,23 @@ void MainWindow::setupUI()
     setCentralWidget(centralWidget);
 
     connect(m_player, &VideoPlayer::positionChanged, m_timeline, &Timeline::setPlayheadPosition);
+    connect(m_timeline, &Timeline::scrubPositionChanged, this, [this](double seconds) {
+        m_player->previewSeek(qRound(static_cast<double>(seconds) * 1000.0));
+    });
+    connect(m_timeline, &Timeline::positionChanged, this, [this](double seconds) {
+        m_player->seek(qRound(static_cast<double>(seconds) * 1000.0));
+    });
+    // Multi-clip playback: forward Timeline's resolved schedule to VideoPlayer.
+    // Apply proxy-path translation here so VideoPlayer stays unaware of proxies.
+    connect(m_timeline, &Timeline::sequenceChanged, this, [this](const QVector<PlaybackEntry> &entries) {
+        if (!m_player) return;
+        QVector<PlaybackEntry> resolved = entries;
+        auto &pm = ProxyManager::instance();
+        for (auto &e : resolved)
+            e.filePath = pm.getProxyPath(e.filePath);
+        qInfo() << "MainWindow: forwarding sequenceChanged entries=" << resolved.size();
+        m_player->setSequence(resolved);
+    });
 
     // J/K/L keyboard shortcuts for playback
     auto *jKey = new QShortcut(QKeySequence(Qt::Key_J), this);
@@ -147,93 +173,100 @@ void MainWindow::setupUI()
     connect(m_player, &VideoPlayer::playbackSpeedChanged, this, [this](double speed) {
         statusBar()->showMessage(QString("Speed: %1x").arg(speed, 0, 'f', 1));
     });
+
+    m_player->setMinimumHeight(280); // lowered so the timeline can grow taller
+    m_mainSplitter->setSizes({680, 320});
 }
 
 void MainWindow::setupMenuBar()
 {
-    // File menu
-    auto *fileMenu = menuBar()->addMenu("&File");
+    // ファイル メニュー
+    auto *fileMenu = menuBar()->addMenu("ファイル(&F)");
 
-    auto *newAction = fileMenu->addAction("&New Project...");
+    auto *newAction = fileMenu->addAction("新規プロジェクト(&N)...");
     newAction->setShortcut(QKeySequence::New);
     connect(newAction, &QAction::triggered, this, &MainWindow::newProject);
 
-    auto *openAction = fileMenu->addAction("&Open File...");
+    auto *openAction = fileMenu->addAction("ファイルを開く(&O)...");
     openAction->setShortcut(QKeySequence::Open);
     connect(openAction, &QAction::triggered, this, &MainWindow::openFile);
 
-    // Recent files submenu
+    // 最近使ったファイル
     m_recentFilesMenu = new RecentFilesMenu(m_recentFilesManager, fileMenu);
+    m_recentFilesMenu->setTitle("最近使ったファイル");
     fileMenu->addMenu(m_recentFilesMenu);
     connect(m_recentFilesMenu, &RecentFilesMenu::fileSelected, this, &MainWindow::openRecentFile);
 
     fileMenu->addSeparator();
 
-    auto *openProjectAction = fileMenu->addAction("Open &Project...");
+    auto *openProjectAction = fileMenu->addAction("プロジェクトを開く(&P)...");
     openProjectAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O));
     connect(openProjectAction, &QAction::triggered, this, &MainWindow::openProject);
 
-    auto *saveAction = fileMenu->addAction("&Save Project");
+    auto *saveAction = fileMenu->addAction("プロジェクトを保存(&S)");
     saveAction->setShortcut(QKeySequence::Save);
     connect(saveAction, &QAction::triggered, this, &MainWindow::saveProject);
 
-    auto *saveAsAction = fileMenu->addAction("Save Project &As...");
+    auto *saveAsAction = fileMenu->addAction("名前を付けて保存(&A)...");
     saveAsAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_S));
     connect(saveAsAction, &QAction::triggered, this, &MainWindow::saveProjectAs);
 
     fileMenu->addSeparator();
 
-    auto *exportAction = fileMenu->addAction("&Export...");
+    auto *exportAction = fileMenu->addAction("エクスポート(&E)...");
     exportAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_E));
     connect(exportAction, &QAction::triggered, this, &MainWindow::exportVideo);
 
-    auto *remotionAction = fileMenu->addAction("Export to &Remotion...");
+    auto *remotionAction = fileMenu->addAction("Remotion形式でエクスポート(&R)...");
     connect(remotionAction, &QAction::triggered, this, &MainWindow::exportToRemotion);
 
     fileMenu->addSeparator();
 
-    auto *quitAction = fileMenu->addAction("&Quit");
+    auto *prefsMenu = fileMenu->addMenu("環境設定(&S)");
+    fileMenu->addSeparator();
+
+    auto *quitAction = fileMenu->addAction("終了(&Q)");
     quitAction->setShortcut(QKeySequence::Quit);
     connect(quitAction, &QAction::triggered, qApp, &QApplication::quit);
 
-    // Edit menu
-    auto *editMenu = menuBar()->addMenu("&Edit");
+    // 編集 メニュー
+    auto *editMenu = menuBar()->addMenu("編集(&E)");
 
-    m_undoAction = editMenu->addAction("&Undo");
+    m_undoAction = editMenu->addAction("元に戻す(&U)");
     m_undoAction->setShortcut(QKeySequence::Undo);
     connect(m_undoAction, &QAction::triggered, this, &MainWindow::undoAction);
 
-    m_redoAction = editMenu->addAction("&Redo");
+    m_redoAction = editMenu->addAction("やり直す(&R)");
     m_redoAction->setShortcut(QKeySequence::Redo);
     connect(m_redoAction, &QAction::triggered, this, &MainWindow::redoAction);
 
     editMenu->addSeparator();
 
-    m_copyAction = editMenu->addAction("&Copy Clip");
+    m_copyAction = editMenu->addAction("クリップをコピー(&C)");
     m_copyAction->setShortcut(QKeySequence::Copy);
     connect(m_copyAction, &QAction::triggered, this, &MainWindow::copyClip);
 
-    m_pasteAction = editMenu->addAction("&Paste Clip");
+    m_pasteAction = editMenu->addAction("クリップを貼り付け(&P)");
     m_pasteAction->setShortcut(QKeySequence::Paste);
     connect(m_pasteAction, &QAction::triggered, this, &MainWindow::pasteClip);
 
     editMenu->addSeparator();
 
-    m_splitAction = editMenu->addAction("&Split at Playhead");
+    m_splitAction = editMenu->addAction("再生ヘッドで分割(&S)");
     m_splitAction->setShortcut(QKeySequence(Qt::Key_S));
     connect(m_splitAction, &QAction::triggered, this, &MainWindow::splitClip);
 
-    m_deleteAction = editMenu->addAction("&Delete Clip");
+    m_deleteAction = editMenu->addAction("クリップを削除(&D)");
     m_deleteAction->setShortcut(QKeySequence::Delete);
     connect(m_deleteAction, &QAction::triggered, this, &MainWindow::deleteClip);
 
-    m_rippleDeleteAction = editMenu->addAction("&Ripple Delete");
+    m_rippleDeleteAction = editMenu->addAction("リップル削除");
     m_rippleDeleteAction->setShortcut(QKeySequence(Qt::SHIFT | Qt::Key_Delete));
     connect(m_rippleDeleteAction, &QAction::triggered, this, &MainWindow::rippleDelete);
 
     editMenu->addSeparator();
 
-    m_snapAction = editMenu->addAction("Toggle S&nap");
+    m_snapAction = editMenu->addAction("スナップ切替(&N)");
     m_snapAction->setShortcut(QKeySequence(Qt::Key_N));
     m_snapAction->setCheckable(true);
     m_snapAction->setChecked(true);
@@ -241,330 +274,336 @@ void MainWindow::setupMenuBar()
 
     editMenu->addSeparator();
 
-    auto *speedAction = editMenu->addAction("Set Clip &Speed...");
+    auto *speedAction = editMenu->addAction("再生速度を設定...");
     connect(speedAction, &QAction::triggered, this, &MainWindow::setClipSpeed);
 
     editMenu->addSeparator();
 
-    auto *shortcutAction = editMenu->addAction("&Keyboard Shortcuts...");
+    auto *shortcutAction = editMenu->addAction("キーボードショートカット(&K)...");
     shortcutAction->setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_K));
     connect(shortcutAction, &QAction::triggered, this, &MainWindow::editShortcuts);
+    prefsMenu->addAction(shortcutAction);
 
-    // View menu
-    auto *viewMenu = menuBar()->addMenu("&View");
+    // 表示 メニュー
+    auto *viewMenu = menuBar()->addMenu("表示(&V)");
 
-    auto *zoomInAction = viewMenu->addAction("Zoom &In");
+    auto *zoomInAction = viewMenu->addAction("拡大(&I)");
     zoomInAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Equal));
     connect(zoomInAction, &QAction::triggered, this, &MainWindow::zoomIn);
 
-    auto *zoomOutAction = viewMenu->addAction("Zoom &Out");
+    auto *zoomOutAction = viewMenu->addAction("縮小(&O)");
     zoomOutAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Minus));
     connect(zoomOutAction, &QAction::triggered, this, &MainWindow::zoomOut);
 
-    // Track menu
-    auto *trackMenu = menuBar()->addMenu("&Track");
+    // トラック メニュー
+    auto *trackMenu = menuBar()->addMenu("トラック(&T)");
 
-    auto *addVTrack = trackMenu->addAction("Add &Video Track");
+    auto *addVTrack = trackMenu->addAction("ビデオトラックを追加(&V)");
     connect(addVTrack, &QAction::triggered, this, &MainWindow::addVideoTrack);
 
-    auto *addATrack = trackMenu->addAction("Add &Audio Track");
+    auto *addATrack = trackMenu->addAction("オーディオトラックを追加(&A)");
     connect(addATrack, &QAction::triggered, this, &MainWindow::addAudioTrack);
 
-    // Insert menu
-    auto *insertMenu = menuBar()->addMenu("&Insert");
+    // 挿入 メニュー
+    auto *insertMenu = menuBar()->addMenu("挿入(&I)");
 
-    auto *addTextAction = insertMenu->addAction("Add &Text / Telop...");
+    auto *addTextAction = insertMenu->addAction("テキスト / テロップ追加(&T)...");
     addTextAction->setShortcut(QKeySequence(Qt::Key_T));
     connect(addTextAction, &QAction::triggered, this, &MainWindow::addTextOverlay);
 
-    auto *manageTextAction = insertMenu->addAction("&Manage Text Overlays...");
+    auto *manageTextAction = insertMenu->addAction("テキスト管理(&M)...");
     manageTextAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_T));
     connect(manageTextAction, &QAction::triggered, this, &MainWindow::manageTextOverlays);
 
-    auto *importSubAction = insertMenu->addAction("Import &Subtitles (SRT/VTT)...");
+    auto *importSubAction = insertMenu->addAction("字幕をインポート (SRT/VTT)...");
     connect(importSubAction, &QAction::triggered, this, &MainWindow::importSubtitles);
 
-    auto *saveTemplateAction = insertMenu->addAction("Save Text Te&mplate...");
+    auto *saveTemplateAction = insertMenu->addAction("テキストテンプレートを保存...");
     connect(saveTemplateAction, &QAction::triggered, this, &MainWindow::saveTextTemplate);
 
     insertMenu->addSeparator();
 
-    auto *addTransAction = insertMenu->addAction("Add T&ransition...");
+    auto *addTransAction = insertMenu->addAction("トランジションを追加...");
     connect(addTransAction, &QAction::triggered, this, &MainWindow::addTransition);
 
-    auto *addImageAction = insertMenu->addAction("Add &Image / Still...");
+    auto *addImageAction = insertMenu->addAction("画像 / 静止画を追加...");
     connect(addImageAction, &QAction::triggered, this, &MainWindow::addImageOverlay);
 
-    auto *addPipAction = insertMenu->addAction("Add &Picture in Picture...");
+    auto *addPipAction = insertMenu->addAction("ピクチャー・イン・ピクチャー追加...");
     connect(addPipAction, &QAction::triggered, this, &MainWindow::addPip);
 
-    // Audio menu
-    auto *audioMenu = menuBar()->addMenu("&Audio");
+    // オーディオ メニュー
+    auto *audioMenu = menuBar()->addMenu("オーディオ(&A)");
 
-    auto *volumeAction = audioMenu->addAction("Set Clip &Volume...");
+    auto *volumeAction = audioMenu->addAction("音量を設定...");
     connect(volumeAction, &QAction::triggered, this, &MainWindow::setClipVolume);
 
-    auto *bgmAction = audioMenu->addAction("Add &BGM / Audio File...");
+    auto *bgmAction = audioMenu->addAction("BGM / 音声ファイルを追加...");
     connect(bgmAction, &QAction::triggered, this, &MainWindow::addBgm);
 
     audioMenu->addSeparator();
 
-    auto *muteAction = audioMenu->addAction("Toggle &Mute (A1)");
+    auto *muteAction = audioMenu->addAction("ミュート切替 (A1)");
     muteAction->setShortcut(QKeySequence(Qt::Key_M));
     connect(muteAction, &QAction::triggered, this, &MainWindow::toggleMute);
 
-    auto *soloAction = audioMenu->addAction("Toggle &Solo (A1)");
+    auto *soloAction = audioMenu->addAction("ソロ切替 (A1)");
     connect(soloAction, &QAction::triggered, this, &MainWindow::toggleSolo);
 
     audioMenu->addSeparator();
 
-    auto *eqAction = audioMenu->addAction("&Equalizer...");
+    auto *eqAction = audioMenu->addAction("イコライザー...");
     connect(eqAction, &QAction::triggered, this, &MainWindow::audioEqualizer);
 
-    auto *audioFxAction = audioMenu->addAction("Audio E&ffects...");
+    auto *audioFxAction = audioMenu->addAction("オーディオエフェクト...");
     connect(audioFxAction, &QAction::triggered, this, &MainWindow::audioEffects);
 
     audioMenu->addSeparator();
 
-    auto *vstAction = audioMenu->addAction("&VST / AU Plugins...");
+    auto *vstAction = audioMenu->addAction("VST / AUプラグイン...");
     connect(vstAction, &QAction::triggered, this, &MainWindow::openVSTPlugins);
 
-    // Markers menu
-    auto *markersMenu = menuBar()->addMenu("Mar&kers");
+    // マーカー メニュー
+    auto *markersMenu = menuBar()->addMenu("マーカー(&K)");
 
-    auto *addMarkerAction = markersMenu->addAction("&Add Marker at Playhead");
+    auto *addMarkerAction = markersMenu->addAction("再生ヘッドにマーカー追加");
     addMarkerAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_M));
     connect(addMarkerAction, &QAction::triggered, this, &MainWindow::addMarker);
 
-    auto *showMarkersAction = markersMenu->addAction("&Show All Markers...");
+    auto *showMarkersAction = markersMenu->addAction("全マーカーを表示...");
     connect(showMarkersAction, &QAction::triggered, this, &MainWindow::showMarkers);
 
-    auto *exportChapAction = markersMenu->addAction("Export &YouTube Chapters...");
+    auto *exportChapAction = markersMenu->addAction("YouTubeチャプターをエクスポート...");
     connect(exportChapAction, &QAction::triggered, this, &MainWindow::exportChapters);
 
-    // Effects menu
-    auto *effectsMenu = menuBar()->addMenu("E&ffects");
+    // エフェクト メニュー
+    auto *effectsMenu = menuBar()->addMenu("エフェクト(&F)");
 
-    auto *ccAction = effectsMenu->addAction("&Color Correction / Grading...");
+    auto *ccAction = effectsMenu->addAction("色補正 / グレーディング(&C)...");
     ccAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_G));
     connect(ccAction, &QAction::triggered, this, &MainWindow::colorCorrection);
 
-    auto *fxAction = effectsMenu->addAction("&Video Effects...");
+    auto *fxAction = effectsMenu->addAction("ビデオエフェクト(&V)...");
     fxAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_F));
     connect(fxAction, &QAction::triggered, this, &MainWindow::videoEffects);
 
-    auto *pluginAction = effectsMenu->addAction("&Plugin Effects...");
+    auto *pluginAction = effectsMenu->addAction("プラグインエフェクト(&P)...");
     connect(pluginAction, &QAction::triggered, this, &MainWindow::pluginEffects);
 
     effectsMenu->addSeparator();
 
-    auto *lutAction = effectsMenu->addAction("Apply &LUT (.cube)...");
+    auto *lutAction = effectsMenu->addAction("LUT適用 (.cube)...");
     connect(lutAction, &QAction::triggered, this, &MainWindow::applyLut);
 
-    auto *manageLutAction = effectsMenu->addAction("Manage L&UTs...");
+    auto *manageLutAction = effectsMenu->addAction("LUT管理...");
     connect(manageLutAction, &QAction::triggered, this, &MainWindow::manageLuts);
 
     effectsMenu->addSeparator();
 
-    auto *applyPresetAction = effectsMenu->addAction("Apply Effect &Preset...");
+    auto *applyPresetAction = effectsMenu->addAction("エフェクトプリセット適用...");
     applyPresetAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_P));
     connect(applyPresetAction, &QAction::triggered, this, &MainWindow::applyEffectPreset);
 
-    auto *savePresetAction = effectsMenu->addAction("&Save Current as Preset...");
+    auto *savePresetAction = effectsMenu->addAction("現在設定をプリセットに保存...");
     connect(savePresetAction, &QAction::triggered, this, &MainWindow::saveEffectPreset);
 
-    auto *managePresetsAction = effectsMenu->addAction("&Manage Presets...");
+    auto *managePresetsAction = effectsMenu->addAction("プリセット管理...");
     connect(managePresetsAction, &QAction::triggered, this, &MainWindow::manageEffectPresets);
 
     effectsMenu->addSeparator();
 
-    auto *kfAction = effectsMenu->addAction("Edit &Keyframes...");
+    auto *kfAction = effectsMenu->addAction("キーフレーム編集(&K)...");
     kfAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_K));
     connect(kfAction, &QAction::triggered, this, &MainWindow::editKeyframes);
 
     effectsMenu->addSeparator();
 
-    auto *shaderFxAction = effectsMenu->addAction("&GPU Shader Effects...");
+    auto *shaderFxAction = effectsMenu->addAction("GPUシェーダーエフェクト...");
     connect(shaderFxAction, &QAction::triggered, this, &MainWindow::applyShaderEffect);
 
-    auto *manageShaderAction = effectsMenu->addAction("Manage GPU S&haders...");
+    auto *manageShaderAction = effectsMenu->addAction("GPUシェーダー管理...");
     connect(manageShaderAction, &QAction::triggered, this, &MainWindow::manageShaderEffects);
 
-    // Playback menu
-    auto *playbackMenu = menuBar()->addMenu("&Playback");
+    // 再生 メニュー
+    auto *playbackMenu = menuBar()->addMenu("再生(&P)");
 
-    auto *jklNote = playbackMenu->addAction("J/K/L Speed Control");
+    auto *jklNote = playbackMenu->addAction("J/K/L 速度コントロール");
     jklNote->setEnabled(false);
 
     playbackMenu->addSeparator();
 
-    auto *markInAction = playbackMenu->addAction("Mark &In");
+    auto *markInAction = playbackMenu->addAction("イン点をマーク(&I)");
     markInAction->setShortcut(QKeySequence(Qt::Key_I));
     connect(markInAction, &QAction::triggered, this, &MainWindow::markIn);
 
-    auto *markOutAction = playbackMenu->addAction("Mark &Out");
+    auto *markOutAction = playbackMenu->addAction("アウト点をマーク(&O)");
     markOutAction->setShortcut(QKeySequence(Qt::Key_O));
     connect(markOutAction, &QAction::triggered, this, &MainWindow::markOut);
 
-    // Tools menu (AI / Auto-edit)
-    auto *toolsMenu = menuBar()->addMenu("&Tools");
+    // ツール メニュー (AI / 自動編集)
+    auto *toolsMenu = menuBar()->addMenu("ツール(&T)");
 
-    auto *silenceAction = toolsMenu->addAction("Detect &Silence...");
+    auto *silenceAction = toolsMenu->addAction("無音検出...");
     connect(silenceAction, &QAction::triggered, this, &MainWindow::autoSilenceDetect);
 
-    auto *jumpCutAction = toolsMenu->addAction("Auto &Jump Cut...");
+    auto *jumpCutAction = toolsMenu->addAction("自動ジャンプカット...");
     connect(jumpCutAction, &QAction::triggered, this, &MainWindow::autoJumpCut);
 
-    auto *sceneAction = toolsMenu->addAction("Detect Scene &Changes...");
+    auto *sceneAction = toolsMenu->addAction("シーン変化検出...");
     connect(sceneAction, &QAction::triggered, this, &MainWindow::autoSceneDetect);
 
     toolsMenu->addSeparator();
 
-    auto *stabilizeAction = toolsMenu->addAction("Video Stabi&lize...");
+    auto *stabilizeAction = toolsMenu->addAction("手ブレ補正...");
     connect(stabilizeAction, &QAction::triggered, this, &MainWindow::stabilizeVideo);
 
-    auto *speedRampAction = toolsMenu->addAction("S&peed Ramp (Variable Speed)...");
+    auto *speedRampAction = toolsMenu->addAction("スピードランプ (可変速)...");
     connect(speedRampAction, &QAction::triggered, this, &MainWindow::setSpeedRamp);
 
     toolsMenu->addSeparator();
 
-    auto *motionTrackAction = toolsMenu->addAction("&Motion Tracking...");
+    auto *motionTrackAction = toolsMenu->addAction("モーショントラッキング...");
     connect(motionTrackAction, &QAction::triggered, this, &MainWindow::motionTrackSetup);
 
     toolsMenu->addSeparator();
 
-    auto *audioDenoiseAction = toolsMenu->addAction("Audio &Noise Reduction...");
+    auto *audioDenoiseAction = toolsMenu->addAction("音声ノイズ除去...");
     connect(audioDenoiseAction, &QAction::triggered, this, &MainWindow::audioNoiseDenoise);
 
-    auto *videoDenoiseAction = toolsMenu->addAction("&Video Denoise...");
+    auto *videoDenoiseAction = toolsMenu->addAction("映像ノイズ除去...");
     connect(videoDenoiseAction, &QAction::triggered, this, &MainWindow::videoNoiseDenoise);
 
     toolsMenu->addSeparator();
 
-    auto *subtitleGenAction = toolsMenu->addAction("Auto-Generate &Subtitles (Whisper)...");
+    auto *subtitleGenAction = toolsMenu->addAction("字幕自動生成 (Whisper)...");
     connect(subtitleGenAction, &QAction::triggered, this, &MainWindow::generateSubtitles);
 
-    auto *highlightAction = toolsMenu->addAction("AI Auto-&Highlight...");
+    auto *highlightAction = toolsMenu->addAction("AI自動ハイライト...");
     connect(highlightAction, &QAction::triggered, this, &MainWindow::analyzeHighlights);
 
     toolsMenu->addSeparator();
 
-    auto *screenRecAction = toolsMenu->addAction("Start Screen &Recording...");
+    auto *screenRecAction = toolsMenu->addAction("画面録画を開始...");
     connect(screenRecAction, &QAction::triggered, this, &MainWindow::startScreenRecording);
 
-    auto *stopRecAction = toolsMenu->addAction("S&top Screen Recording");
+    auto *stopRecAction = toolsMenu->addAction("画面録画を停止");
     connect(stopRecAction, &QAction::triggered, this, &MainWindow::stopScreenRecording);
 
     toolsMenu->addSeparator();
 
-    auto *proxyToggle = toolsMenu->addAction("Toggle &Proxy Mode");
+    auto *proxyToggle = toolsMenu->addAction("プロキシモード切替");
     proxyToggle->setCheckable(true);
     connect(proxyToggle, &QAction::triggered, this, &MainWindow::toggleProxyMode);
 
-    auto *genProxiesAction = toolsMenu->addAction("Generate Pro&xies...");
+    auto *genProxiesAction = toolsMenu->addAction("プロキシ生成...");
     connect(genProxiesAction, &QAction::triggered, this, &MainWindow::generateProxies);
 
-    auto *renderQueueAction = toolsMenu->addAction("&Render Queue...");
+    auto *renderQueueAction = toolsMenu->addAction("レンダーキュー...");
     renderQueueAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R));
     connect(renderQueueAction, &QAction::triggered, this, &MainWindow::openRenderQueue);
 
-    auto *networkRenderAction = toolsMenu->addAction("&Network Render...");
+    auto *networkRenderAction = toolsMenu->addAction("ネットワークレンダー...");
     connect(networkRenderAction, &QAction::triggered, this, &MainWindow::openNetworkRender);
 
     toolsMenu->addSeparator();
 
-    auto *scriptAction = toolsMenu->addAction("P&ython Script Console...");
+    auto *scriptAction = toolsMenu->addAction("Pythonスクリプトコンソール...");
     scriptAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_P));
     connect(scriptAction, &QAction::triggered, this, &MainWindow::openScriptConsole);
 
     toolsMenu->addSeparator();
 
-    auto *multiCamSetupAction = toolsMenu->addAction("&Multi-Camera Setup...");
+    auto *multiCamSetupAction = toolsMenu->addAction("マルチカメラセットアップ...");
     connect(multiCamSetupAction, &QAction::triggered, this, &MainWindow::multiCamSetup);
 
-    auto *multiCamSwitchAction = toolsMenu->addAction("Multi-Camera S&witch...");
+    auto *multiCamSwitchAction = toolsMenu->addAction("マルチカメラ切替...");
     connect(multiCamSwitchAction, &QAction::triggered, this, &MainWindow::multiCamSwitch);
 
-    // Composition menu (AE-like features)
-    auto *compMenu = menuBar()->addMenu("&Composition");
+    // コンポジション メニュー (After Effects風)
+    auto *compMenu = menuBar()->addMenu("コンポジション(&C)");
 
-    auto *addShapeAction = compMenu->addAction("Add &Shape Layer...");
+    auto *addShapeAction = compMenu->addAction("シェイプレイヤー追加...");
     connect(addShapeAction, &QAction::triggered, this, &MainWindow::addShapeLayer);
 
-    auto *addParticleAction = compMenu->addAction("Add &Particle Effect...");
+    auto *addParticleAction = compMenu->addAction("パーティクルエフェクト追加...");
     connect(addParticleAction, &QAction::triggered, this, &MainWindow::addParticleEffect);
 
-    auto *textAnimAction = compMenu->addAction("Add &Text Animation...");
+    auto *textAnimAction = compMenu->addAction("テキストアニメーション追加...");
     connect(textAnimAction, &QAction::triggered, this, &MainWindow::addTextAnimation);
 
     compMenu->addSeparator();
 
-    auto *transformKfAction = compMenu->addAction("Edit T&ransform Keyframes...");
+    auto *transformKfAction = compMenu->addAction("トランスフォームキーフレーム編集...");
     connect(transformKfAction, &QAction::triggered, this, &MainWindow::editTransformKeyframes);
 
-    auto *maskAction = compMenu->addAction("Add &Mask...");
+    auto *maskAction = compMenu->addAction("マスク追加...");
     connect(maskAction, &QAction::triggered, this, &MainWindow::addMask);
 
-    auto *warpAction = compMenu->addAction("Apply &Warp / Distortion...");
+    auto *warpAction = compMenu->addAction("ワープ / 歪みエフェクト...");
     connect(warpAction, &QAction::triggered, this, &MainWindow::applyWarpEffect);
 
     compMenu->addSeparator();
 
-    auto *exprAction = compMenu->addAction("&Expressions...");
+    auto *exprAction = compMenu->addAction("エクスプレッション...");
     connect(exprAction, &QAction::triggered, this, &MainWindow::editExpressions);
 
-    auto *precompAction = compMenu->addAction("Pre-&Compose Selected...");
+    auto *precompAction = compMenu->addAction("選択をプリコンポーズ...");
     connect(precompAction, &QAction::triggered, this, &MainWindow::precomposeSelected);
 
-    // View menu extras
-    auto *themeAction = viewMenu->addAction("Change &Theme...");
+    // 表示メニュー追加項目
+    auto *themeAction = viewMenu->addAction("テーマ変更...");
     connect(themeAction, &QAction::triggered, this, &MainWindow::changeTheme);
 
     viewMenu->addSeparator();
 
-    auto *tooltipAction = viewMenu->addAction("Show Toolbar &Tooltips");
+    auto *tooltipAction = viewMenu->addAction("ツールバーのツールチップを表示");
     tooltipAction->setCheckable(true);
     {
-        QSettings prefSettings("VEditorSimple", "Preferences");
+        QSettings prefSettings("VSimpleEditor", "Preferences");
         tooltipAction->setChecked(prefSettings.value("showTooltips", true).toBool());
     }
     connect(tooltipAction, &QAction::toggled, this, [this](bool checked) {
-        QSettings prefSettings("VEditorSimple", "Preferences");
+        QSettings prefSettings("VSimpleEditor", "Preferences");
         prefSettings.setValue("showTooltips", checked);
         // Re-apply tooltips on all toolbar actions
         auto *toolbar = findChild<QToolBar *>("Main");
         if (!toolbar) return;
         if (checked) {
-            // Rebuild toolbar to restore tooltips
-            statusBar()->showMessage("Tooltips enabled — restart to apply");
+            statusBar()->showMessage("ツールチップ有効 — 再起動で反映");
         } else {
             for (auto *action : toolbar->actions())
                 action->setToolTip("");
-            statusBar()->showMessage("Toolbar tooltips disabled");
+            statusBar()->showMessage("ツールバーのツールチップを無効化");
         }
     });
 
-    auto *toolbarStyleAction = viewMenu->addAction("Toolbar &Icons Only");
+    auto *toolbarStyleAction = viewMenu->addAction("ツールバーをアイコンのみ表示");
     toolbarStyleAction->setCheckable(true);
     connect(toolbarStyleAction, &QAction::toggled, this, [this](bool iconOnly) {
         auto *toolbar = findChild<QToolBar *>();
         if (toolbar) {
             toolbar->setToolButtonStyle(iconOnly ? Qt::ToolButtonIconOnly : Qt::ToolButtonTextBesideIcon);
-            QSettings prefSettings("VEditorSimple", "Preferences");
+            QSettings prefSettings("VSimpleEditor", "Preferences");
             prefSettings.setValue("toolbarIconOnly", iconOnly);
         }
     });
 
-    // Help menu
-    auto *helpMenu = menuBar()->addMenu("&Help");
+    // 環境設定サブメニューに共有QActionを集約
+    prefsMenu->addSeparator();
+    prefsMenu->addAction(themeAction);
+    prefsMenu->addAction(tooltipAction);
+    prefsMenu->addAction(toolbarStyleAction);
 
-    auto *resourceGuideAction = helpMenu->addAction("Free &Resource Guide...");
+    // ヘルプ メニュー
+    auto *helpMenu = menuBar()->addMenu("ヘルプ(&H)");
+
+    auto *resourceGuideAction = helpMenu->addAction("無料素材ガイド...");
     resourceGuideAction->setShortcut(QKeySequence(Qt::Key_F1));
     connect(resourceGuideAction, &QAction::triggered, this, &MainWindow::showResourceGuide);
 
     helpMenu->addSeparator();
 
-    auto *aboutAction = helpMenu->addAction("&About");
+    auto *aboutAction = helpMenu->addAction("バージョン情報(&A)");
     connect(aboutAction, &QAction::triggered, this, &MainWindow::about);
 }
 
@@ -584,28 +623,28 @@ void MainWindow::setupToolBar()
         return action;
     };
 
-    addBtn("new", "New", "New Project (Ctrl+N)", &MainWindow::newProject);
-    addBtn("open", "Open", "Open File (Ctrl+O)", &MainWindow::openFile);
-    addBtn("save", "Save", "Save Project (Ctrl+S)", &MainWindow::saveProject);
+    addBtn("new", "新規", "新規プロジェクト (Ctrl+N)", &MainWindow::newProject);
+    addBtn("open", "開く", "ファイルを開く (Ctrl+O)", &MainWindow::openFile);
+    addBtn("save", "保存", "プロジェクトを保存 (Ctrl+S)", &MainWindow::saveProject);
     toolbar->addSeparator();
-    addBtn("undo", "Undo", "Undo (Ctrl+Z)", &MainWindow::undoAction);
-    addBtn("redo", "Redo", "Redo (Ctrl+Shift+Z)", &MainWindow::redoAction);
+    addBtn("undo", "元に戻す", "元に戻す (Ctrl+Z)", &MainWindow::undoAction);
+    addBtn("redo", "やり直し", "やり直し (Ctrl+Shift+Z)", &MainWindow::redoAction);
     toolbar->addSeparator();
-    addBtn("split", "Split", "Split at Playhead (S)", &MainWindow::splitClip);
-    addBtn("delete", "Delete", "Delete Clip (Del)", &MainWindow::deleteClip);
-    addBtn("copy", "Copy", "Copy Clip (Ctrl+C)", &MainWindow::copyClip);
-    addBtn("paste", "Paste", "Paste Clip (Ctrl+V)", &MainWindow::pasteClip);
+    addBtn("split", "分割", "再生ヘッドで分割 (S)", &MainWindow::splitClip);
+    addBtn("delete", "削除", "クリップ削除 (Del)", &MainWindow::deleteClip);
+    addBtn("copy", "コピー", "クリップをコピー (Ctrl+C)", &MainWindow::copyClip);
+    addBtn("paste", "貼付", "クリップを貼り付け (Ctrl+V)", &MainWindow::pasteClip);
     toolbar->addSeparator();
-    addBtn("text", "Text", "Add Text Overlay (T)", &MainWindow::addTextOverlay);
-    addBtn("color", "Color", "Color Correction (Ctrl+G)", &MainWindow::colorCorrection);
-    addBtn("effects", "Effects", "Video Effects (Ctrl+Shift+F)", &MainWindow::videoEffects);
-    addBtn("marker", "Marker", "Add Marker (Ctrl+M)", &MainWindow::addMarker);
+    addBtn("text", "テキスト", "テキスト追加 (T)", &MainWindow::addTextOverlay);
+    addBtn("color", "色補正", "色補正 (Ctrl+G)", &MainWindow::colorCorrection);
+    addBtn("effects", "効果", "ビデオエフェクト (Ctrl+Shift+F)", &MainWindow::videoEffects);
+    addBtn("marker", "マーカー", "マーカー追加 (Ctrl+M)", &MainWindow::addMarker);
     toolbar->addSeparator();
-    addBtn("export", "Export", "Export Video (Ctrl+E)", &MainWindow::exportVideo);
-    addBtn("record", "Record", "Start Screen Recording", &MainWindow::startScreenRecording);
+    addBtn("export", "出力", "動画をエクスポート (Ctrl+E)", &MainWindow::exportVideo);
+    addBtn("record", "録画", "画面録画を開始", &MainWindow::startScreenRecording);
 
     // Apply saved tooltip preference
-    QSettings settings("VEditorSimple", "Preferences");
+    QSettings settings("VSimpleEditor", "Preferences");
     bool showTooltips = settings.value("showTooltips", true).toBool();
     if (!showTooltips) {
         for (auto *action : toolbar->actions())
@@ -626,7 +665,7 @@ void MainWindow::updateEditActions()
 
 void MainWindow::updateTitle()
 {
-    QString title = QString("V Editor Simple - %1 (%2 %3fps)")
+    QString title = QString("V Simple Editor - %1 (%2 %3fps)")
         .arg(m_projectConfig.name)
         .arg(m_projectConfig.resolutionLabel())
         .arg(m_projectConfig.fps);
@@ -700,11 +739,14 @@ void MainWindow::openProject()
     }
 
     m_projectFilePath = filePath;
-    m_recentFilesManager->addFile(filePath);
+    if (m_recentFilesManager)
+        m_recentFilesManager->addFile(filePath);
     m_projectConfig = data.config;
-    m_player->setCanvasSize(data.config.width, data.config.height);
-    m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
-        data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
+    if (m_player)
+        m_player->setCanvasSize(data.config.width, data.config.height);
+    if (m_timeline)
+        m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
+            data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
     updateTitle();
     hideWelcomeScreen();
     updateStatusInfo();
@@ -716,15 +758,8 @@ void MainWindow::openFile()
 {
     QString filter = "Video Files (*.mp4 *.mkv *.mov *.webm *.flv);;All Files (*)";
     QString filePath = QFileDialog::getOpenFileName(this, "Open Video", QString(), filter);
-    if (!filePath.isEmpty()) {
-        m_player->loadFile(filePath);
-        m_timeline->addClip(filePath);
-        m_recentFilesManager->addFile(filePath);
-        hideWelcomeScreen();
-        updateStatusInfo();
-        statusBar()->showMessage("Loaded: " + filePath);
-        updateEditActions();
-    }
+    if (!filePath.isEmpty())
+        loadMediaFile(filePath, true, "Loaded");
 }
 
 void MainWindow::exportVideo()
@@ -1690,10 +1725,20 @@ void MainWindow::toggleProxyMode()
     auto &pm = ProxyManager::instance();
     pm.setProxyMode(!pm.isProxyMode());
     statusBar()->showMessage(pm.isProxyMode() ? "Proxy mode ON (low-res playback)" : "Proxy mode OFF (original quality)");
+
+    if (!m_timeline || !m_player)
+        return;
+    const auto &clips = m_timeline->videoClips();
+    if (!clips.isEmpty())
+        m_player->loadFile(pm.getProxyPath(clips.first().filePath));
 }
 
 void MainWindow::generateProxies()
 {
+    if (!m_timeline) {
+        QMessageBox::information(this, "Proxies", "Timeline not ready.");
+        return;
+    }
     const auto &clips = m_timeline->videoClips();
     if (clips.isEmpty()) {
         QMessageBox::information(this, "Proxies", "Add clips first.");
@@ -1707,6 +1752,11 @@ void MainWindow::generateProxies()
     auto &pm = ProxyManager::instance();
     connect(&pm, &ProxyManager::allProxiesReady, this, [this]() {
         statusBar()->showMessage("All proxies generated");
+        if (!m_timeline || !m_player)
+            return;
+        const auto &clips = m_timeline->videoClips();
+        if (!clips.isEmpty())
+            m_player->loadFile(ProxyManager::instance().getProxyPath(clips.first().filePath));
     }, Qt::UniqueConnection);
     connect(&pm, &ProxyManager::progressChanged, this, [this](int pct) {
         statusBar()->showMessage(QString("Generating proxies... %1%").arg(pct));
@@ -2201,8 +2251,8 @@ void MainWindow::showResourceGuide()
 
 void MainWindow::about()
 {
-    QMessageBox::about(this, "About V Editor Simple",
-        QString("V Editor Simple v%1\n\n"
+    QMessageBox::about(this, "About V Simple Editor",
+        QString("V Simple Editor v%1\n\n"
                 "A full-featured video editor with 90+ features.\n"
                 "Built with C++17 / Qt6 / FFmpeg / OpenGL 3.3.\n\n"
                 "Features: multi-track timeline, AE-style compositing,\n"
@@ -2225,7 +2275,8 @@ void MainWindow::openRecentFile(const QString &filePath)
     if (!fi.exists()) {
         QMessageBox::warning(this, "File Not Found",
             QString("The file '%1' no longer exists.").arg(filePath));
-        m_recentFilesManager->removeFile(filePath);
+        if (m_recentFilesManager)
+            m_recentFilesManager->removeFile(filePath);
         return;
     }
 
@@ -2234,18 +2285,23 @@ void MainWindow::openRecentFile(const QString &filePath)
         ProjectData data;
         if (ProjectFile::load(filePath, data)) {
             m_projectConfig = data.config;
-            m_player->setCanvasSize(data.config.width, data.config.height);
-            m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
-                data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
+            if (m_player)
+                m_player->setCanvasSize(data.config.width, data.config.height);
+            if (m_timeline)
+                m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
+                    data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
             m_projectFilePath = filePath;
+            if (m_recentFilesManager)
+                m_recentFilesManager->addFile(filePath);
             updateTitle();
+            hideWelcomeScreen();
+            updateStatusInfo();
+            updateEditActions();
             statusBar()->showMessage("Opened project: " + fi.fileName());
         }
     } else {
-        m_player->loadFile(filePath);
-        statusBar()->showMessage("Opened: " + fi.fileName());
+        loadMediaFile(filePath, false, "Opened");
     }
-    m_recentFilesManager->addFile(filePath);
 }
 
 void MainWindow::editShortcuts()
@@ -2344,57 +2400,119 @@ void MainWindow::setupStatusBarWidgets()
 
 void MainWindow::updateStatusInfo()
 {
-    m_statusResolution->setText(QString("%1x%2").arg(m_projectConfig.width).arg(m_projectConfig.height));
-    m_statusFps->setText(QString("%1 fps").arg(m_projectConfig.fps));
+    if (m_statusResolution)
+        m_statusResolution->setText(QString("%1x%2").arg(m_projectConfig.width).arg(m_projectConfig.height));
+    if (m_statusFps)
+        m_statusFps->setText(QString("%1 fps").arg(m_projectConfig.fps));
 
-    double totalDur = m_timeline->totalDuration();
-    int h = (int)(totalDur / 3600);
-    int m = (int)(fmod(totalDur, 3600) / 60);
-    int s = (int)(fmod(totalDur, 60));
-    m_statusDuration->setText(QString("%1:%2:%3")
-        .arg(h, 2, 10, QChar('0'))
-        .arg(m, 2, 10, QChar('0'))
-        .arg(s, 2, 10, QChar('0')));
+    if (m_statusDuration) {
+        const double totalDur = m_timeline ? m_timeline->totalDuration() : 0.0;
+        int h = (int)(totalDur / 3600);
+        int m = (int)(fmod(totalDur, 3600) / 60);
+        int s = (int)(fmod(totalDur, 60));
+        m_statusDuration->setText(QString("%1:%2:%3")
+            .arg(h, 2, 10, QChar('0'))
+            .arg(m, 2, 10, QChar('0'))
+            .arg(s, 2, 10, QChar('0')));
+    }
 
-    m_statusTheme->setText(ThemeManager::themeName(ThemeManager::instance().currentTheme()));
+    if (m_statusTheme)
+        m_statusTheme->setText(ThemeManager::themeName(ThemeManager::instance().currentTheme()));
+}
+
+void MainWindow::testLoadFile(const QString &filePath)
+{
+    qInfo() << "MainWindow::testLoadFile" << filePath;
+    loadMediaFile(filePath, true, "Loaded");
+}
+
+void MainWindow::testStartPlayback()
+{
+    qInfo() << "MainWindow::testStartPlayback";
+    if (m_player)
+        QMetaObject::invokeMethod(m_player, "play", Qt::QueuedConnection);
+}
+
+void MainWindow::loadMediaFile(const QString &filePath, bool addToTimeline, const QString &statusPrefix)
+{
+    qInfo() << "MainWindow::loadMediaFile" << filePath << "addToTimeline=" << addToTimeline;
+    if (filePath.isEmpty())
+        return;
+
+    const QFileInfo fi(filePath);
+    if (addToTimeline && m_timeline)
+        m_timeline->addClip(filePath);
+    if (m_recentFilesManager)
+        m_recentFilesManager->addFile(filePath);
+
+    hideWelcomeScreen();
+    updateStatusInfo();
+    updateEditActions();
+    statusBar()->showMessage("Loading: " + fi.fileName());
+
+    // When the file is added to the timeline, the player is driven by the
+    // Timeline::sequenceChanged → VideoPlayer::setSequence wiring (synchronous
+    // from addClip above), so we must NOT call loadFile() again here — that
+    // would clobber the sequence-driven load with a single-file load.
+    const QString playbackPath = ProxyManager::instance().getProxyPath(filePath);
+    const bool needsDirectLoad = !addToTimeline;
+    QPointer<MainWindow> guard(this);
+    QTimer::singleShot(0, this, [guard, filePath, playbackPath, statusPrefix, needsDirectLoad]() {
+        if (!guard)
+            return;
+        qInfo() << "MainWindow::loadMediaFile deferred load" << playbackPath
+                << "directLoad=" << needsDirectLoad;
+        if (needsDirectLoad && guard->m_player)
+            guard->m_player->loadFile(playbackPath);
+        guard->updateStatusInfo();
+        guard->updateEditActions();
+        guard->statusBar()->showMessage(statusPrefix + ": " + QFileInfo(filePath).fileName());
+    });
 }
 
 void MainWindow::showWelcomeScreen()
 {
-    m_welcomeWidget->setRecentFiles(m_recentFilesManager->recentFiles());
-    m_welcomeWidget->setVisible(true);
-    m_mainSplitter->setVisible(false);
+    if (m_welcomeWidget) {
+        if (m_recentFilesManager)
+            m_welcomeWidget->setRecentFiles(m_recentFilesManager->recentFiles());
+        m_welcomeWidget->setVisible(true);
+    }
+    if (m_mainSplitter)
+        m_mainSplitter->setVisible(false);
     m_hasContent = false;
 }
 
 void MainWindow::hideWelcomeScreen()
 {
-    if (!m_hasContent) {
+    if (m_hasContent)
+        return;
+    if (m_welcomeWidget)
         m_welcomeWidget->setVisible(false);
+    if (m_mainSplitter)
         m_mainSplitter->setVisible(true);
-        m_hasContent = true;
-    }
+    m_hasContent = true;
 }
 
 void MainWindow::saveWindowState()
 {
-    QSettings settings("VEditorSimple", "WindowState");
+    QSettings settings("VSimpleEditor", "WindowState");
     settings.setValue("geometry", saveGeometry());
     settings.setValue("windowState", saveState());
-    settings.setValue("splitterState", m_mainSplitter->saveState());
+    if (m_mainSplitter)
+        settings.setValue("splitterState", m_mainSplitter->saveState());
     settings.setValue("theme", (int)ThemeManager::instance().currentTheme());
 }
 
 void MainWindow::restoreWindowState()
 {
-    QSettings settings("VEditorSimple", "WindowState");
+    QSettings settings("VSimpleEditor", "WindowState");
     if (settings.contains("geometry")) {
         restoreGeometry(settings.value("geometry").toByteArray());
     }
     if (settings.contains("windowState")) {
         restoreState(settings.value("windowState").toByteArray());
     }
-    if (settings.contains("splitterState")) {
+    if (m_mainSplitter && settings.contains("splitterState")) {
         m_mainSplitter->restoreState(settings.value("splitterState").toByteArray());
     }
     if (settings.contains("theme")) {
@@ -2430,11 +2548,14 @@ void MainWindow::dropEvent(QDropEvent *event)
             ProjectData data;
             if (ProjectFile::load(filePath, data)) {
                 m_projectFilePath = filePath;
-                m_recentFilesManager->addFile(filePath);
+                if (m_recentFilesManager)
+                    m_recentFilesManager->addFile(filePath);
                 m_projectConfig = data.config;
-                m_player->setCanvasSize(data.config.width, data.config.height);
-                m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
-                    data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
+                if (m_player)
+                    m_player->setCanvasSize(data.config.width, data.config.height);
+                if (m_timeline)
+                    m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
+                        data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
                 updateTitle();
                 hideWelcomeScreen();
                 updateStatusInfo();
@@ -2442,15 +2563,23 @@ void MainWindow::dropEvent(QDropEvent *event)
             }
         } else {
             // Open as media file
-            m_player->loadFile(filePath);
-            m_timeline->addClip(filePath);
-            m_recentFilesManager->addFile(filePath);
-            hideWelcomeScreen();
-            updateStatusInfo();
-            statusBar()->showMessage("Loaded: " + QFileInfo(filePath).fileName());
+            loadMediaFile(filePath, true, "Loaded");
         }
     }
     updateEditActions();
+}
+
+void MainWindow::showEvent(QShowEvent *event)
+{
+    QMainWindow::showEvent(event);
+
+    if (!m_autoSaveStarted && m_autoSave) {
+        m_autoSaveStarted = true;
+        QTimer::singleShot(500, this, [this]() {
+            if (m_autoSave)
+                m_autoSave->start(AutoSaveConfig{});
+        });
+    }
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)

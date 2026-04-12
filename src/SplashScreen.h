@@ -94,7 +94,7 @@ protected:
         QFont titleFont("Segoe UI", 36, QFont::Bold);
         painter->setFont(titleFont);
         painter->setPen(QColor(255, 255, 255));
-        painter->drawText(QRect(50, 190, width() - 100, 50), Qt::AlignCenter, "V Editor Simple");
+        painter->drawText(QRect(50, 190, width() - 100, 50), Qt::AlignCenter, "V Simple Editor");
 
         // Version
         QFont versionFont("Segoe UI", 12);
