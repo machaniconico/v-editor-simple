@@ -357,8 +357,18 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     // the QMediaPlayer side-player and cause audible double playback.
     const bool entryStructurallyChanged = needFileSwitch || (m_activeEntry != desiredIdx);
 
+    // Snapshot playback state BEFORE loadFile+resetDecoder tear down the
+    // playback timer and the audio side-player, so we can resurrect them
+    // after the file swap completes.
+    const bool wasPlaying = m_playing;
+    qInfo() << "VideoPlayer::setSequence flow"
+            << "wasPlaying=" << wasPlaying
+            << "needFileSwitch=" << needFileSwitch
+            << "entryStructurallyChanged=" << entryStructurallyChanged
+            << "desiredIdx=" << desiredIdx
+            << "m_activeEntry(before)=" << m_activeEntry;
+
     if (needFileSwitch) {
-        const bool wasPlaying = m_playing;
         loadFile(target.filePath);  // resets decoder, clears m_playing
         if (wasPlaying)
             m_playing = true;
@@ -381,6 +391,26 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     // Audio mute may have changed even when the entry is otherwise unchanged
     // (e.g. user toggled the M button on the active track) — always reapply.
     applyActiveEntryAudioMute();
+
+    // If a sequenceChanged arrived mid-playback (e.g. a linked-clip drag was
+    // released while playing), loadFile+resetDecoder halted both the playback
+    // timer and the audio side-player. Resurrect them here — without this the
+    // player sits in a zombie state where m_playing=true but nothing actually
+    // ticks, which looks like the pause button stopped responding AND
+    // silences audio even though the file was just reloaded.
+    if (wasPlaying && needFileSwitch) {
+        qInfo() << "VideoPlayer::setSequence resurrecting timer+audio"
+                << "audioSourceValid=" << (m_audioPlayer && m_audioPlayer->source().isValid());
+        scheduleNextFrame();
+        if (m_audioPlayer && m_audioPlayer->source().isValid() && m_playbackSpeed >= 0.0)
+            m_audioPlayer->play();
+    }
+
+    // Keep the play/pause button enabled states in sync with m_playing.
+    // Without this, the button may show the wrong enabled state after we
+    // restore m_playing post-loadFile — and the user experiences a "dead"
+    // pause button even though the click is wired.
+    updatePlayButton();
 
     updatePositionUi();
 }
@@ -469,10 +499,10 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     // inside loadFile. We explicitly call updatePositionUi at the end.
     const bool prevSuppress = m_suppressUiUpdates;
     m_suppressUiUpdates = needSwitch;
+    const bool wasPlayingOuter = m_playing;
     if (needSwitch) {
-        const bool wasPlaying = m_playing;
         loadFile(e.filePath); // sets m_audioPlayer source as part of init
-        if (wasPlaying)
+        if (wasPlayingOuter)
             m_playing = true;
     }
 
@@ -482,6 +512,18 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     const bool ok = seekInternal(localUs, true, precise);
     applyActiveEntryAudioMute();
     m_suppressUiUpdates = prevSuppress;
+
+    // resetDecoder (called from loadFile when needSwitch) ran updatePlayButton
+    // with m_playing=false and stopped the audio side-player. Resurrect both
+    // — without this, a seek that crosses a file boundary leaves the pause
+    // button visually disabled and the audio track silent.
+    if (wasPlayingOuter && needSwitch) {
+        scheduleNextFrame();
+        if (m_audioPlayer && m_audioPlayer->source().isValid() && m_playbackSpeed >= 0.0)
+            m_audioPlayer->play();
+    }
+    updatePlayButton();
+
     updatePositionUi();
     return ok;
 }
@@ -526,6 +568,12 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
     if (wasPlaying)
         m_playing = true;
     m_suppressUiUpdates = prevSuppress;
+    // resetDecoder (called from loadFile) ran updatePlayButton with
+    // m_playing=false and disabled the pause button. After we restore
+    // m_playing above, sync the button enabled state again — otherwise
+    // the user sees the pause button as un-clickable across every clip
+    // boundary that crosses a file switch.
+    updatePlayButton();
     updatePositionUi();
     return true;
 }
