@@ -77,6 +77,44 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
     if (cc.gamma != 1.0)
         adjustGamma(img, cc.gamma);
 
+    // Lift/Gamma/Gain (DaVinci Resolve style) — must match GLSL applyLiftGammaGain()
+    bool hasLGG = cc.liftR != 0.0 || cc.liftG != 0.0 || cc.liftB != 0.0
+               || cc.gammaR != 0.0 || cc.gammaG != 0.0 || cc.gammaB != 0.0
+               || cc.gainR != 0.0 || cc.gainG != 0.0 || cc.gainB != 0.0;
+    if (hasLGG) {
+        const int w = img.width(), h = img.height();
+        for (int y = 0; y < h; ++y) {
+            uint8_t *line = img.scanLine(y);
+            for (int x = 0; x < w; ++x) {
+                double r = line[x * 3 + 0] / 255.0;
+                double g = line[x * 3 + 1] / 255.0;
+                double b = line[x * 3 + 2] / 255.0;
+
+                // Gain: multiply signal
+                r *= (1.0 + cc.gainR);
+                g *= (1.0 + cc.gainG);
+                b *= (1.0 + cc.gainB);
+
+                // Lift: offset weighted by inverse luminance
+                r += cc.liftR * (1.0 - r);
+                g += cc.liftG * (1.0 - g);
+                b += cc.liftB * (1.0 - b);
+
+                // Gamma: power curve through midtones
+                double gpR = 1.0 / qMax(1.0 + cc.gammaR, 0.01);
+                double gpG = 1.0 / qMax(1.0 + cc.gammaG, 0.01);
+                double gpB = 1.0 / qMax(1.0 + cc.gammaB, 0.01);
+                r = std::pow(qMax(r, 0.0), gpR);
+                g = std::pow(qMax(g, 0.0), gpG);
+                b = std::pow(qMax(b, 0.0), gpB);
+
+                line[x * 3 + 0] = static_cast<uint8_t>(qBound(0.0, r, 1.0) * 255.0);
+                line[x * 3 + 1] = static_cast<uint8_t>(qBound(0.0, g, 1.0) * 255.0);
+                line[x * 3 + 2] = static_cast<uint8_t>(qBound(0.0, b, 1.0) * 255.0);
+            }
+        }
+    }
+
     return img;
 }
 

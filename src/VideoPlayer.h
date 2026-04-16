@@ -42,6 +42,7 @@ public:
     void setColorCorrection(const ColorCorrection &cc);
     bool isGLAccelerated() const { return m_useGL; }
     void setGLAcceleration(bool enabled);
+    GLPreview *glPreview() const { return m_glPreview; }
 
 public slots:
     void play();

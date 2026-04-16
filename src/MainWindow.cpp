@@ -6,6 +6,8 @@
 #include "OverlayDialogs.h"
 #include "VideoEffectDialogs.h"
 #include "EffectPlugin.h"
+#include "ColorGradingPanel.h"
+#include "GLPreview.h"
 #include <QApplication>
 #include <QMessageBox>
 #include <QVBoxLayout>
@@ -536,6 +538,58 @@ void MainWindow::setupMenuBar()
     auto *precompAction = compMenu->addAction("選択をプリコンポーズ...");
     connect(precompAction, &QAction::triggered, this, &MainWindow::precomposeSelected);
 
+    // --- カラーグレーディングパネル ---
+    m_colorGradingPanel = new ColorGradingPanel(this);
+    addDockWidget(Qt::RightDockWidgetArea, m_colorGradingPanel);
+    m_colorGradingPanel->setLutList(LutLibrary::instance().allLuts());
+    m_colorGradingPanel->hide(); // 初期非表示
+
+    connect(m_colorGradingPanel, &ColorGradingPanel::colorCorrectionChanged,
+            this, [this](const ColorCorrection &cc) {
+        if (m_timeline->hasSelection()) {
+            m_timeline->setClipColorCorrection(cc);
+            m_player->setColorCorrection(cc);
+        }
+    });
+    connect(m_colorGradingPanel, &ColorGradingPanel::lutSelected,
+            this, [this](const QString &name) {
+        if (name.isEmpty()) {
+            m_player->glPreview()->clearLut();
+            return;
+        }
+        LutData lut = LutLibrary::instance().findByName(name);
+        if (lut.isValid()) {
+            lut.intensity = m_colorGradingPanel->lutIntensity();
+            m_player->glPreview()->setLut(lut);
+        }
+    });
+    connect(m_colorGradingPanel, &ColorGradingPanel::lutIntensityChanged,
+            this, [this](double intensity) {
+        QString name = m_colorGradingPanel->selectedLutName();
+        if (name.isEmpty()) return;
+        LutData lut = LutLibrary::instance().findByName(name);
+        if (lut.isValid()) {
+            lut.intensity = intensity;
+            m_player->glPreview()->setLut(lut);
+        }
+    });
+    connect(m_colorGradingPanel, &ColorGradingPanel::resetRequested,
+            this, [this]() {
+        if (m_timeline->hasSelection()) {
+            ColorCorrection cc;
+            m_timeline->setClipColorCorrection(cc);
+            m_player->setColorCorrection(cc);
+            m_player->glPreview()->clearLut();
+        }
+    });
+
+    viewMenu->addSeparator();
+    auto *colorPanelAction = viewMenu->addAction("カラーグレーディングパネル(&G)");
+    colorPanelAction->setCheckable(true);
+    colorPanelAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_G));
+    connect(colorPanelAction, &QAction::toggled, m_colorGradingPanel, &QDockWidget::setVisible);
+    connect(m_colorGradingPanel, &QDockWidget::visibilityChanged, colorPanelAction, &QAction::setChecked);
+
     // 表示メニュー追加項目
     auto *themeAction = viewMenu->addAction("テーマ変更...");
     connect(themeAction, &QAction::triggered, this, &MainWindow::changeTheme);
@@ -1057,19 +1111,10 @@ void MainWindow::colorCorrection()
         QMessageBox::information(this, "Color Correction", "Select a clip first.");
         return;
     }
-    ColorCorrectionDialog dialog(m_timeline->clipColorCorrection(), this);
-    if (dialog.exec() == QDialog::Accepted) {
-        m_timeline->setClipColorCorrection(dialog.result());
-        m_player->setColorCorrection(dialog.result()); // Update GPU preview
-        auto cc = dialog.result();
-        QStringList changes;
-        if (cc.brightness != 0) changes << QString("Brightness %1").arg(cc.brightness);
-        if (cc.contrast != 0)   changes << QString("Contrast %1").arg(cc.contrast);
-        if (cc.saturation != 0) changes << QString("Saturation %1").arg(cc.saturation);
-        if (cc.exposure != 0)   changes << QString("Exposure %1").arg(cc.exposure, 0, 'f', 2);
-        statusBar()->showMessage(changes.isEmpty() ? "Color correction reset" :
-            "Color: " + changes.join(", "));
-    }
+    // カラーグレーディングパネルを表示し、選択クリップの値を反映
+    m_colorGradingPanel->setColorCorrection(m_timeline->clipColorCorrection());
+    m_colorGradingPanel->show();
+    m_colorGradingPanel->raise();
 }
 
 void MainWindow::videoEffects()

@@ -44,6 +44,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/OverlayDialogs.cpp
     src/VideoEffect.cpp
     src/VideoEffectDialogs.cpp
+    src/ColorWheelWidget.cpp
+    src/ColorGradingPanel.cpp
     src/Keyframe.cpp
     src/EffectPlugin.cpp
     src/ProjectFile.cpp

@@ -183,6 +183,7 @@ private:
 
     VideoPlayer *m_player;
     Timeline *m_timeline;
+    class ColorGradingPanel *m_colorGradingPanel = nullptr;
     QStringList m_supportedFormats;
     ProjectConfig m_projectConfig;
 

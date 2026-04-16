@@ -19,11 +19,19 @@ struct ColorCorrection {
     double shadows = 0.0;       // -100 to 100
     double exposure = 0.0;      // -3.0 to 3.0
 
+    // Lift/Gamma/Gain color wheels (DaVinci Resolve style)
+    double liftR = 0.0, liftG = 0.0, liftB = 0.0;       // -1.0 to 1.0
+    double gammaR = 0.0, gammaG = 0.0, gammaB = 0.0;     // -1.0 to 1.0
+    double gainR = 0.0, gainG = 0.0, gainB = 0.0;        // -1.0 to 1.0
+
     bool isDefault() const {
         return brightness == 0.0 && contrast == 0.0 && saturation == 0.0
             && hue == 0.0 && temperature == 0.0 && tint == 0.0
             && gamma == 1.0 && highlights == 0.0 && shadows == 0.0
-            && exposure == 0.0;
+            && exposure == 0.0
+            && liftR == 0.0 && liftG == 0.0 && liftB == 0.0
+            && gammaR == 0.0 && gammaG == 0.0 && gammaB == 0.0
+            && gainR == 0.0 && gainG == 0.0 && gainB == 0.0;
     }
 
     void reset() { *this = ColorCorrection{}; }

@@ -16,7 +16,7 @@ void main() {
 }
 )";
 
-// Fragment shader — color correction pipeline on GPU
+// Fragment shader — color correction + color grading pipeline on GPU
 static const char *fragmentShaderSrc = R"(
 #version 330 core
 in vec2 vTexCoord;
@@ -36,6 +36,16 @@ uniform float uGamma;        // 0.1 to 3.0
 uniform float uHighlights;   // -100 to 100
 uniform float uShadows;      // -100 to 100
 uniform float uExposure;     // -3.0 to 3.0
+
+// Lift/Gamma/Gain color wheels (DaVinci Resolve style)
+uniform float uLiftR, uLiftG, uLiftB;     // -1.0 to 1.0
+uniform float uGammaR, uGammaG, uGammaB;  // -1.0 to 1.0
+uniform float uGainR, uGainG, uGainB;     // -1.0 to 1.0
+
+// 3D LUT uniforms
+uniform sampler3D uLut3D;
+uniform float uLutIntensity;  // 0.0 to 1.0
+uniform bool uLutEnabled;
 
 vec3 adjustExposure(vec3 color, float exposure) {
     return color * pow(2.0, exposure);
@@ -99,6 +109,25 @@ vec3 adjustGamma(vec3 color, float gamma) {
     return pow(max(color, vec3(0.0)), vec3(invGamma));
 }
 
+// DaVinci Resolve-style Lift/Gamma/Gain
+// Lift  = shadows offset (applied more in darks)
+// Gamma = midtone power (applied via power function weighted to midtones)
+// Gain  = highlight multiplier (scales the entire signal)
+vec3 applyLiftGammaGain(vec3 color, vec3 lift, vec3 gamma, vec3 gain) {
+    // Gain: multiply signal  (1.0 + gain adjustment)
+    vec3 gained = color * (vec3(1.0) + gain);
+
+    // Lift: add offset weighted by inverse luminance (affects shadows more)
+    vec3 lifted = gained + lift * (vec3(1.0) - gained);
+
+    // Gamma: power curve through midtones
+    // gamma adjustment maps [-1,1] to a power curve: 0 = no change, negative = darken mids, positive = brighten mids
+    vec3 gammaPow = vec3(1.0) / max(vec3(1.0) + gamma, vec3(0.01));
+    vec3 result = pow(max(lifted, vec3(0.0)), gammaPow);
+
+    return result;
+}
+
 void main() {
     vec4 texColor = texture(uTexture, vTexCoord);
     vec3 color = texColor.rgb;
@@ -119,6 +148,19 @@ void main() {
             color = adjustTemperatureTint(color, uTemperature, uTint);
         if (uGamma != 1.0)
             color = adjustGamma(color, uGamma);
+
+        // Lift/Gamma/Gain color wheels (DaVinci Resolve style)
+        vec3 lift  = vec3(uLiftR,  uLiftG,  uLiftB);
+        vec3 gamma = vec3(uGammaR, uGammaG, uGammaB);
+        vec3 gain  = vec3(uGainR,  uGainG,  uGainB);
+        if (lift != vec3(0.0) || gamma != vec3(0.0) || gain != vec3(0.0))
+            color = applyLiftGammaGain(color, lift, gamma, gain);
+
+        // 3D LUT application
+        if (uLutEnabled) {
+            vec3 lutColor = texture(uLut3D, clamp(color, 0.0, 1.0)).rgb;
+            color = mix(color, lutColor, uLutIntensity);
+        }
     }
 
     FragColor = vec4(clamp(color, 0.0, 1.0), texColor.a);
@@ -152,6 +194,10 @@ void GLPreview::cleanupGL()
         return;
 
     makeCurrent();
+    if (m_lutTexture) {
+        delete m_lutTexture;
+        m_lutTexture = nullptr;
+    }
     if (m_texture) {
         delete m_texture;
         m_texture = nullptr;
@@ -237,6 +283,22 @@ void GLPreview::createShaderProgram()
     m_locShadows        = m_program->uniformLocation("uShadows");
     m_locExposure       = m_program->uniformLocation("uExposure");
     m_locEffectsEnabled = m_program->uniformLocation("uEffectsEnabled");
+
+    // Lift/Gamma/Gain
+    m_locLiftR  = m_program->uniformLocation("uLiftR");
+    m_locLiftG  = m_program->uniformLocation("uLiftG");
+    m_locLiftB  = m_program->uniformLocation("uLiftB");
+    m_locGammaR = m_program->uniformLocation("uGammaR");
+    m_locGammaG = m_program->uniformLocation("uGammaG");
+    m_locGammaB = m_program->uniformLocation("uGammaB");
+    m_locGainR  = m_program->uniformLocation("uGainR");
+    m_locGainG  = m_program->uniformLocation("uGainG");
+    m_locGainB  = m_program->uniformLocation("uGainB");
+
+    // LUT
+    m_locLut3D         = m_program->uniformLocation("uLut3D");
+    m_locLutIntensity  = m_program->uniformLocation("uLutIntensity");
+    m_locLutEnabled    = m_program->uniformLocation("uLutEnabled");
 }
 
 void GLPreview::resizeGL(int w, int h)
@@ -378,12 +440,92 @@ void GLPreview::paintGL()
     m_program->setUniformValue(m_locShadows,     static_cast<float>(m_cc.shadows));
     m_program->setUniformValue(m_locExposure,    static_cast<float>(m_cc.exposure));
 
+    // Lift/Gamma/Gain
+    m_program->setUniformValue(m_locLiftR,  static_cast<float>(m_cc.liftR));
+    m_program->setUniformValue(m_locLiftG,  static_cast<float>(m_cc.liftG));
+    m_program->setUniformValue(m_locLiftB,  static_cast<float>(m_cc.liftB));
+    m_program->setUniformValue(m_locGammaR, static_cast<float>(m_cc.gammaR));
+    m_program->setUniformValue(m_locGammaG, static_cast<float>(m_cc.gammaG));
+    m_program->setUniformValue(m_locGammaB, static_cast<float>(m_cc.gammaB));
+    m_program->setUniformValue(m_locGainR,  static_cast<float>(m_cc.gainR));
+    m_program->setUniformValue(m_locGainG,  static_cast<float>(m_cc.gainG));
+    m_program->setUniformValue(m_locGainB,  static_cast<float>(m_cc.gainB));
+
+    // LUT
+    m_program->setUniformValue(m_locLutEnabled, m_lutEnabled);
+    m_program->setUniformValue(m_locLutIntensity, m_lutIntensity);
+    if (m_lutEnabled && m_lutTexture) {
+        glActiveTexture(GL_TEXTURE1);
+        m_lutTexture->bind();
+        m_program->setUniformValue(m_locLut3D, 1);
+    }
+
     // Draw quad
     m_vao.bind();
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     m_vao.release();
 
+    if (m_lutEnabled && m_lutTexture) {
+        glActiveTexture(GL_TEXTURE1);
+        m_lutTexture->release();
+        glActiveTexture(GL_TEXTURE0);
+    }
+
     m_texture->release();
     m_program->release();
     glViewport(0, 0, physW, physH);
+}
+
+void GLPreview::setLut(const LutData &lut)
+{
+    if (!lut.isValid()) {
+        clearLut();
+        return;
+    }
+
+    makeCurrent();
+
+    if (m_lutTexture) {
+        delete m_lutTexture;
+        m_lutTexture = nullptr;
+    }
+
+    // Create 3D texture from LUT table
+    m_lutTexture = new QOpenGLTexture(QOpenGLTexture::Target3D);
+    m_lutTexture->setSize(lut.size, lut.size, lut.size);
+    m_lutTexture->setFormat(QOpenGLTexture::RGB32F);
+    m_lutTexture->allocateStorage();
+    m_lutTexture->setMinificationFilter(QOpenGLTexture::Linear);
+    m_lutTexture->setMagnificationFilter(QOpenGLTexture::Linear);
+    m_lutTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
+
+    // Upload LUT data as float RGB
+    QVector<float> data;
+    data.reserve(lut.table.size() * 3);
+    for (const QVector3D &v : lut.table) {
+        data.append(v.x());
+        data.append(v.y());
+        data.append(v.z());
+    }
+    m_lutTexture->setData(QOpenGLTexture::RGB, QOpenGLTexture::Float32,
+                          data.constData());
+
+    m_lutIntensity = static_cast<float>(lut.intensity);
+    m_lutEnabled = true;
+
+    doneCurrent();
+    update();
+}
+
+void GLPreview::clearLut()
+{
+    makeCurrent();
+    if (m_lutTexture) {
+        delete m_lutTexture;
+        m_lutTexture = nullptr;
+    }
+    m_lutEnabled = false;
+    m_lutIntensity = 1.0f;
+    doneCurrent();
+    update();
 }

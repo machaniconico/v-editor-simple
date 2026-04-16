@@ -8,6 +8,7 @@
 #include <QOpenGLVertexArrayObject>
 #include <QImage>
 #include "VideoEffect.h"
+#include "LutImporter.h"
 
 class GLPreview : public QOpenGLWidget, protected QOpenGLFunctions
 {
@@ -22,6 +23,8 @@ public:
     void setColorCorrection(const ColorCorrection &cc);
     void setEffectsEnabled(bool enabled) { m_effectsEnabled = enabled; update(); }
     bool effectsEnabled() const { return m_effectsEnabled; }
+    void setLut(const LutData &lut);
+    void clearLut();
 
 protected:
     void initializeGL() override;
@@ -59,4 +62,17 @@ private:
     int m_locShadows = -1;
     int m_locExposure = -1;
     int m_locEffectsEnabled = -1;
+
+    // Lift/Gamma/Gain uniform locations
+    int m_locLiftR = -1, m_locLiftG = -1, m_locLiftB = -1;
+    int m_locGammaR = -1, m_locGammaG = -1, m_locGammaB = -1;
+    int m_locGainR = -1, m_locGainG = -1, m_locGainB = -1;
+
+    // LUT uniform locations and texture
+    int m_locLut3D = -1;
+    int m_locLutIntensity = -1;
+    int m_locLutEnabled = -1;
+    QOpenGLTexture *m_lutTexture = nullptr;
+    float m_lutIntensity = 1.0f;
+    bool m_lutEnabled = false;
 };
