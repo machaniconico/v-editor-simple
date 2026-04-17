@@ -1,0 +1,189 @@
+
+ ============================================================
+  V Simple Editor - One-Click Setup and Build
+  This script will install everything and build the app.
+
+  *** Please run as Administrator for automatic installs ***
+ ============================================================
+
+[Preparing] Adding Windows Defender exclusions for build directories...
+  [OK] Defender exclusions set (requires admin)
+
+[Step 1/7] Checking and installing prerequisites...
+
+  Checking winget...
+  [OK] winget available
+  Checking Git...
+  [OK] Git found
+  Checking CMake...
+  [OK] CMake found
+  Checking Visual Studio...
+  [OK] Visual Studio: C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat
+  Setting up MSVC environment...
+  [OK] MSVC x64 environment ready
+
+[Step 2/7] Setting up vcpkg...
+  [OK] vcpkg already installed at C:\vcpkg
+  [OK] vcpkg integrated
+
+[Step 3/7] Installing libraries via vcpkg (first time may take 30-60 min)...
+  Packages: Qt6, FFmpeg, pkgconf
+
+  [Installing] Qt6...
+Computing installation plan...
+The following packages are already installed:
+    qtbase[core,zstd,widgets,thread,testlib,sql-sqlite,sql-psql,sql,sessionmanager,png,pcre2,openssl,opengl,network,jpeg,icu,harfbuzz,gui,freetype,doubleconversion,dnslookup,dbus,concurrent,brotli]:x64-windows@6.10.2
+    qtmultimedia[core,widgets,ffmpeg]:x64-windows@6.10.2
+    qtnetworkauth:x64-windows@6.10.2
+Total install time: 601 us
+All requested installations completed successfully in: 601 us
+  [OK] Qt6 ready
+  [Installing] FFmpeg...
+Computing installation plan...
+The following packages are already installed:
+    ffmpeg[core,swscale,swresample,avformat,avfilter,avdevice,avcodec]:x64-windows@8.1#2
+Total install time: 595 us
+All requested installations completed successfully in: 595 us
+  [OK] FFmpeg ready
+  [Installing] pkgconf...
+Computing installation plan...
+The following packages are already installed:
+    pkgconf:x64-windows@2.5.1#4
+Total install time: 568 us
+All requested installations completed successfully in: 568 us
+  [OK] pkgconf ready
+
+[Step 4/7] Configuring with CMake...
+  Using generator: Visual Studio 17 2022
+-- Selecting Windows SDK version 10.0.26100.0 to target Windows 10.0.26200.
+-- The CXX compiler identification is MSVC 19.44.35224.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Failed
+-- Looking for pthread_create in pthreads
+-- Looking for pthread_create in pthreads - not found
+-- Looking for pthread_create in pthread
+-- Looking for pthread_create in pthread - not found
+-- Found Threads: TRUE
+-- Performing Test HAVE_STDATOMIC
+-- Performing Test HAVE_STDATOMIC - Success
+-- Found WrapAtomic: TRUE
+-- Configuring done (3.9s)
+-- Generating done (0.3s)
+-- Build files have been written to: C:/Users/macha/OneDrive/デスクトップ/v-simple-editor/build
+  [OK] CMake configured
+
+[Step 5/7] Building (Release)...
+MSBuild のバージョン 17.14.40+3e7442088 (.NET Framework)
+
+  1>Checking Build System
+  Automatic MOC and UIC for target v-simple-editor
+  1>Automatic RCC for resources/resources.qrc
+  Building Custom Rule C:/Users/macha/OneDrive/デスクトップ/v-simple-editor/CMakeLists.txt
+  main.cpp
+  MainWindow.cpp
+  VideoPlayer.cpp
+  Timeline.cpp
+  ProjectSettings.cpp
+  ExportDialog.cpp
+  Exporter.cpp
+  CodecDetector.cpp
+  UndoManager.cpp
+  Overlay.cpp
+  OverlayDialogs.cpp
+  VideoEffect.cpp
+  VideoEffectDialogs.cpp
+  Keyframe.cpp
+  EffectPlugin.cpp
+  ProjectFile.cpp
+  GLPreview.cpp
+  ShaderEffect.cpp
+  WaveformGenerator.cpp
+  AutoEdit.cpp
+  コードを生成中...
+  コンパイル中...
+  ThemeManager.cpp
+  MultiCam.cpp
+  TextManager.cpp
+  TextInteractive.cpp
+  EffectPreset.cpp
+  SubtitleGenerator.cpp
+  MotionTracker.cpp
+  TrackerLink.cpp
+  NoiseReduction.cpp
+C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\src\NoiseReduction.cpp(361,26): warning C4834: [[nodiscard]] 属性を持つ関数の戻り値を破棄しています [C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\build\v-simple-editor.vcxproj]
+C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\src\NoiseReduction.cpp(444,35): warning C4834: [[nodiscard]] 属性を持つ関数の戻り値を破棄しています [C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\build\v-simple-editor.vcxproj]
+C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\src\NoiseReduction.cpp(447,31): warning C4834: [[nodiscard]] 属性を持つ関数の戻り値を破棄しています [C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\build\v-simple-editor.vcxproj]
+C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\src\NoiseReduction.cpp(472,35): warning C4834: [[nodiscard]] 属性を持つ関数の戻り値を破棄しています [C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\build\v-simple-editor.vcxproj]
+C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\src\NoiseReduction.cpp(475,31): warning C4834: [[nodiscard]] 属性を持つ関数の戻り値を破棄しています [C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\build\v-simple-editor.vcxproj]
+  ResourceGuide.cpp
+  AutoSave.cpp
+  ProxyManager.cpp
+  LutImporter.cpp
+  TimelineMarker.cpp
+  VideoStabilizer.cpp
+  SpeedRamp.cpp
+  RenderQueue.cpp
+  AudioEQ.cpp
+  ScreenRecorder.cpp
+  AIHighlight.cpp
+  コードを生成中...
+  コンパイル中...
+  LayerCompositor.cpp
+  TransformAnimator.cpp
+  MaskSystem.cpp
+  ParticleSystem.cpp
+  TextAnimator.cpp
+  ShapeLayer.cpp
+  Camera3D.cpp
+  Expression.cpp
+  Precompose.cpp
+  Rotoscope.cpp
+  WarpDistortion.cpp
+  RecentFiles.cpp
+  ShortcutEditor.cpp
+  VSTHost.cpp
+  NetworkRender.cpp
+  RemotionExport.cpp
+  PythonScript.cpp
+  mocs_compilation_Release.cpp
+  qrc_resources_Release.cpp
+  コードを生成中...
+  v-simple-editor.vcxproj -> C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\build\Release\v-simple-editor.exe
+  Building Custom Rule C:/Users/macha/OneDrive/デスクトップ/v-simple-editor/CMakeLists.txt
+  [OK] Build successful
+
+[Step 6/7] Deploying DLLs and runtime tools...
+  Running windeployqt from vcpkg...
+  [OK] Qt DLLs deployed
+  Copying FFmpeg DLLs...
+  [OK] FFmpeg DLLs deployed
+  Copying FFmpeg CLI tools...
+
+[Step 7/7] Optional tools...
+
+  Checking Python...
+  [OK] Python 3.12.10 found
+  Checking Whisper...
+  [OK] Whisper found
+
+
+ ============================================================
+  BUILD COMPLETE
+ ============================================================
+
+  Executable: C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\build\Release\v-simple-editor.exe
+
+Launch V Simple Editor now? (y/n): 
+  To rebuild after code changes:
+    cmake --build build --config Release
+
+  To update from GitHub:
+    git pull
+    cmake --build build --config Release
+
+Press any key to continue . . . 

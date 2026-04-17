@@ -26,5 +26,7 @@
         <file>icons/script.svg</file>
         <file>icons/network.svg</file>
         <file>icons/plugin.svg</file>
+        <file>icons/spin-up.svg</file>
+        <file>icons/spin-down.svg</file>
     </qresource>
 </RCC>

@@ -1,0 +1,8 @@
+MSBuild のバージョン 17.14.40+3e7442088 (.NET Framework)
+
+  Automatic MOC and UIC for target v-simple-editor
+  mocs_compilation_Release.cpp
+  MainWindow.cpp
+  VideoPlayer.cpp
+  コードを生成中...
+  v-simple-editor.vcxproj -> C:\Users\macha\OneDrive\デスクトップ\v-simple-editor\build\Release\v-simple-editor.exe

@@ -22,6 +22,8 @@ QVector<CodecOption> CodecDetector::availableVideoEncoders()
         {"AV1 QSV",            "av1_qsv",      false, 5},
         {"AV1 AMF",            "av1_amf",       false, 5},
         {"VP9",                "libvpx-vp9",    false, 4},
+        {"ProRes (Kostya)",    "prores_ks",     false, 5},
+        {"ProRes (Anatoly)",   "prores_aw",     false, 4},
     };
 
     for (auto &enc : encoders)
@@ -40,6 +42,8 @@ QVector<CodecOption> CodecDetector::availableAudioEncoders()
         {"MP3 (LAME)",           "libmp3lame",  false, 3},
         {"ALAC (Apple Lossless)","alac",        false, 5},
         {"FLAC (Lossless)",      "flac",        false, 5},
+        {"PCM 16-bit (for ProRes MOV)", "pcm_s16le", false, 5},
+        {"PCM 24-bit (for ProRes MOV)", "pcm_s24le", false, 5},
     };
 
     for (auto &enc : encoders)

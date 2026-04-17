@@ -17,6 +17,14 @@ struct PlaybackEntry {
     double speed = 1.0;          // Playback speed multiplier (>0)
     int sourceTrack = 0;         // 0 = V1, 1 = V2, ... (higher = front in stacking)
     bool audioMuted = false;     // Audio for this entry is muted (corresponding A track muted)
+    // US-T35 per-clip video source transform, copied from ClipInfo at
+    // Timeline::buildPlaybackEntries time. Applied by VideoPlayer when
+    // the entry becomes active so each clip keeps its own scale/offset.
+    double videoScale = 1.0;
+    double videoDx = 0.0;
+    double videoDy = 0.0;
+    double opacity = 1.0;        // PiP alpha, propagated from ClipInfo::opacity
+    int sourceClipIndex = -1;    // Index into TimelineTrack::m_clips
 };
 
 Q_DECLARE_METATYPE(PlaybackEntry)

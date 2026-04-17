@@ -12,6 +12,8 @@
 #include <QMimeData>
 #include <QLabel>
 #include <QShowEvent>
+#include <QColor>
+#include <QRectF>
 #include "ProjectSettings.h"
 #include "Exporter.h"
 #include "ProjectFile.h"
@@ -75,6 +77,7 @@ public slots:
 
 private slots:
     void newProject();
+    void editProjectSettings();
     void openFile();
     void saveProject();
     void saveProjectAs();
@@ -97,6 +100,7 @@ private slots:
     void setClipSpeed();
     void addTextOverlay();
     void manageTextOverlays();
+    void exportTextOverlays();
     void importSubtitles();
     void saveTextTemplate();
     void addTransition();
@@ -228,4 +232,51 @@ private:
     QLabel *m_statusTheme = nullptr;
     bool m_hasContent = false;
     bool m_autoSaveStarted = false;
+
+    // Text tool mode + right-side property panel (Adobe-style text tool).
+    // m_previewSplitter wraps [m_player | m_toolPropertyStack] horizontally
+    // and is the widget inserted into m_mainSplitter's top half.
+    QSplitter *m_previewSplitter = nullptr;
+    class QStackedWidget *m_toolPropertyStack = nullptr;
+    QAction *m_textToolAction = nullptr;
+    bool m_textToolActive = false;
+    class QLineEdit *m_textToolLineEdit = nullptr;
+    class QSpinBox *m_textToolSizeSpin = nullptr;
+    class QPushButton *m_textToolColorButton = nullptr;
+    class QDoubleSpinBox *m_textToolStartSpin = nullptr;
+    class QDoubleSpinBox *m_textToolEndSpin = nullptr;
+    QColor m_textToolColor;
+    class QCheckBox *m_textToolGradientCheck = nullptr;
+    class QPushButton *m_textToolGradientStartBtn = nullptr;
+    class QPushButton *m_textToolGradientEndBtn = nullptr;
+    class QDoubleSpinBox *m_textToolGradientAngleSpin = nullptr;
+    class QComboBox *m_textToolGradientTypeCombo = nullptr;
+    class QDoubleSpinBox *m_textToolGradientMidSpin = nullptr;
+    class QCheckBox *m_textToolGradientReverseCheck = nullptr;
+    QColor m_textToolGradientStart;
+    QColor m_textToolGradientEnd;
+    // Illustrator-style multi-stop gradient editor and per-stop controls.
+    class GradientStopBar *m_textToolStopBar = nullptr;
+    class QPushButton *m_textToolStopColorBtn = nullptr;
+    class QDoubleSpinBox *m_textToolStopOpacitySpin = nullptr;
+    class QDoubleSpinBox *m_textToolStopPosSpin = nullptr;
+    class QPushButton *m_textToolGradientPresetSaveBtn = nullptr;
+    class QPushButton *m_textToolGradientPresetLoadBtn = nullptr;
+    class QCheckBox *m_textToolOutlineCheck = nullptr;
+    class QPushButton *m_textToolOutlineColorBtn = nullptr;
+    class QSpinBox *m_textToolOutlineWidthSpin = nullptr;
+    QColor m_textToolOutlineColor;
+    // Last drag rectangle on the preview in normalized 0.0–1.0 widget-relative
+    // coordinates; populated by VideoPlayer::textRectRequested and consumed by
+    // the 適用 button.
+    QRectF m_textToolPendingRect;
+    bool m_textToolHasPendingRect = false;
+
+    void setupToolPropertyPanel();
+    void onTextToolToggled(bool checked);
+    void onTextRectRequested(const QRectF &normalizedRect);
+    void onTextInlineCommitted(const QString &text, const QRectF &normalizedRect);
+    void onTextOverlayEditCommitted(int overlayIndex, const QString &newText);
+    void applyTextToolOverlay();
+    void pushTextToolStyleToPreview();
 };

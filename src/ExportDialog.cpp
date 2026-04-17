@@ -21,7 +21,14 @@ QVector<ExportPreset> ExportDialog::presets()
 {
     return {
         {"YouTube (1080p H.264)",       "libx264",    "aac",      "mp4",  10000, 192, 0},
+        {"YouTube (1440p H.264)",       "libx264",    "aac",      "mp4",  16000, 192, 0},
         {"YouTube (4K H.264)",          "libx264",    "aac",      "mp4",  35000, 192, 0},
+        {"HDR10 (HEVC Main10)",         "libx265",    "aac",      "mp4",  25000, 192, 0, true},
+        {"ProRes 422 Proxy",            "prores_ks",  "pcm_s16le","mov",  45000, 1536, 0, false, 0},
+        {"ProRes 422 LT",               "prores_ks",  "pcm_s16le","mov", 102000, 1536, 0, false, 1},
+        {"ProRes 422",                  "prores_ks",  "pcm_s16le","mov", 147000, 1536, 0, false, 2},
+        {"ProRes 422 HQ",               "prores_ks",  "pcm_s16le","mov", 220000, 1536, 0, false, 3},
+        {"ProRes 4444",                 "prores_ks",  "pcm_s16le","mov", 330000, 1536, 0, false, 4},
         {"YouTube (AV1 高圧縮)",        "libsvtav1",  "aac",      "mp4",   8000, 192, 0},
         {"YouTube Shorts",              "libx264",    "aac",      "mp4",   8000, 192, 0},
         {"TikTok / Reels",              "libx264",    "aac",      "mp4",   8000, 192, 0},
@@ -59,6 +66,15 @@ void ExportDialog::setupUI()
     for (const auto &p : presetList)
         m_presetCombo->addItem(p.name);
     presetLayout->addWidget(m_presetCombo);
+
+    m_hdrWarningLabel = new QLabel(
+        "Warning: source is SDR; output will be tagged HDR10 but not actually HDR",
+        this);
+    m_hdrWarningLabel->setStyleSheet("color: #c97c1a; font-size: 11px; padding: 2px;");
+    m_hdrWarningLabel->setWordWrap(true);
+    m_hdrWarningLabel->hide();
+    presetLayout->addWidget(m_hdrWarningLabel);
+
     mainLayout->addWidget(presetGroup);
 
     // Codec settings
@@ -177,7 +193,30 @@ void ExportDialog::onPresetChanged(int index)
         m_audioBitrateSpin->setValue(p.audioBitrate);
     }
 
+    if (m_hdrWarningLabel) {
+        const bool presetIsHdr = (!isCustom
+                                  && index < presetList.size()
+                                  && presetList[index].hdr10);
+        m_hdrWarningLabel->setVisible(presetIsHdr && !m_sourceIsHdr);
+    }
+
     updateSummary();
+}
+
+void ExportDialog::setSourceIsHdr(bool hdr)
+{
+    m_sourceIsHdr = hdr;
+    if (hdr) {
+        const auto presetList = presets();
+        for (int i = 0; i < presetList.size(); ++i) {
+            if (presetList[i].hdr10) {
+                m_presetCombo->setCurrentIndex(i);
+                break;
+            }
+        }
+    } else {
+        onPresetChanged(m_presetCombo->currentIndex());
+    }
 }
 
 void ExportDialog::onBrowseOutput()
@@ -214,8 +253,14 @@ void ExportDialog::onExport()
 
     const auto presetList = presets();
     int idx = m_presetCombo->currentIndex();
-    if (idx < presetList.size())
+    if (idx < presetList.size()) {
         m_config.maxFileSizeMB = presetList[idx].maxFileSizeMB;
+        m_config.hdr10 = presetList[idx].hdr10;
+        m_config.proresProfile = presetList[idx].proresProfile;
+    } else {
+        m_config.hdr10 = false;
+        m_config.proresProfile = -1;
+    }
 
     accept();
 }
@@ -224,6 +269,7 @@ QString ExportDialog::defaultExtension() const
 {
     QString vc = m_videoCodecCombo->currentData().toString();
     if (vc == "libvpx-vp9") return "webm";
+    if (vc.startsWith("prores")) return "mov";
     if (vc == "libx265") return "mkv";
     return "mp4";
 }

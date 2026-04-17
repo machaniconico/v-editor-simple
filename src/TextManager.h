@@ -62,6 +62,14 @@ struct RubyAnnotation {
     QString ruby;         // ruby text (furigana)
 };
 
+// --- Gradient Stop ---
+
+struct GradientStop {
+    double position = 0.0; // 0.0 - 1.0
+    QColor color = Qt::white;
+    double opacity = 1.0;  // 0.0 - 1.0, multiplied into color alpha at render time
+};
+
 // --- Enhanced Text Overlay ---
 
 struct EnhancedTextOverlay {
@@ -89,6 +97,20 @@ struct EnhancedTextOverlay {
     int outlineWidth = 2;
     QColor outline2Color = QColor(0, 0, 0, 0); // second outline (0 alpha = disabled)
     int outline2Width = 0;
+
+    // Gradient fill overrides `color` when enabled. Angle in degrees: 0=L→R, 90=T→B.
+    // Legacy 2-stop fields (start/end/midpoint) remain for backward compat when
+    // gradientStops is empty — rendering synthesizes a 2-stop list from them.
+    bool gradientEnabled = false;
+    QColor gradientStart = Qt::white;
+    QColor gradientEnd = QColor(255, 200, 0);
+    double gradientAngle = 90.0;
+    int    gradientType = 0;          // 0=Linear, 1=Radial
+    double gradientMidpoint = 50.0;   // 0-100 %, where the 50% blend occurs
+    bool   gradientReverse = false;
+    // Multi-stop gradient (Illustrator-style). Empty = fall back to legacy
+    // start/end/midpoint pair above. Must have 2+ entries when populated.
+    QVector<GradientStop> gradientStops;
 
     // Shadow
     TextShadow shadow;
@@ -160,6 +182,10 @@ public:
     // Subtitle import (SRT/VTT)
     static QVector<EnhancedTextOverlay> importSRT(const QString &filePath);
     static QVector<EnhancedTextOverlay> importVTT(const QString &filePath);
+    // Subtitle / spreadsheet export — uses overlay.startTime / endTime
+    // as the subtitle time range. Returns true on success.
+    static bool exportSRT(const QVector<EnhancedTextOverlay> &overlays, const QString &filePath);
+    static bool exportCSV(const QVector<EnhancedTextOverlay> &overlays, const QString &filePath);
 
     // Serialization
     static QJsonArray toJson(const QVector<EnhancedTextOverlay> &overlays);

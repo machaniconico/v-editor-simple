@@ -28,6 +28,9 @@ public:
                                     QWidget *parent = nullptr);
     ColorCorrection result() const { return m_cc; }
 
+signals:
+    void colorCorrectionChanged(const ColorCorrection &cc);
+
 private slots:
     void onSliderChanged();
     void resetAll();
@@ -57,6 +60,9 @@ public:
     explicit VideoEffectDialog(const QVector<VideoEffect> &initial = {},
                                 QWidget *parent = nullptr);
     QVector<VideoEffect> result() const { return m_effects; }
+
+signals:
+    void effectsChanged(const QVector<VideoEffect> &effects);
 
 private slots:
     void addEffect();

@@ -1,5 +1,6 @@
 #include "VideoPlayer.h"
 #include "GLPreview.h"
+#include <QSettings>
 #include <QResizeEvent>
 #include <QSignalBlocker>
 #include <QStackedWidget>
@@ -8,6 +9,12 @@
 #include <QDebug>
 #include <QPointer>
 #include <QTimer>
+#include <QPainter>
+#include <QPainterPath>
+#include <QLinearGradient>
+#include <QRadialGradient>
+#include <QPen>
+#include <QFontMetrics>
 #include <cmath>
 #include <limits>
 
@@ -57,6 +64,34 @@ VideoPlayer::VideoPlayer(QWidget *parent)
                 if (err != QMediaPlayer::NoError)
                     qWarning() << "QMediaPlayer error:" << err << msg;
             });
+    // Qt MediaFoundation setSource is async — apply deferred position/play
+    // when the new source finishes loading. Without this the audio side-player
+    // swallows the setPosition+play() issued immediately after setSource and
+    // the user hears silence after a file-switching seek or tick boundary.
+    connect(m_audioPlayer, &QMediaPlayer::mediaStatusChanged, this,
+            [this](QMediaPlayer::MediaStatus status) {
+                // Drop pending state if the load failed or the source was
+                // cleared — otherwise a broken file would leave the yield
+                // guard in applyAudioEntryAtTimeline permanently stuck.
+                if (status == QMediaPlayer::InvalidMedia
+                    || status == QMediaPlayer::NoMedia) {
+                    m_pendingAudioPositionMs = -1;
+                    m_pendingAudioPlay = false;
+                    return;
+                }
+                if (status != QMediaPlayer::LoadedMedia
+                    && status != QMediaPlayer::BufferedMedia) {
+                    return;
+                }
+                if (m_pendingAudioPositionMs >= 0) {
+                    m_audioPlayer->setPosition(m_pendingAudioPositionMs);
+                    m_pendingAudioPositionMs = -1;
+                }
+                if (m_pendingAudioPlay && m_playing && m_playbackSpeed >= 0.0) {
+                    m_audioPlayer->play();
+                }
+                m_pendingAudioPlay = false;
+            });
 }
 
 VideoPlayer::~VideoPlayer()
@@ -83,6 +118,28 @@ void VideoPlayer::setupUI()
 
     m_glPreview = new GLPreview(this);
     m_glPreview->setMinimumSize(640, 360);
+    connect(m_glPreview, &GLPreview::textRectRequested,
+            this, &VideoPlayer::textRectRequested);
+    connect(m_glPreview, &GLPreview::textInlineCommitted,
+            this, &VideoPlayer::textInlineCommitted);
+    connect(m_glPreview, &GLPreview::textOverlayEditCommitted,
+            this, &VideoPlayer::textOverlayEditCommitted);
+    connect(m_glPreview, &GLPreview::textOverlayEditStarted,
+            this, [this](int idx) { setHiddenTextOverlayIndex(idx); });
+    connect(m_glPreview, &GLPreview::textOverlayEditEnded,
+            this, [this]() { setHiddenTextOverlayIndex(-1); });
+    connect(m_glPreview, &GLPreview::textOverlayRectChanged,
+            this, &VideoPlayer::textOverlayRectChanged);
+    connect(m_glPreview, &GLPreview::videoSourceTransformChanged,
+            this, [this](double scale, double dx, double dy) {
+                // Map back to the current entry's source clip so MainWindow
+                // can persist the new transform to the right ClipInfo.
+                if (m_activeEntry < 0 || m_activeEntry >= m_sequence.size())
+                    return;
+                const auto &entry = m_sequence[m_activeEntry];
+                emit videoSourceTransformChanged(entry.sourceTrack, entry.sourceClipIndex,
+                                                 scale, dx, dy);
+            });
 
     displayStack->addWidget(m_videoDisplay); // index 0: software
     displayStack->addWidget(m_glPreview);    // index 1: GL
@@ -92,6 +149,10 @@ void VideoPlayer::setupUI()
 
     auto *controls = new QHBoxLayout();
 
+    m_proxyButton = new QPushButton(this);
+    // Frame step: |◀ and ▶|
+    m_stepBackButton = new QPushButton(QString::fromUtf8("\xE2\x8F\xAE"), this); // ⏮
+    m_stepFwdButton  = new QPushButton(QString::fromUtf8("\xE2\x8F\xAD"), this); // ⏭
     // Unicode media controls: ▶ U+25B6 / ⏸ U+23F8 / ⏹ U+23F9
     m_playButton = new QPushButton(QString::fromUtf8("\xE2\x96\xB6"), this);
     m_pauseButton = new QPushButton(QString::fromUtf8("\xE2\x8F\xB8"), this);
@@ -114,13 +175,53 @@ void VideoPlayer::setupUI()
     m_playButton->setToolTip(QStringLiteral("再生"));
     m_pauseButton->setToolTip(QStringLiteral("一時停止"));
     m_stopButton->setToolTip(QStringLiteral("停止"));
+    m_stepBackButton->setFixedSize(40, 32);
+    m_stepFwdButton->setFixedSize(40, 32);
+    m_stepBackButton->setStyleSheet(mediaBtnStyle);
+    m_stepFwdButton->setStyleSheet(mediaBtnStyle);
+    m_stepBackButton->setToolTip(QStringLiteral("1フレーム戻る (←)"));
+    m_stepFwdButton->setToolTip(QStringLiteral("1フレーム進む (→)"));
+    connect(m_stepBackButton, &QPushButton::clicked, this, &VideoPlayer::stepBackward);
+    connect(m_stepFwdButton,  &QPushButton::clicked, this, &VideoPlayer::stepForward);
+
+    {
+        QSettings prefs("VSimpleEditor", "Preferences");
+        int saved = prefs.value("proxyDivisor", 1).toInt();
+        if (saved != 1 && saved != 2 && saved != 4 && saved != 8) saved = 1;
+        m_proxyDivisor = saved;
+    }
+    auto proxyLabel = [](int d) {
+        switch (d) {
+        case 2: return QStringLiteral("1/2");
+        case 4: return QStringLiteral("1/4");
+        case 8: return QStringLiteral("1/8");
+        default: return QStringLiteral("Full");
+        }
+    };
+    m_proxyButton->setText(proxyLabel(m_proxyDivisor));
+    m_proxyButton->setFixedSize(56, 32);
+    m_proxyButton->setStyleSheet(mediaBtnStyle);
+    m_proxyButton->setToolTip(QStringLiteral("プレビュー プロキシ解像度 (CPUエフェクト再生時に適用)"));
+    connect(m_proxyButton, &QPushButton::clicked, this, [this, proxyLabel]() {
+        const int order[] = {1, 2, 4, 8};
+        int idx = 0;
+        for (int i = 0; i < 4; ++i) if (order[i] == m_proxyDivisor) { idx = i; break; }
+        m_proxyDivisor = order[(idx + 1) % 4];
+        m_proxyButton->setText(proxyLabel(m_proxyDivisor));
+        QSettings("VSimpleEditor", "Preferences").setValue("proxyDivisor", m_proxyDivisor);
+        if (!m_lastSourceFrame.isNull())
+            displayFrame(m_lastSourceFrame);
+    });
     m_timeLabel->setFixedWidth(120);
     m_seekBar->setRange(0, 0);
     m_seekBar->setTracking(false);
 
+    controls->addWidget(m_proxyButton);
+    controls->addWidget(m_stepBackButton);
     controls->addWidget(m_playButton);
     controls->addWidget(m_pauseButton);
     controls->addWidget(m_stopButton);
+    controls->addWidget(m_stepFwdButton);
     controls->addWidget(m_seekBar);
     controls->addWidget(m_timeLabel);
 
@@ -150,26 +251,12 @@ void VideoPlayer::setupUI()
 void VideoPlayer::loadFile(const QString &filePath)
 {
     qInfo() << "VideoPlayer::loadFile BEGIN" << filePath;
-    // Mute the side-player BEFORE we tear down so any tail samples queued in
-    // QAudioOutput don't overlap with the next file's start (root cause of
-    // the "double playback" report). Scheduling a 200ms-delayed unmute makes
-    // sure Qt's Media Foundation backend has fully drained the previous
-    // source AND has decoded the first samples of the new source before we
-    // raise the gate again. Token guards against newer loadFile calls
-    // beating the timer.
-    if (m_audioOut)
-        m_audioOut->setMuted(true);
-    m_audioUnmuteScheduled = true;
-    ++m_audioUnmuteToken;
-    const qint64 myToken = m_audioUnmuteToken;
-    QPointer<VideoPlayer> guard(this);
-    QTimer::singleShot(200, this, [guard, myToken]() {
-        if (!guard) return;
-        if (myToken != guard->m_audioUnmuteToken) return; // superseded
-        guard->m_audioUnmuteScheduled = false;
-        guard->applyActiveEntryAudioMute();
-    });
-
+    // Audio is now driven by the independent A-track schedule via
+    // setAudioSequence/applyAudioEntryAtTimeline. loadFile only reloads the
+    // FFmpeg video decoder. No audio side-player touching here — that was
+    // needed back when m_audioPlayer was bound to the video file, but since
+    // the audio schedule owns the audio channel the old 200ms mute lockout
+    // is no longer applicable.
     resetDecoder();
     qInfo() << "  resetDecoder done";
     m_loadedFilePath = filePath;
@@ -211,6 +298,15 @@ void VideoPlayer::loadFile(const QString &filePath)
         m_videoDisplay->setText("Unsupported codec");
         return;
     }
+
+    m_hdrInfo = {};
+    m_hdrInfo.primaries = codecpar->color_primaries;
+    m_hdrInfo.trc = codecpar->color_trc;
+    m_hdrInfo.colorspace = codecpar->color_space;
+    m_hdrInfo.bitDepth = std::max(8, av_get_bits_per_pixel(av_pix_fmt_desc_get(
+        static_cast<AVPixelFormat>(codecpar->format))) / 3);
+    m_hdrInfo.isHdr = (codecpar->color_trc == AVCOL_TRC_SMPTE2084
+                       || codecpar->color_trc == AVCOL_TRC_ARIB_STD_B67);
 
     m_codecCtx = avcodec_alloc_context3(codec);
     if (!m_codecCtx || avcodec_parameters_to_context(m_codecCtx, codecpar) < 0) {
@@ -290,13 +386,13 @@ void VideoPlayer::loadFile(const QString &filePath)
     }
     qInfo() << "  seekInternal(0) ok";
 
-    if (m_audioPlayer) {
-        m_audioPlayer->stop();
-        m_audioPlayer->setSource(QUrl::fromLocalFile(filePath));
-        m_audioPlayer->setPosition(0);
-        if (m_audioOut)
-            m_audioOut->setMuted(false);
-    }
+    // NOTE: The audio side-player is now driven by setAudioSequence /
+    // applyAudioEntryAtTimeline from the A-track schedule, NOT by the video
+    // file currently decoded by this VideoPlayer. We deliberately do not
+    // bind m_audioPlayer to filePath here — audio and video are independent
+    // timelines so unlinked clips can play a J-cut / L-cut.
+    if (m_audioOut)
+        m_audioOut->setMuted(false);
 
     // If a sequence is active, restore its slider range so the seekbar shows
     // the full timeline rather than just this file's duration.
@@ -313,15 +409,41 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 {
     qInfo() << "VideoPlayer::setSequence count=" << entries.size();
 
-    // Compute total duration in microseconds.
+    // PiP staging shim (Stage 1): Timeline now emits every track's entries
+    // without mutual subtraction, but VideoPlayer still drives a single
+    // decoder. Drop V2+ entries so findActiveEntryAt / advanceToEntry stay
+    // monotonic in timelineStart. The multi-layer compositor (Stage 2+) will
+    // replace this with per-sourceTrack LayerDecoders and this filter is
+    // removed at that time.
+    QVector<PlaybackEntry> primary;
+    primary.reserve(entries.size());
+    for (const auto &e : entries) {
+        if (e.sourceTrack == 0) primary.append(e);
+    }
+
+    // Compute total duration in microseconds from the full (multi-track) set
+    // so the slider range still reflects V2-only segments beyond V1's tail.
     int64_t totalUs = 0;
     for (const auto &e : entries) {
         const int64_t entryEndUs = static_cast<int64_t>(e.timelineEnd * AV_TIME_BASE);
         if (entryEndUs > totalUs) totalUs = entryEndUs;
     }
 
-    m_sequence = entries;
+    m_sequence = primary;
     m_sequenceDurationUs = totalUs;
+
+    // V1-empty-but-V2+-populated case can only happen once the PiP
+    // compositor lands. Until then, treat it as "no primary stream" and
+    // leave the slider range intact so the user still sees V2's span.
+    if (!entries.isEmpty() && primary.isEmpty()) {
+        m_activeEntry = -1;
+        m_timelinePositionUs = qBound<int64_t>(0, m_timelinePositionUs, m_sequenceDurationUs);
+        if (m_playing) pause();
+        applySequenceSliderRange();
+        emit durationChanged(static_cast<double>(m_sequenceDurationUs) / AV_TIME_BASE);
+        if (m_glPreview) m_glPreview->resetVideoSourceTransform();
+        return;
+    }
 
     if (entries.isEmpty()) {
         // Timeline emptied (all clips deleted). Pause and clear the slider so
@@ -332,6 +454,10 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         if (m_playing) pause();
         m_seekBar->setRange(0, 0);
         emit durationChanged(0.0);
+        // US-T35 clear any OBS-style transform so a fresh import starts at
+        // identity instead of inheriting the last clip's scale/offset.
+        if (m_glPreview)
+            m_glPreview->resetVideoSourceTransform();
         return;
     }
 
@@ -380,31 +506,23 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     if (entryStructurallyChanged) {
         const int64_t localUs = entryLocalPositionUs(desiredIdx, clamped);
         seekInternal(localUs, true, true);
-
-        // loadFile() already called m_audioPlayer->setSource() when
-        // needFileSwitch was true; calling setSource a second time here would
-        // spawn a parallel decoder in Qt's Media Foundation backend and the
-        // user hears the same audio playing twice. Only adjust the position.
-        if (m_audioPlayer)
-            m_audioPlayer->setPosition(qMax<qint64>(0, localUs / 1000));
     }
     // Audio mute may have changed even when the entry is otherwise unchanged
     // (e.g. user toggled the M button on the active track) — always reapply.
     applyActiveEntryAudioMute();
 
     // If a sequenceChanged arrived mid-playback (e.g. a linked-clip drag was
-    // released while playing), loadFile+resetDecoder halted both the playback
-    // timer and the audio side-player. Resurrect them here — without this the
-    // player sits in a zombie state where m_playing=true but nothing actually
-    // ticks, which looks like the pause button stopped responding AND
-    // silences audio even though the file was just reloaded.
+    // released while playing), loadFile+resetDecoder halted the playback
+    // timer. Resurrect it here — without this the player sits in a zombie
+    // state where m_playing=true but nothing actually ticks, which looks
+    // like the pause button stopped responding.
     if (wasPlaying && needFileSwitch) {
-        qInfo() << "VideoPlayer::setSequence resurrecting timer+audio"
-                << "audioSourceValid=" << (m_audioPlayer && m_audioPlayer->source().isValid());
+        qInfo() << "VideoPlayer::setSequence resurrecting playback timer";
         scheduleNextFrame();
-        if (m_audioPlayer && m_audioPlayer->source().isValid() && m_playbackSpeed >= 0.0)
-            m_audioPlayer->play();
     }
+    // Audio-side resume is handled by setAudioSequence (called separately
+    // via MainWindow's audioSequenceChanged wiring) and by the per-tick
+    // applyAudioEntryAtTimeline call inside handlePlaybackTick.
 
     // Keep the play/pause button enabled states in sync with m_playing.
     // Without this, the button may show the wrong enabled state after we
@@ -413,6 +531,109 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     updatePlayButton();
 
     updatePositionUi();
+}
+
+void VideoPlayer::setAudioSequence(const QVector<PlaybackEntry> &entries)
+{
+    qInfo() << "VideoPlayer::setAudioSequence count=" << entries.size();
+    m_audioSequence = entries;
+    if (entries.isEmpty()) {
+        if (m_audioPlayer) {
+            m_audioPlayer->stop();
+            m_audioPlayer->setSource(QUrl());
+        }
+        m_activeAudioEntry = -1;
+        m_audioLoadedFilePath.clear();
+        return;
+    }
+    // Pick the entry for the current timeline position and let the
+    // filePath comparison decide whether setSource is actually needed.
+    // Forcing setSource unconditionally races with Qt MediaFoundation's async
+    // source load on Windows: the player accepts setPosition/play() before the
+    // new source is ready and the audio ends up silent ("同期を切って配置を
+    // ずらすと音が消える"). The filePath check still picks up real file swaps
+    // (e.g. A2 fills A1's dragged gap) because the entry at the current time
+    // will have a different filePath in that case.
+    applyAudioEntryAtTimeline(m_timelinePositionUs, /*forceSourceReload=*/false, /*forceReposition=*/true);
+    applyActiveEntryAudioMute();
+}
+
+int VideoPlayer::findActiveAudioEntryAt(int64_t timelineUs) const
+{
+    if (m_audioSequence.isEmpty()) return -1;
+    const double tSec = static_cast<double>(timelineUs) / AV_TIME_BASE;
+    for (int i = 0; i < m_audioSequence.size(); ++i) {
+        const auto &e = m_audioSequence[i];
+        if (tSec >= e.timelineStart && tSec < e.timelineEnd)
+            return i;
+    }
+    return -1;
+}
+
+void VideoPlayer::applyAudioEntryAtTimeline(int64_t timelineUs, bool forceSourceReload, bool forceReposition)
+{
+    if (!m_audioPlayer) return;
+    if (m_audioSequence.isEmpty()) {
+        if (!m_audioLoadedFilePath.isEmpty()) {
+            m_audioPlayer->stop();
+            m_audioPlayer->setSource(QUrl());
+            m_audioLoadedFilePath.clear();
+        }
+        m_activeAudioEntry = -1;
+        return;
+    }
+    int idx = findActiveAudioEntryAt(timelineUs);
+    if (idx < 0) {
+        // In a gap — pause without clearing the source. Do NOT force a
+        // setSource on the next re-entry: Qt Media Foundation's setSource
+        // is async and ignores the immediately-following setPosition, which
+        // causes the audio to replay from 0 ("先頭からの音が流れる"). Let
+        // setPosition handle re-entry cleanly. Since the audio schedule now
+        // covers A1+A2+... with V1-wins resolution, full A-side gaps are
+        // rare — they only occur where no audio track has any clip.
+        if (m_audioPlayer->playbackState() == QMediaPlayer::PlayingState)
+            m_audioPlayer->pause();
+        m_activeAudioEntry = -1;
+        return;
+    }
+    const auto &target = m_audioSequence[idx];
+    // INVARIANT: m_audioLoadedFilePath MUST always reflect the player's
+    // current source. Never clear the source without also clearing this
+    // cache, and vice versa — otherwise needSwitch short-circuits and the
+    // player sits on a stale/empty source.
+    const bool needSwitch = forceSourceReload || (target.filePath != m_audioLoadedFilePath);
+    const double tSec = static_cast<double>(timelineUs) / AV_TIME_BASE;
+    const double entryLocalSec = target.clipIn + (tSec - target.timelineStart);
+    const qint64 posMs = qMax<qint64>(0, static_cast<qint64>(entryLocalSec * 1000.0));
+    if (needSwitch) {
+        // Source switch — stash position/play and let mediaStatusChanged
+        // apply them after Qt MF finishes the async load. Issuing setPosition
+        // + play() immediately here races with the async loader and leaves
+        // the side-player silent on Windows.
+        m_pendingAudioPositionMs = posMs;
+        m_pendingAudioPlay = (m_playing && m_playbackSpeed >= 0.0);
+        m_audioPlayer->setSource(QUrl::fromLocalFile(target.filePath));
+        m_audioLoadedFilePath = target.filePath;
+        m_activeAudioEntry = idx;
+        return;
+    }
+    // forceReposition is set from seek / boundary-jump call sites so a seek
+    // landing inside the SAME audio entry still updates the player position.
+    // Without it, seek-within-entry silently left the QMediaPlayer clock at
+    // its old position — which caused the "audio drops out after seek" report.
+    if (idx != m_activeAudioEntry || forceReposition) {
+        m_audioPlayer->setPosition(posMs);
+    }
+    m_activeAudioEntry = idx;
+    // Don't fight the pending-load path — if a setSource is still in flight
+    // the mediaStatusChanged handler owns the play() call.
+    if (m_pendingAudioPositionMs >= 0 || m_pendingAudioPlay) {
+        return;
+    }
+    if (m_playing && m_playbackSpeed >= 0.0
+        && m_audioPlayer->playbackState() != QMediaPlayer::PlayingState) {
+        m_audioPlayer->play();
+    }
 }
 
 int VideoPlayer::findActiveEntryAt(int64_t timelineUs) const
@@ -470,13 +691,18 @@ int VideoPlayer::sliderTimelinePosition(int64_t timelineUs) const
 
 void VideoPlayer::applyActiveEntryAudioMute()
 {
+    // With the audio schedule owning the audio channel, mute state is
+    // derived from the active AUDIO entry (m_audioSequence[m_activeAudioEntry]),
+    // not the video entry. A track mute toggle flows through audioMuted on
+    // the PlaybackEntry and lands here.
     if (!m_audioOut) return;
-    // Honour the loadFile lockout — the delayed unmute timer will reapply
-    // the correct state once the file swap is fully settled.
-    if (m_audioUnmuteScheduled) return;
     bool muted = false;
-    if (sequenceActive() && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
-        muted = m_sequence[m_activeEntry].audioMuted;
+    if (audioSequenceActive() && m_activeAudioEntry >= 0
+        && m_activeAudioEntry < m_audioSequence.size()) {
+        muted = m_audioSequence[m_activeAudioEntry].audioMuted;
+    } else if (!audioSequenceActive()) {
+        // No audio schedule at all — silence the side-player.
+        muted = true;
     }
     // Reverse playback already mutes audio elsewhere; don't fight that here.
     if (m_playbackSpeed < 0.0)
@@ -510,18 +736,22 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     m_timelinePositionUs = timelineUs;
     const int64_t localUs = entryLocalPositionUs(idx, timelineUs);
     const bool ok = seekInternal(localUs, true, precise);
+    // Push the seeked-to clip's own transform so cross-clip seeks don't
+    // inherit the previously-active clip's OBS-style scale/offset.
+    if (m_glPreview)
+        m_glPreview->setVideoSourceTransform(e.videoScale, e.videoDx, e.videoDy);
     applyActiveEntryAudioMute();
     m_suppressUiUpdates = prevSuppress;
 
     // resetDecoder (called from loadFile when needSwitch) ran updatePlayButton
-    // with m_playing=false and stopped the audio side-player. Resurrect both
-    // — without this, a seek that crosses a file boundary leaves the pause
-    // button visually disabled and the audio track silent.
+    // with m_playing=false. Resurrect the video playback timer.
     if (wasPlayingOuter && needSwitch) {
         scheduleNextFrame();
-        if (m_audioPlayer && m_audioPlayer->source().isValid() && m_playbackSpeed >= 0.0)
-            m_audioPlayer->play();
     }
+    // Audio stays in step via the audio schedule path. forceReposition=true
+    // because this is a user-initiated seek — we WANT to update the audio
+    // player position even when the entry index didn't change.
+    applyAudioEntryAtTimeline(timelineUs, /*forceSourceReload=*/false, /*forceReposition=*/true);
     updatePlayButton();
 
     updatePositionUi();
@@ -547,10 +777,15 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
     const bool prevSuppress = m_suppressUiUpdates;
     m_suppressUiUpdates = needSwitch;
     if (needSwitch) {
-        loadFile(next.filePath); // loadFile sets the audio source itself
+        loadFile(next.filePath); // loadFile only reloads the video decoder; audio is driven by setAudioSequence
     }
 
     m_activeEntry = newEntryIdx;
+    // US-T35 apply the new entry's per-clip video source transform to the
+    // GL preview so each clip keeps its own scale/offset.
+    if (m_glPreview) {
+        m_glPreview->setVideoSourceTransform(next.videoScale, next.videoDx, next.videoDy);
+    }
     m_timelinePositionUs = static_cast<int64_t>(next.timelineStart * AV_TIME_BASE);
     const int64_t startLocalUs = static_cast<int64_t>(next.clipIn * AV_TIME_BASE);
     if (!seekInternal(startLocalUs, true, true)) {
@@ -558,11 +793,14 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
         return false;
     }
 
-    if (m_audioPlayer) {
-        m_audioPlayer->setPosition(qMax<qint64>(0, startLocalUs / 1000));
-        if (wasPlaying && m_playbackSpeed >= 0.0)
-            m_audioPlayer->play();
-    }
+    // Audio is driven by the independent A-track schedule — no direct
+    // m_audioPlayer ops here any more. Re-apply the audio schedule entry for
+    // the new timeline position so the A-side stays in step.
+    m_timelinePositionUs = static_cast<int64_t>(next.timelineStart * AV_TIME_BASE);
+    // Hard entry jump — always reposition the audio player so it starts at
+    // the new entry's local position even if the audio schedule stayed on
+    // the same entry index.
+    applyAudioEntryAtTimeline(m_timelinePositionUs, /*forceSourceReload=*/false, /*forceReposition=*/true);
     applyActiveEntryAudioMute();
 
     if (wasPlaying)
@@ -608,12 +846,17 @@ void VideoPlayer::play()
     emit stateChanged(true);
     scheduleNextFrame();
 
-    if (m_audioPlayer && m_audioPlayer->source().isValid() && m_playbackSpeed >= 0.0) {
-        if (m_audioOut)
-            m_audioOut->setMuted(false);
-        m_audioPlayer->setPosition(qMax<int64_t>(0, m_currentPositionUs / 1000));
-        m_audioPlayer->play();
-    }
+    // Kick the audio side-player via the independent audio schedule. If no
+    // audio schedule is set (legacy single-file mode or the user has no A
+    // clips), applyAudioEntryAtTimeline short-circuits and we stay silent —
+    // which is the correct new behaviour now that audio is owned by A-track.
+    // forceReposition=true so audio is aligned with the current playhead
+    // before resuming (otherwise a previous pause-then-seek can leave the
+    // player reading from a stale QMediaPlayer position).
+    applyAudioEntryAtTimeline(m_timelinePositionUs, /*forceSourceReload=*/false, /*forceReposition=*/true);
+    if (m_audioOut)
+        m_audioOut->setMuted(false);
+    applyActiveEntryAudioMute();
 }
 
 void VideoPlayer::pause()
@@ -627,6 +870,23 @@ void VideoPlayer::pause()
 
     if (m_audioPlayer)
         m_audioPlayer->pause();
+}
+
+void VideoPlayer::stepForward()
+{
+    pause();
+    const int64_t step = m_frameDurationUs > 0 ? m_frameDurationUs : AV_TIME_BASE / 30;
+    const int64_t target = qMin(m_durationUs > 0 ? m_durationUs - 1 : INT64_MAX,
+                                m_currentPositionUs + step);
+    seekInternal(target, /*displayFrame=*/true, /*precise=*/true);
+}
+
+void VideoPlayer::stepBackward()
+{
+    pause();
+    const int64_t step = m_frameDurationUs > 0 ? m_frameDurationUs : AV_TIME_BASE / 30;
+    const int64_t target = qMax<int64_t>(0, m_currentPositionUs - step);
+    seekInternal(target, /*displayFrame=*/true, /*precise=*/true);
 }
 
 void VideoPlayer::stop()
@@ -746,21 +1006,267 @@ void VideoPlayer::updatePlayButton()
 
 void VideoPlayer::displayFrame(const QImage &image)
 {
-    m_currentFrameImage = image;
+    m_lastSourceFrame = image;
+    const QImage composed = composeFrameWithOverlays(image);
+    m_currentFrameImage = composed;
     if (m_useGL && m_glPreview) {
         m_glPreview->setDisplayAspectRatio(effectiveDisplayAspectRatio());
-        m_glPreview->displayFrame(image);
+        int hdrTransfer = 0;
+        if (m_hdrInfo.isHdr) {
+            if (m_hdrInfo.trc == AVCOL_TRC_SMPTE2084) hdrTransfer = 1;
+            else if (m_hdrInfo.trc == AVCOL_TRC_ARIB_STD_B67) hdrTransfer = 2;
+        }
+        m_glPreview->setHdrTransfer(hdrTransfer);
+        m_glPreview->displayFrame(composed);
     } else {
         const QSize targetSize = fittedDisplaySize(m_videoDisplay->size());
-        const QPixmap pixmap = QPixmap::fromImage(image);
+        const QPixmap pixmap = QPixmap::fromImage(composed);
         m_videoDisplay->setPixmap(pixmap.scaled(targetSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
     }
+}
+
+void VideoPlayer::setTextOverlays(const QVector<EnhancedTextOverlay> &overlays)
+{
+    m_textOverlays = overlays;
+    // Drop the hidden-during-edit index if the overlay list shrank under it.
+    if (m_hiddenTextOverlayIndex >= m_textOverlays.size())
+        m_hiddenTextOverlayIndex = -1;
+    refreshTextOverlayHits();
+    refreshDisplayedFrame();
+}
+
+void VideoPlayer::refreshTextOverlayHits()
+{
+    if (!m_glPreview)
+        return;
+    QVector<GLPreview::TextOverlayHit> hits;
+    hits.reserve(m_textOverlays.size());
+    for (int i = 0; i < m_textOverlays.size(); ++i) {
+        const auto &ov = m_textOverlays[i];
+        if (!ov.visible || ov.text.isEmpty())
+            continue;
+        // Skip overlays whose rect dimensions are zero — they're auto-sized
+        // at paint time and don't have a stable hit area until the frame
+        // is rendered. Click-to-edit works for explicit-size overlays only.
+        if (ov.width <= 0.0 || ov.height <= 0.0)
+            continue;
+        GLPreview::TextOverlayHit hit;
+        hit.index = i;
+        hit.text = ov.text;
+        hit.normalizedRect = QRectF(ov.x, ov.y, ov.width, ov.height);
+        hits.append(hit);
+    }
+    m_glPreview->setTextOverlayHitList(hits);
+}
+
+QImage VideoPlayer::composeFrameWithOverlays(const QImage &source) const
+{
+    if (source.isNull())
+        return source;
+
+    const bool applyPreviewFx = !m_previewEffects.isEmpty()
+                                && (m_previewEffectsLive || !m_playing);
+
+    // Preview proxy: only shrink during playback, keep paused frames full-res.
+    const int proxy = (applyPreviewFx && m_playing) ? qMax(1, m_proxyDivisor) : 1;
+    auto runProxy = [proxy, this](const QImage &img) {
+        if (proxy <= 1)
+            return VideoEffectProcessor::applyEffectStack(img, {}, m_previewEffects);
+        const QImage small = img.scaled(img.width() / proxy, img.height() / proxy,
+                                        Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        const QImage processed = VideoEffectProcessor::applyEffectStack(
+            small, {}, m_previewEffects);
+        return processed.scaled(img.width(), img.height(),
+                                Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    };
+
+    if (m_textOverlays.isEmpty()) {
+        if (!applyPreviewFx) return source;
+        return runProxy(source);
+    }
+
+    const double nowSec = static_cast<double>(
+        sequenceActive() ? m_timelinePositionUs : m_currentPositionUs) / AV_TIME_BASE;
+
+    QImage composed = source.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    QPainter p(&composed);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setRenderHint(QPainter::TextAntialiasing, true);
+
+    const int W = composed.width();
+    const int H = composed.height();
+    // US-T32 WYSIWYG: the inline text tool draws at the literal pointSize
+    // in widget coordinates. When compose bakes overlays into the source
+    // image at (W,H) and GLPreview later scales it to the current letterbox
+    // for display, the display scale is letterboxH/H. To land at the same
+    // visible pointSize we inverse-scale by H/letterboxH so the committed
+    // text matches the inline input size 1:1 on screen.
+    double letterboxH = static_cast<double>(H);
+    if (m_glPreview) {
+        const QRectF lb = m_glPreview->letterboxRect();
+        if (lb.height() > 0.0 && std::isfinite(lb.height()))
+            letterboxH = lb.height();
+    }
+    const double fontScale = (letterboxH > 0.0)
+        ? (static_cast<double>(H) / letterboxH)
+        : 1.0;
+    for (int i = 0; i < m_textOverlays.size(); ++i) {
+        if (i == m_hiddenTextOverlayIndex) continue;
+        const auto &ov = m_textOverlays[i];
+        if (!ov.visible || ov.text.isEmpty()) continue;
+        const double start = ov.startTime;
+        const double end   = (ov.endTime > 0.0) ? ov.endTime : 1e18;
+        if (nowSec < start || nowSec >= end) continue;
+
+        QFont font = ov.font;
+        font.setPointSizeF(qMax(1.0, font.pointSizeF() * fontScale));
+        p.setFont(font);
+
+        const QFontMetrics fm(font);
+        int boxW = qMax(1, static_cast<int>(ov.width  * W));
+        int boxH = qMax(1, static_cast<int>(ov.height * H));
+        if (ov.width <= 0.0 || ov.height <= 0.0) {
+            const QSize textSize = fm.boundingRect(ov.text).size();
+            boxW = textSize.width() + 16;
+            boxH = textSize.height() + 8;
+        }
+        const int cx = static_cast<int>(ov.x * W);
+        const int cy = static_cast<int>(ov.y * H);
+        QRect box(cx - boxW / 2, cy - boxH / 2, boxW, boxH);
+
+        if (ov.backgroundColor.alpha() > 0)
+            p.fillRect(box, ov.backgroundColor);
+
+        // Match QPainter::drawText(rect, AlignCenter|TextWordWrap, text) so
+        // the committed render lands at the exact same position as the inline
+        // text tool (widget-space drawText uses fm.boundingRect(rect,flags)
+        // internally; horizontalAdvance + fm.height() drifts by 1-2 px on
+        // certain glyph runs because horizontalAdvance includes right-side
+        // bearing while the visual glyph rect doesn't).
+        const QRect textRect = fm.boundingRect(
+            box, Qt::AlignCenter | Qt::TextWordWrap, ov.text);
+        const int baselineX = textRect.left();
+        const int baselineY = textRect.top() + fm.ascent();
+        QPainterPath path;
+        path.addText(baselineX, baselineY, font, ov.text);
+
+        if (ov.outlineWidth > 0 && ov.outlineColor.alpha() > 0) {
+            QPen outline(ov.outlineColor);
+            outline.setWidthF(ov.outlineWidth * fontScale);
+            outline.setJoinStyle(Qt::RoundJoin);
+            outline.setCapStyle(Qt::RoundCap);
+            p.strokePath(path, outline);
+        }
+
+        if (ov.gradientEnabled) {
+            const QRectF bb = path.boundingRect();
+            const QPointF center = bb.center();
+
+            // Build the effective stop list. Prefer multi-stop gradientStops;
+            // fall back to the legacy 2-stop (+ midpoint) on empty.
+            QVector<GradientStop> stops;
+            if (ov.gradientStops.size() >= 2) {
+                stops = ov.gradientStops;
+            } else {
+                const QColor a = ov.gradientReverse ? ov.gradientEnd   : ov.gradientStart;
+                const QColor b = ov.gradientReverse ? ov.gradientStart : ov.gradientEnd;
+                GradientStop s0, s1;
+                s0.position = 0.0; s0.color = a; s0.opacity = a.alphaF();
+                s1.position = 1.0; s1.color = b; s1.opacity = b.alphaF();
+                stops = { s0, s1 };
+                const double midT = qBound(0.01, ov.gradientMidpoint / 100.0, 0.99);
+                GradientStop sm;
+                sm.position = midT;
+                sm.color = QColor(
+                    (a.red()   + b.red())   / 2,
+                    (a.green() + b.green()) / 2,
+                    (a.blue()  + b.blue())  / 2,
+                    (a.alpha() + b.alpha()) / 2);
+                sm.opacity = 0.5 * (a.alphaF() + b.alphaF());
+                stops.insert(1, sm);
+            }
+            if (ov.gradientReverse && !ov.gradientStops.isEmpty()) {
+                for (auto &s : stops) s.position = 1.0 - s.position;
+                std::sort(stops.begin(), stops.end(),
+                          [](const GradientStop &a, const GradientStop &b){ return a.position < b.position; });
+            }
+            auto applyStops = [&](QGradient &g) {
+                for (const auto &s : stops) {
+                    QColor c = s.color;
+                    c.setAlphaF(qBound(0.0, s.opacity, 1.0));
+                    g.setColorAt(qBound(0.0, s.position, 1.0), c);
+                }
+            };
+
+            if (ov.gradientType == 1) {
+                // Radial: center the gradient on the text bbox, radius = half diagonal
+                const double r = 0.5 * std::hypot(bb.width(), bb.height());
+                QRadialGradient grad(center, r);
+                applyStops(grad);
+                p.fillPath(path, grad);
+            } else {
+                // Linear: project bbox onto angle so colors hit bbox edges exactly
+                const double rad = qDegreesToRadians(ov.gradientAngle);
+                const double dx = std::cos(rad);
+                const double dy = std::sin(rad);
+                const double halfSpan = 0.5 * (std::abs(bb.width() * dx) + std::abs(bb.height() * dy));
+                const QPointF offset(dx * halfSpan, dy * halfSpan);
+                QLinearGradient grad(center - offset, center + offset);
+                applyStops(grad);
+                p.fillPath(path, grad);
+            }
+        } else {
+            p.fillPath(path, ov.color);
+        }
+    }
+    p.end();
+    if (applyPreviewFx)
+        return runProxy(composed);
+    return composed;
+}
+
+void VideoPlayer::setHiddenTextOverlayIndex(int index)
+{
+    if (m_hiddenTextOverlayIndex == index) return;
+    m_hiddenTextOverlayIndex = index;
+    if (!m_lastSourceFrame.isNull())
+        displayFrame(m_lastSourceFrame);
 }
 
 void VideoPlayer::setColorCorrection(const ColorCorrection &cc)
 {
     if (m_glPreview)
         m_glPreview->setColorCorrection(cc);
+}
+
+void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool live)
+{
+    m_previewEffectsLive = live;
+
+    const bool gpuEnabled = QSettings("VSimpleEditor", "Preferences")
+                                .value("gpuEffectsEnabled", true).toBool()
+                            && m_useGL && m_glPreview;
+
+    QVector<VideoEffect> gpu;
+    QVector<VideoEffect> cpu;
+    for (const VideoEffect &e : effects) {
+        const bool gpuCapable =
+            e.type == VideoEffectType::Blur      ||
+            e.type == VideoEffectType::Noise     ||
+            e.type == VideoEffectType::Sepia     ||
+            e.type == VideoEffectType::Grayscale ||
+            e.type == VideoEffectType::Invert    ||
+            e.type == VideoEffectType::Vignette;
+        if (gpuEnabled && gpuCapable) gpu.append(e);
+        else                          cpu.append(e);
+    }
+
+    m_previewEffects = cpu;
+    if (m_glPreview)
+        m_glPreview->setVideoEffects(gpu);
+
+    if (!m_lastSourceFrame.isNull())
+        displayFrame(m_lastSourceFrame);
 }
 
 void VideoPlayer::setGLAcceleration(bool enabled)
@@ -772,6 +1278,57 @@ void VideoPlayer::setGLAcceleration(bool enabled)
     refreshDisplayedFrame();
 }
 
+void VideoPlayer::setTextToolActive(bool active)
+{
+    if (m_textToolActive == active)
+        return;
+    m_textToolActive = active;
+    // Forward the mode to GLPreview (owns the drag capture + I-beam cursor)
+    // and mirror the cursor on the QLabel fallback for non-GL software mode.
+    if (m_glPreview)
+        m_glPreview->setTextToolActive(active);
+    if (m_videoDisplay) {
+        if (active)
+            m_videoDisplay->setCursor(Qt::IBeamCursor);
+        else
+            m_videoDisplay->unsetCursor();
+    }
+}
+
+void VideoPlayer::clearTextToolRect()
+{
+    if (m_glPreview)
+        m_glPreview->clearTextToolRect();
+}
+
+void VideoPlayer::setTextToolStyle(const QFont &font, const QColor &color)
+{
+    if (m_glPreview)
+        m_glPreview->setTextToolStyle(font, color);
+}
+
+void VideoPlayer::setSnapStrength(double pixels)
+{
+    if (m_glPreview)
+        m_glPreview->setSnapStrength(pixels);
+}
+
+bool VideoPlayer::isTextToolEditing() const
+{
+    return m_glPreview && m_glPreview->isTextToolEditing();
+}
+
+QString VideoPlayer::currentTextToolInputText() const
+{
+    return m_glPreview ? m_glPreview->currentTextToolInputText() : QString();
+}
+
+void VideoPlayer::commitCurrentTextToolEdit()
+{
+    if (m_glPreview)
+        m_glPreview->commitCurrentTextToolEdit();
+}
+
 void VideoPlayer::resetDecoder()
 {
     if (m_playbackTimer)
@@ -779,13 +1336,19 @@ void VideoPlayer::resetDecoder()
     if (m_seekTimer)
         m_seekTimer->stop();
 
-    if (m_audioPlayer) {
-        m_audioPlayer->stop();
-        m_audioPlayer->setSource(QUrl());
-    }
+    // Audio lifecycle belongs to the A-track schedule now — do NOT touch
+    // m_audioPlayer here. resetDecoder is called from loadFile() on every
+    // video entry boundary, and wiping the audio source at those boundaries
+    // desynchronises it from m_audioLoadedFilePath: the next
+    // applyAudioEntryAtTimeline sees target.filePath == m_audioLoadedFilePath,
+    // skips setSource, and the player stays on the empty source → silence
+    // inside the shifted A1 range ("A1 の上で音が出ない"). The audio
+    // side-player is cleaned up via setAudioSequence(empty) and in the
+    // destructor when the QObject parent tears it down.
 
     m_playing = false;
     m_videoStreamIndex = -1;
+    m_hdrInfo = {};
     m_durationUs = 0;
     m_currentPositionUs = 0;
     m_frameDurationUs = 0;
@@ -828,8 +1391,70 @@ void VideoPlayer::scheduleNextFrame()
 
     const double absSpeed = qMax(0.25, std::abs(m_playbackSpeed));
     const int64_t baseFrameUs = (m_frameDurationUs > 0) ? m_frameDurationUs : (AV_TIME_BASE / 30);
-    const int intervalMs = qMax(5, static_cast<int>(baseFrameUs / 1000.0 / absSpeed));
+    const int64_t frameIntervalUs = static_cast<int64_t>(baseFrameUs / absSpeed);
+    int intervalMs = qMax(1, static_cast<int>(frameIntervalUs / 1000));
+
+    // Audio-paced scheduling: pace the next frame against the audio clock
+    // when the audio side-player is reading the same file as the active
+    // video entry. The naive "frameIntervalUs from now" interval accumulates
+    // decode latency into progressive drift on long clips, and also lets
+    // video run ahead of audio when QMediaPlayer's async setSource starts
+    // late. J-cut / L-cut falls through to the naive interval via the
+    // filePath guard so unlinked-clip playback is untouched.
+    if (m_audioPlayer && m_playbackSpeed >= 0.0
+        && m_audioPlayer->playbackState() == QMediaPlayer::PlayingState
+        && m_pendingAudioPositionMs < 0 && !m_pendingAudioPlay
+        && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()
+        && m_activeAudioEntry >= 0 && m_activeAudioEntry < m_audioSequence.size()
+        && m_sequence[m_activeEntry].filePath == m_audioSequence[m_activeAudioEntry].filePath) {
+        const int64_t audioPosUs = static_cast<int64_t>(m_audioPlayer->position()) * 1000;
+        const int64_t videoAheadUs = m_currentPositionUs - audioPosUs;
+        const int64_t waitUs = static_cast<int64_t>(videoAheadUs / absSpeed);
+        // waitUs <= 0: video is behind audio — fire next tick ASAP so
+        // correctVideoDriftAgainstAudioClock can catch up. waitUs > 0: video
+        // is ahead — wait so audio can catch up.
+        intervalMs = (waitUs <= 0) ? 1 : qMax(1, static_cast<int>(waitUs / 1000));
+    }
     m_playbackTimer->start(intervalMs);
+}
+
+int VideoPlayer::correctVideoDriftAgainstAudioClock()
+{
+    // Same guards as the audio-paced branch in scheduleNextFrame — the two
+    // layers activate/deactivate in lockstep. Reverse playback, a pending
+    // async setSource, a J-cut/L-cut pair, or missing entries all short-
+    // circuit so unlinked-clip playback is untouched.
+    if (!m_audioPlayer || m_playbackSpeed < 0.0)
+        return 0;
+    if (m_audioPlayer->playbackState() != QMediaPlayer::PlayingState)
+        return 0;
+    if (m_pendingAudioPositionMs >= 0 || m_pendingAudioPlay)
+        return 0;
+    if (m_activeEntry < 0 || m_activeEntry >= m_sequence.size())
+        return 0;
+    if (m_activeAudioEntry < 0 || m_activeAudioEntry >= m_audioSequence.size())
+        return 0;
+    if (m_sequence[m_activeEntry].filePath != m_audioSequence[m_activeAudioEntry].filePath)
+        return 0;
+
+    const int64_t audioPosUs = static_cast<int64_t>(m_audioPlayer->position()) * 1000;
+    const int64_t frameUs = (m_frameDurationUs > 0) ? m_frameDurationUs : (AV_TIME_BASE / 30);
+    // Threshold > 1.5 frames avoids skipping on natural scheduler jitter.
+    const int64_t catchupThresholdUs = (frameUs * 3) / 2;
+    const int maxSkips = 6; // bounded so one tick can't block the UI
+
+    int skipped = 0;
+    while (skipped < maxSkips) {
+        if (audioPosUs - m_currentPositionUs <= catchupThresholdUs)
+            break;
+        // Skip-decode WITHOUT displaying — handlePlaybackTick calls
+        // decodeNextFrame(true) right after this returns, so the frame the
+        // user sees is always the freshest, never a stale skipped one.
+        if (!decodeNextFrame(false))
+            break;
+        ++skipped;
+    }
+    return skipped;
 }
 
 void VideoPlayer::performPendingSeek()
@@ -886,10 +1511,12 @@ void VideoPlayer::performPendingSeek()
         return;
     }
 
-    if (seekOk && m_audioPlayer && m_audioPlayer->source().isValid()) {
-        const qint64 posMs = qMax<int64_t>(0, m_currentPositionUs / 1000);
-        m_audioPlayer->setPosition(posMs);
-    }
+    // NOTE: audio side is already repositioned by applyAudioEntryAtTimeline
+    // inside seekToTimelineUs (forceReposition=true). The old direct
+    // m_audioPlayer->setPosition(m_currentPositionUs / 1000) call here was a
+    // legacy single-file-mode shim — in sequence mode it used VIDEO
+    // file-local coordinates to set the AUDIO player position, which was
+    // wrong and caused audible drift after seek. Do not reintroduce it.
 
     if (seekOk && wasPlaying)
         scheduleNextFrame();
@@ -1073,6 +1700,10 @@ QImage VideoPlayer::frameToImage(const AVFrame *frame)
         return {};
     }
 
+    const bool hdr = m_hdrInfo.isHdr;
+    const AVPixelFormat dstPixFmt = hdr ? AV_PIX_FMT_RGBA64LE : AV_PIX_FMT_RGB24;
+    const QImage::Format qFmt = hdr ? QImage::Format_RGBA64 : QImage::Format_RGB888;
+
     m_swsCtx = sws_getCachedContext(
         m_swsCtx,
         frame->width,
@@ -1080,7 +1711,7 @@ QImage VideoPlayer::frameToImage(const AVFrame *frame)
         static_cast<AVPixelFormat>(frame->format),
         frame->width,
         frame->height,
-        AV_PIX_FMT_RGB24,
+        dstPixFmt,
         SWS_BILINEAR,
         nullptr,
         nullptr,
@@ -1091,7 +1722,7 @@ QImage VideoPlayer::frameToImage(const AVFrame *frame)
         return {};
     }
 
-    QImage image(frame->width, frame->height, QImage::Format_RGB888);
+    QImage image(frame->width, frame->height, qFmt);
     if (image.isNull()) {
         qWarning() << "frameToImage: QImage alloc failed" << frame->width << "x" << frame->height;
         return {};
@@ -1198,10 +1829,13 @@ QSize VideoPlayer::fittedDisplaySize(const QSize &bounds) const
 
 void VideoPlayer::refreshDisplayedFrame()
 {
-    if (m_currentFrameImage.isNull())
+    // Use the raw source cache, NOT m_currentFrameImage — the latter is
+    // already composited, so re-running composeFrameWithOverlays on it
+    // would burn the overlays in twice (visible as duplicated text when
+    // an existing overlay is selected and setTextOverlays re-pushes).
+    if (m_lastSourceFrame.isNull())
         return;
-
-    displayFrame(m_currentFrameImage);
+    displayFrame(m_lastSourceFrame);
 }
 
 void VideoPlayer::resizeEvent(QResizeEvent *event)
@@ -1217,6 +1851,10 @@ void VideoPlayer::handlePlaybackTick()
 
     bool advanced = false;
     if (m_playbackSpeed >= 0.0) {
+        // Drift correction runs BEFORE the display decode so the frame the
+        // user sees this tick is always the freshest one, not the tail of a
+        // skip-decode batch. Helper short-circuits on J-cut/L-cut.
+        correctVideoDriftAgainstAudioClock();
         advanced = decodeNextFrame(true);
     } else {
         const int64_t stepUs = qMax<int64_t>(1, m_frameDurationUs);
@@ -1224,32 +1862,13 @@ void VideoPlayer::handlePlaybackTick()
         advanced = seekInternal(targetUs, true, true);
     }
 
-    // A/V sync — audio (QMediaPlayer) is the master clock. Strategy:
-    //   * audioAhead > 2000 ms : do a single direct seek (cheaper than drops).
-    //   * audioAhead > 600 ms  : drop ONE frame per tick (gentle catch-up).
-    //   * audioAhead in [-300, 600] ms : do nothing (acceptable drift).
-    //   * audioAhead < -300 ms : push audio forward (never rewind).
-    // Dropping more than one frame per tick or running every tick produces a
-    // visibly choppy video (the earlier behaviour). Single-frame drops at a
-    // higher threshold trade marginal lag for smooth motion.
-    if (m_playbackSpeed >= 0.0 && m_audioPlayer && m_audioPlayer->source().isValid()) {
-        const qint64 videoMs = m_currentPositionUs / 1000;
-        const qint64 audioMs = m_audioPlayer->position();
-        const qint64 audioAhead = audioMs - videoMs;
-
-        if (audioAhead > 2000) {
-            qInfo() << "VideoPlayer video seek-forward audioAhead=" << audioAhead
-                    << "video=" << videoMs << "audio=" << audioMs;
-            seekInternal(audioMs * 1000, true, false);
-        } else if (audioAhead > 600) {
-            // Drop exactly ONE frame this tick — gentle catch-up.
-            decodeNextFrame(false);
-        } else if (audioAhead < -300) {
-            qInfo() << "VideoPlayer audio nudge-forward audioAhead=" << audioAhead
-                    << "video=" << videoMs << "audio=" << audioMs;
-            m_audioPlayer->setPosition(videoMs);
-        }
-    }
+    // A/V sync: INDEPENDENT schedules by default (video owns
+    // m_currentPositionUs via the FFmpeg decoder; audio owns the QMediaPlayer
+    // clock via the A-track schedule), coupled to the audio clock as master
+    // when the audio side-player and active video entry resolve to the same
+    // file. The coupling is implemented by correctVideoDriftAgainstAudioClock
+    // above and by audio-paced scheduleNextFrame. J-cut / L-cut falls back
+    // to fully independent clocks so unlinked clip playback keeps working.
 
     // Sequence mode: detect when we've crossed the active entry's outPoint or
     // run off the end of the file, and switch to the next entry.
@@ -1290,6 +1909,12 @@ void VideoPlayer::handlePlaybackTick()
             m_audioPlayer->stop();
         return;
     }
+
+    // Keep the audio side aligned with the current timeline position —
+    // cheap when nothing changed, switches source when we've crossed an
+    // audio entry boundary. forceReposition=false: natural tick flow, don't
+    // spam setPosition every frame.
+    applyAudioEntryAtTimeline(m_timelinePositionUs, /*forceSourceReload=*/false, /*forceReposition=*/false);
 
     scheduleNextFrame();
 }

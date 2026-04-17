@@ -143,6 +143,43 @@ int main(int argc, char *argv[])
     app.setOrganizationName("VSimpleEditor");
     app.setWindowIcon(QIcon(":/icons/app-icon.svg"));
 
+    app.setStyleSheet(R"(
+        QSpinBox, QDoubleSpinBox {
+            padding-right: 22px;
+        }
+        QSpinBox::up-button, QDoubleSpinBox::up-button,
+        QSpinBox::down-button, QDoubleSpinBox::down-button {
+            subcontrol-origin: border;
+            width: 20px;
+            background: #3a3a3a;
+            border: 1px solid #555;
+        }
+        QSpinBox::up-button, QDoubleSpinBox::up-button {
+            subcontrol-position: top right;
+        }
+        QSpinBox::down-button, QDoubleSpinBox::down-button {
+            subcontrol-position: bottom right;
+        }
+        QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+        QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+            background: #555;
+        }
+        QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
+        QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {
+            background: #6a6a6a;
+        }
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+            image: url(:/icons/spin-up.svg);
+            width: 10px;
+            height: 10px;
+        }
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+            image: url(:/icons/spin-down.svg);
+            width: 10px;
+            height: 10px;
+        }
+    )");
+
     writeLogLine("INFO", "QApplication constructed");
 
     // スプラッシュ画面

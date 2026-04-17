@@ -16,8 +16,17 @@
 #include "TextManager.h"
 #include "PlaybackTypes.h"
 
+// Where Timeline::addClip drops a freshly-imported clip. Persisted via
+// QSettings('VSimpleEditor','Preferences')/importPlacement; the MainWindow
+// preference menu toggles between the two values.
+enum class ImportPlacement {
+    ParallelTrack = 0,      // Premiere-style: first empty V/A track (V2, V3, ...)
+    AppendToFirstTrack = 1  // Append to the end of V1/A1 as a continuous sequence
+};
+
 class UndoManager;
 class PlayheadOverlay;
+class TextStripWidget;
 struct TimelineState;
 class QDragEnterEvent;
 class QDragMoveEvent;
@@ -37,6 +46,18 @@ struct ClipInfo {
     // linkGroup. Linked clips are selected together, dragged together, and
     // deleted together so V/A stays in AV sync. 0 = unlinked / standalone.
     int linkGroup = 0;
+
+    // US-T35 per-clip OBS-style video source transform. scale=1.0, dx=dy=0
+    // is identity (no transform). dx/dy are offsets in fractions of the
+    // letterbox width/height, scale is uniform.
+    double videoScale = 1.0;
+    double videoDx = 0.0;
+    double videoDy = 0.0;
+
+    // Future multi-track compositing groundwork. 1.0 = opaque (current
+    // V1-wins behaviour). <1.0 values are placeholders until the layered
+    // compositor lands in a follow-up iteration.
+    double opacity = 1.0;
 
     // Phase 3: Color correction, effects, keyframes
     ColorCorrection colorCorrection;
@@ -100,6 +121,14 @@ public:
     // clips don't slide right. Caller must have verified the plan fits.
     void insertClipPreservingDownstream(int index, const ClipInfo &clip, double leadInSec);
 
+    struct DropPlan {
+        bool valid = false;
+        int insertIdx = -1;
+        double newLeadIn = 0.0;
+        double nextLeadInDelta = 0.0;
+    };
+    DropPlan planDrop(double dropTime, double clipDuration) const;
+
     void setSnapEnabled(bool enabled) { m_snapEnabled = enabled; }
     bool snapEnabled() const { return m_snapEnabled; }
     void setPixelsPerSecond(double pps);
@@ -112,6 +141,12 @@ public:
     bool isSolo() const { return m_solo; }
     void setHidden(bool hidden) { m_hidden = hidden; update(); }
     bool isHidden() const { return m_hidden; }
+
+    // Edit lock. When locked, mousePressEvent early-returns before entering
+    // any drag/trim/split mode and cross-track drops into this track are
+    // rejected. The lock is a pure editing guard — playback is unaffected.
+    void setLocked(bool locked) { m_locked = locked; update(); }
+    bool isLocked() const { return m_locked; }
 
     // Quietly mutate a clip's leadInSec (and optionally its next clip's
     // leadInSec) during a drag coordinated at the Timeline level. Does NOT
@@ -130,6 +165,7 @@ signals:
     void linkedDragStarted(int clipIndex);
     void linkedDragDelta(int clipIndex, double deltaSec);
     void linkedDragCancelled();
+    void crossTrackDropped(int clipIndex, int linkGroup, double dropTime);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -142,14 +178,6 @@ protected:
     void dropEvent(QDropEvent *event) override;
 
 private:
-    struct DropPlan {
-        bool valid = false;
-        int insertIdx = -1;
-        double newLeadIn = 0.0;          // leadInSec for the clip being inserted
-        double nextLeadInDelta = 0.0;    // amount to subtract from clip[insertIdx+1].leadInSec
-    };
-    DropPlan planDrop(double dropTime, double clipDuration) const;
-
     void updateMinimumWidth();
     int snapToEdge(int x) const;
 
@@ -169,6 +197,7 @@ private:
 
     double m_pixelsPerSecond = 10.0;
     bool m_muted = false;
+    bool m_locked = false;
     bool m_solo = false;
     bool m_hidden = false;
     int m_rowHeight = 50; // adjustable per-track via setRowHeight
@@ -264,12 +293,32 @@ public:
             return kEmpty;
         return m_videoTracks.first()->clips();
     }
+    // Add a text overlay to V1's first clip, writing back via setClips so
+    // the mutation actually persists. Used by MainWindow's Adobe-style text
+    // tool. Returns true if an overlay was added.
+    bool addTextOverlayToFirstVideoClip(const EnhancedTextOverlay &overlay);
+    // Update the text of an existing overlay on V1's first clip. Used by
+    // click-to-edit when the user edits an existing overlay in place.
+    bool updateTextOverlayText(int overlayIndex, const QString &newText);
+    // Rewrite an existing overlay's rect (center-based normalized x/y,
+    // normalized width/height). Returns false if the index is invalid.
+    bool updateTextOverlayRect(int overlayIndex, double x, double y, double width, double height);
+    // US-T35 update a V-track clip's per-clip video source transform.
+    // trackIdx 0 = V1, 1 = V2, ... ; clipIdx is the clip position within
+    // that track. Triggers sequenceChanged so VideoPlayer re-pulls the
+    // new transform on the next advanceToEntry.
+    bool setClipVideoTransform(int trackIdx, int clipIdx,
+                               double scale, double dx, double dy);
+    // Update an existing overlay's start/end time. Called from the timeline
+    // text strip when the user drags an overlay's edge handle.
+    bool updateTextOverlayTime(int overlayIndex, double startTime, double endTime);
 
     UndoManager *undoManager() const { return m_undoManager; }
 
     // Multi-clip playback: flatten all video tracks into a sorted, gap-aware
     // schedule with topmost-track-wins resolution (Premiere V1/V2 semantics).
     QVector<PlaybackEntry> computePlaybackSequence() const;
+    QVector<PlaybackEntry> computeAudioPlaybackSequence() const;
 
     // Project save/load support
     QVector<QVector<ClipInfo>> allVideoTracks() const;
@@ -283,6 +332,11 @@ signals:
     void scrubPositionChanged(double seconds);
     void positionChanged(double seconds);
     void sequenceChanged(const QVector<PlaybackEntry> &entries);
+    void audioSequenceChanged(const QVector<PlaybackEntry> &entries);
+    // Fired when the user drags a text overlay's edge handle on the
+    // timeline text strip so MainWindow can resync the right-panel
+    // 開始時間 / 表示時間 spinboxes and re-push the preview overlays.
+    void textOverlayTimeChanged(int overlayIndex, double startTime, double endTime);
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -318,6 +372,12 @@ private:
     static constexpr int kHeaderColumnWidth = 130;
     PlayheadOverlay *m_playheadOverlay = nullptr;
     class TimeRuler *m_timeRuler = nullptr;
+    TextStripWidget *m_textStrip = nullptr;
+    QWidget *m_textStripHeader = nullptr;
+    QWidget *m_vaSeparator = nullptr;
+    QWidget *m_vaSeparatorHeader = nullptr;
+    int m_textStripCustomHeight = 0;  // 0 = follows m_trackHeight
+    void refreshTextStrip();
     QLabel *m_infoLabel;
     double m_playheadPos = 0.0;
     double m_markIn = -1.0;
@@ -355,11 +415,13 @@ private:
     void onTrackSelectionChanged(int primaryIndex, bool additive);
     void showClipContextMenu(TimelineTrack *track, int clipIndex, const QPoint &globalPos);
     void unlinkClipGroup(int linkGroup);
+    void relinkClipAt(TimelineTrack *track, int clipIndex);
     void cutSelectedClip();
     void captureLinkedDragPartners(TimelineTrack *source, int clipIdx);
     void applyLinkedDragDelta(double rawDeltaSec);
     void revertLinkedDragPartners();
     void clearLinkedDragState();
+    void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime);
 };
 
 class PlayheadOverlay : public QWidget

@@ -57,6 +57,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/MultiCam.cpp
     src/TextManager.cpp
     src/TextInteractive.cpp
+    src/GradientStopBar.cpp
     src/EffectPreset.cpp
     src/SubtitleGenerator.cpp
     src/MotionTracker.cpp

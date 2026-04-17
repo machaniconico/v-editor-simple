@@ -21,6 +21,27 @@
 #include <QPointer>
 #include <QUrl>
 #include <QDebug>
+#include <QActionGroup>
+#include <QSignalBlocker>
+#include <QStackedWidget>
+#include <QLineEdit>
+#include <QSpinBox>
+#include <QDoubleSpinBox>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QScrollArea>
+#include <QFrame>
+#include <QInputDialog>
+#include <QStandardPaths>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QDir>
+#include "GradientStopBar.h"
+#include <QPushButton>
+#include <QColorDialog>
+#include <QFormLayout>
+#include <QLabel>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -121,10 +142,83 @@ void MainWindow::setupUI()
     connect(m_welcomeWidget, &WelcomeWidget::openFileClicked, this, &MainWindow::openFile);
     connect(m_welcomeWidget, &WelcomeWidget::openProjectClicked, this, &MainWindow::openProject);
 
-    m_mainSplitter->addWidget(m_player);
+    // Adobe-style tool property layout: wrap the player in a horizontal
+    // splitter whose right-hand child is a QStackedWidget hosting per-tool
+    // property panels (empty page by default, text-tool page when active).
+    // The horizontal splitter replaces the raw VideoPlayer as the top half
+    // of m_mainSplitter so the timeline is unaffected.
+    m_previewSplitter = new QSplitter(Qt::Horizontal, this);
+    m_previewSplitter->addWidget(m_player);
+    setupToolPropertyPanel();
+    m_previewSplitter->addWidget(m_toolPropertyStack);
+    m_previewSplitter->setStretchFactor(0, 1);
+    m_previewSplitter->setStretchFactor(1, 0);
+    m_previewSplitter->setCollapsible(0, false);
+    m_previewSplitter->setCollapsible(1, true);
+    m_toolPropertyStack->hide(); // collapsed by default — no tool active
+
+    m_mainSplitter->addWidget(m_previewSplitter);
     m_mainSplitter->addWidget(m_timeline);
     m_mainSplitter->setStretchFactor(0, 3);
     m_mainSplitter->setStretchFactor(1, 1);
+
+    connect(m_player, &VideoPlayer::textRectRequested,
+            this, &MainWindow::onTextRectRequested);
+    connect(m_player, &VideoPlayer::textInlineCommitted,
+            this, &MainWindow::onTextInlineCommitted);
+    connect(m_player, &VideoPlayer::textOverlayEditCommitted,
+            this, &MainWindow::onTextOverlayEditCommitted);
+    // Existing-overlay drag: rewrite the rect in place and re-push the
+    // overlay list so the preview re-renders with the new geometry.
+    connect(m_player, &VideoPlayer::textOverlayRectChanged, this,
+            [this](int idx, const QRectF &normalizedRect) {
+                if (!m_timeline) return;
+                if (!m_timeline->updateTextOverlayRect(idx,
+                        normalizedRect.x(), normalizedRect.y(),
+                        normalizedRect.width(), normalizedRect.height()))
+                    return;
+                const auto &clips = m_timeline->videoClips();
+                if (!clips.isEmpty() && m_player) {
+                    QVector<EnhancedTextOverlay> overlays;
+                    const auto &mgr = clips[0].textManager;
+                    for (int i = 0; i < mgr.count(); ++i)
+                        overlays.append(mgr.overlay(i));
+                    m_player->setTextOverlays(overlays);
+                }
+            });
+    // US-T35 Video source transform drag/resize → persist to owning clip.
+    connect(m_player, &VideoPlayer::videoSourceTransformChanged, this,
+            [this](int trackIdx, int clipIdx, double scale, double dx, double dy) {
+                if (!m_timeline) return;
+                m_timeline->setClipVideoTransform(trackIdx, clipIdx, scale, dx, dy);
+            });
+    // Timeline text-strip edge drag → update right-panel spinboxes + preview
+    connect(m_timeline, &Timeline::textOverlayTimeChanged, this,
+            [this](int idx, double startTime, double endTime) {
+                if (m_textToolStartSpin) {
+                    QSignalBlocker b(m_textToolStartSpin);
+                    m_textToolStartSpin->setValue(startTime);
+                }
+                if (m_textToolEndSpin) {
+                    QSignalBlocker b(m_textToolEndSpin);
+                    m_textToolEndSpin->setValue(qMax(0.1, endTime - startTime));
+                }
+                // Re-push the overlay list so the preview re-renders with
+                // the updated time range.
+                const auto &clips = m_timeline->videoClips();
+                if (!clips.isEmpty() && m_player) {
+                    QVector<EnhancedTextOverlay> overlays;
+                    const auto &mgr = clips[0].textManager;
+                    for (int i = 0; i < mgr.count(); ++i)
+                        overlays.append(mgr.overlay(i));
+                    m_player->setTextOverlays(overlays);
+                }
+                statusBar()->showMessage(QString("テキスト時間: %1 s → %2 s (%3 s)")
+                    .arg(startTime, 0, 'f', 2)
+                    .arg(endTime, 0, 'f', 2)
+                    .arg(endTime - startTime, 0, 'f', 2));
+                (void)idx;
+            });
 
     mainLayout->addWidget(m_welcomeWidget);
     mainLayout->addWidget(m_mainSplitter);
@@ -147,6 +241,17 @@ void MainWindow::setupUI()
             e.filePath = pm.getProxyPath(e.filePath);
         qInfo() << "MainWindow: forwarding sequenceChanged entries=" << resolved.size();
         m_player->setSequence(resolved);
+    });
+    // Audio-side schedule — drives m_audioPlayer independently so unlinked
+    // A clips can play a J-cut / L-cut at their own timeline offset.
+    connect(m_timeline, &Timeline::audioSequenceChanged, this, [this](const QVector<PlaybackEntry> &entries) {
+        if (!m_player) return;
+        QVector<PlaybackEntry> resolved = entries;
+        auto &pm = ProxyManager::instance();
+        for (auto &e : resolved)
+            e.filePath = pm.getProxyPath(e.filePath);
+        qInfo() << "MainWindow: forwarding audioSequenceChanged entries=" << resolved.size();
+        m_player->setAudioSequence(resolved);
     });
 
     // J/K/L keyboard shortcuts for playback
@@ -174,6 +279,9 @@ void MainWindow::setupMenuBar()
     auto *newAction = fileMenu->addAction("新規プロジェクト(&N)...");
     newAction->setShortcut(QKeySequence::New);
     connect(newAction, &QAction::triggered, this, &MainWindow::newProject);
+
+    auto *projectSettingsAction = fileMenu->addAction("プロジェクト設定(&T)...");
+    connect(projectSettingsAction, &QAction::triggered, this, &MainWindow::editProjectSettings);
 
     auto *openAction = fileMenu->addAction("ファイルを開く(&O)...");
     openAction->setShortcut(QKeySequence::Open);
@@ -305,6 +413,9 @@ void MainWindow::setupMenuBar()
 
     auto *importSubAction = insertMenu->addAction("字幕をインポート (SRT/VTT)...");
     connect(importSubAction, &QAction::triggered, this, &MainWindow::importSubtitles);
+
+    auto *exportTextAction = insertMenu->addAction("テキストを書き出し (SRT / CSV)...");
+    connect(exportTextAction, &QAction::triggered, this, &MainWindow::exportTextOverlays);
 
     auto *saveTemplateAction = insertMenu->addAction("テキストテンプレートを保存...");
     connect(saveTemplateAction, &QAction::triggered, this, &MainWindow::saveTextTemplate);
@@ -540,9 +651,10 @@ void MainWindow::setupMenuBar()
 
     // --- カラーグレーディングパネル ---
     m_colorGradingPanel = new ColorGradingPanel(this);
+    m_colorGradingPanel->setVisible(false); // 作成直後に非表示設定
     addDockWidget(Qt::RightDockWidgetArea, m_colorGradingPanel);
     m_colorGradingPanel->setLutList(LutLibrary::instance().allLuts());
-    m_colorGradingPanel->hide(); // 初期非表示
+    m_colorGradingPanel->close(); // 初期非表示を確実にする
 
     connect(m_colorGradingPanel, &ColorGradingPanel::colorCorrectionChanged,
             this, [this](const ColorCorrection &cc) {
@@ -628,11 +740,128 @@ void MainWindow::setupMenuBar()
         }
     });
 
+    // 取り込み配置ポリシー: 並列トラック (V2/A2...) か 現在トラック追加 (V1/A1 連結)
+    auto *importPlacementGroup = new QActionGroup(this);
+    importPlacementGroup->setExclusive(true);
+    auto *importParallelAction = new QAction("取り込み：新しいトラックに並列配置", this);
+    importParallelAction->setCheckable(true);
+    importParallelAction->setActionGroup(importPlacementGroup);
+    auto *importAppendAction = new QAction("取り込み：現在のトラックに追加", this);
+    importAppendAction->setCheckable(true);
+    importAppendAction->setActionGroup(importPlacementGroup);
+    {
+        QSettings prefSettings("VSimpleEditor", "Preferences");
+        const int saved = prefSettings.value("importPlacement",
+                                              static_cast<int>(ImportPlacement::ParallelTrack)).toInt();
+        if (saved == static_cast<int>(ImportPlacement::AppendToFirstTrack))
+            importAppendAction->setChecked(true);
+        else
+            importParallelAction->setChecked(true);
+    }
+    connect(importParallelAction, &QAction::toggled, this, [this](bool checked) {
+        if (!checked) return;
+        QSettings prefSettings("VSimpleEditor", "Preferences");
+        prefSettings.setValue("importPlacement", static_cast<int>(ImportPlacement::ParallelTrack));
+        statusBar()->showMessage("取り込み先を V2/A2 並列配置に設定");
+    });
+    connect(importAppendAction, &QAction::toggled, this, [this](bool checked) {
+        if (!checked) return;
+        QSettings prefSettings("VSimpleEditor", "Preferences");
+        prefSettings.setValue("importPlacement", static_cast<int>(ImportPlacement::AppendToFirstTrack));
+        statusBar()->showMessage("取り込み先を V1/A1 追加に設定");
+    });
+
+    // 自動保存（バックアップ）トグル — デフォルトOFF、30分周期
+    auto *autoSaveAction = new QAction("自動保存を有効化 (30分ごと)", this);
+    autoSaveAction->setCheckable(true);
+    {
+        QSettings prefSettings("VSimpleEditor", "Preferences");
+        autoSaveAction->setChecked(prefSettings.value("autoSaveEnabled", false).toBool());
+    }
+    connect(autoSaveAction, &QAction::toggled, this, [this](bool checked) {
+        QSettings prefSettings("VSimpleEditor", "Preferences");
+        prefSettings.setValue("autoSaveEnabled", checked);
+        if (!m_autoSave)
+            return;
+        if (checked) {
+            AutoSaveConfig cfg;
+            cfg.enabled = true;
+            cfg.interval = prefSettings.value("autoSaveIntervalSec", 1800).toInt();
+            m_autoSave->start(cfg);
+            statusBar()->showMessage(QString("自動保存 ON (%1分ごと)").arg(cfg.interval / 60));
+        } else {
+            m_autoSave->stop();
+            statusBar()->showMessage("自動保存 OFF");
+        }
+    });
+
     // 環境設定サブメニューに共有QActionを集約
     prefsMenu->addSeparator();
     prefsMenu->addAction(themeAction);
     prefsMenu->addAction(tooltipAction);
     prefsMenu->addAction(toolbarStyleAction);
+    prefsMenu->addSeparator();
+    prefsMenu->addAction(importParallelAction);
+    prefsMenu->addAction(importAppendAction);
+    prefsMenu->addSeparator();
+
+    auto *gpuEffectsAction = new QAction("GPUエフェクトを使用", this);
+    gpuEffectsAction->setCheckable(true);
+    {
+        QSettings gpuFxSettings("VSimpleEditor", "Preferences");
+        gpuEffectsAction->setChecked(gpuFxSettings.value("gpuEffectsEnabled", true).toBool());
+    }
+    connect(gpuEffectsAction, &QAction::toggled, this, [this](bool on) {
+        QSettings("VSimpleEditor", "Preferences").setValue("gpuEffectsEnabled", on);
+        if (m_player && m_timeline && m_timeline->hasSelection())
+            m_player->setPreviewEffects(m_timeline->clipEffects(), /*live=*/true);
+        else if (m_player)
+            m_player->setPreviewEffects({}, /*live=*/true);
+    });
+    prefsMenu->addAction(gpuEffectsAction);
+    prefsMenu->addSeparator();
+
+    // US-T39 Snap strength submenu — pulls/flushes the video source onto
+    // the 16:9 canvas edges when dragging. Persisted via QSettings so the
+    // user's preference survives restart.
+    auto *snapMenu = prefsMenu->addMenu("画面フィット強度");
+    auto *snapGroup = new QActionGroup(this);
+    snapGroup->setExclusive(true);
+    struct SnapPreset { const char *label; double px; };
+    const SnapPreset snapPresets[] = {
+        {"オフ",  0.0},
+        {"弱",   6.0},
+        {"中",  12.0},
+        {"強",  24.0},
+        {"最強", 48.0},
+    };
+    double savedSnap = 12.0;
+    {
+        QSettings prefSettings("VSimpleEditor", "Preferences");
+        savedSnap = prefSettings.value("snapStrength", 12.0).toDouble();
+    }
+    if (m_player)
+        m_player->setSnapStrength(savedSnap);
+    for (const auto &preset : snapPresets) {
+        auto *act = new QAction(preset.label, this);
+        act->setCheckable(true);
+        act->setActionGroup(snapGroup);
+        if (qFuzzyCompare(preset.px, savedSnap)
+            || (preset.px == 0.0 && savedSnap <= 0.0))
+            act->setChecked(true);
+        const double px = preset.px;
+        connect(act, &QAction::toggled, this, [this, px](bool checked) {
+            if (!checked) return;
+            if (m_player) m_player->setSnapStrength(px);
+            QSettings prefSettings("VSimpleEditor", "Preferences");
+            prefSettings.setValue("snapStrength", px);
+            statusBar()->showMessage(
+                QString("画面フィット強度: %1 px").arg(px == 0.0 ? QStringLiteral("オフ") : QString::number(px)));
+        });
+        snapMenu->addAction(act);
+    }
+
+    prefsMenu->addAction(autoSaveAction);
 
     // ヘルプ メニュー
     auto *helpMenu = menuBar()->addMenu("ヘルプ(&H)");
@@ -675,7 +904,13 @@ void MainWindow::setupToolBar()
     addBtn("copy", "コピー", "クリップをコピー (Ctrl+C)", &MainWindow::copyClip);
     addBtn("paste", "貼付", "クリップを貼り付け (Ctrl+V)", &MainWindow::pasteClip);
     toolbar->addSeparator();
-    addBtn("text", "テキスト", "テキスト追加 (T)", &MainWindow::addTextOverlay);
+    // Text tool: toolbar button toggles Adobe-style text-tool mode instead
+    // of opening the modal dialog directly. The legacy dialog is still
+    // reachable via 挿入 → テキスト / テロップ追加 for users who prefer it.
+    m_textToolAction = toolbar->addAction(icon("text"), "テキスト");
+    m_textToolAction->setToolTip("テキストツール (T) — ドラッグでテキスト枠を指定");
+    m_textToolAction->setCheckable(true);
+    connect(m_textToolAction, &QAction::toggled, this, &MainWindow::onTextToolToggled);
     addBtn("color", "色補正", "色補正 (Ctrl+G)", &MainWindow::colorCorrection);
     addBtn("effects", "効果", "ビデオエフェクト (Ctrl+Shift+F)", &MainWindow::videoEffects);
     addBtn("marker", "マーカー", "マーカー追加 (Ctrl+M)", &MainWindow::addMarker);
@@ -729,6 +964,15 @@ void MainWindow::newProject()
     if (dialog.exec() == QDialog::Accepted) {
         applyProjectConfig(dialog.config());
         hideWelcomeScreen();
+        updateStatusInfo();
+    }
+}
+
+void MainWindow::editProjectSettings()
+{
+    ProjectSettingsDialog dialog(this, &m_projectConfig);
+    if (dialog.exec() == QDialog::Accepted) {
+        applyProjectConfig(dialog.config());
         updateStatusInfo();
     }
 }
@@ -805,6 +1049,7 @@ void MainWindow::openFile()
 void MainWindow::exportVideo()
 {
     ExportDialog dialog(m_projectConfig, this);
+    dialog.setSourceIsHdr(m_player && m_player->isHdrSource());
     if (dialog.exec() != QDialog::Accepted) return;
 
     ExportConfig exportCfg = dialog.config();
@@ -978,6 +1223,509 @@ void MainWindow::toggleSolo()
     statusBar()->showMessage("A1: Toggled solo");
 }
 
+void MainWindow::setupToolPropertyPanel()
+{
+    m_toolPropertyStack = new QStackedWidget(this);
+    m_toolPropertyStack->setMinimumWidth(260);
+    m_toolPropertyStack->setMaximumWidth(360);
+
+    // Page 0: empty placeholder shown when no tool is active.
+    auto *emptyPage = new QWidget(m_toolPropertyStack);
+    auto *emptyLayout = new QVBoxLayout(emptyPage);
+    emptyLayout->addStretch();
+    auto *emptyLabel = new QLabel("ツール未選択", emptyPage);
+    emptyLabel->setAlignment(Qt::AlignCenter);
+    emptyLabel->setStyleSheet("color: #888;");
+    emptyLayout->addWidget(emptyLabel);
+    emptyLayout->addStretch();
+    m_toolPropertyStack->addWidget(emptyPage);
+
+    // Page 1: text tool properties — text / font size / color / 適用.
+    auto *textPage = new QWidget(m_toolPropertyStack);
+    auto *textLayout = new QVBoxLayout(textPage);
+    textLayout->setContentsMargins(12, 12, 12, 12);
+    auto *titleLabel = new QLabel("テキストツール", textPage);
+    QFont titleFont = titleLabel->font();
+    titleFont.setBold(true);
+    titleFont.setPointSize(titleFont.pointSize() + 1);
+    titleLabel->setFont(titleFont);
+    textLayout->addWidget(titleLabel);
+    textLayout->addSpacing(8);
+
+    auto *form = new QFormLayout();
+    m_textToolLineEdit = new QLineEdit(textPage);
+    m_textToolLineEdit->setPlaceholderText("テキストを入力...");
+    form->addRow("テキスト", m_textToolLineEdit);
+
+    m_textToolSizeSpin = new QSpinBox(textPage);
+    m_textToolSizeSpin->setRange(6, 256);
+    m_textToolSizeSpin->setValue(32);
+    m_textToolSizeSpin->setSuffix(" pt");
+    connect(m_textToolSizeSpin, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, [this](int) { pushTextToolStyleToPreview(); });
+    form->addRow("サイズ", m_textToolSizeSpin);
+
+    m_textToolColor = Qt::white;
+    m_textToolColorButton = new QPushButton(textPage);
+    m_textToolColorButton->setText("色を選択...");
+    m_textToolColorButton->setStyleSheet("background-color: white; color: black;");
+    connect(m_textToolColorButton, &QPushButton::clicked, this, [this]() {
+        QColor picked = QColorDialog::getColor(m_textToolColor, this, "テキスト色");
+        if (picked.isValid()) {
+            m_textToolColor = picked;
+            m_textToolColorButton->setStyleSheet(
+                QString("background-color: %1; color: %2;")
+                    .arg(picked.name())
+                    .arg(picked.lightness() > 128 ? "black" : "white"));
+            pushTextToolStyleToPreview();
+        }
+    });
+    form->addRow("色", m_textToolColorButton);
+
+    m_textToolStartSpin = new QDoubleSpinBox(textPage);
+    m_textToolStartSpin->setRange(0.0, 36000.0);
+    m_textToolStartSpin->setDecimals(2);
+    m_textToolStartSpin->setSingleStep(0.5);
+    m_textToolStartSpin->setSuffix(" s");
+    m_textToolStartSpin->setValue(0.0);
+    form->addRow("開始時間", m_textToolStartSpin);
+
+    // 表示時間 = duration (not absolute end time). applyTextToolOverlay
+    // computes overlay.endTime = startTime + duration so the downstream
+    // renderer still gets an absolute end time in EnhancedTextOverlay.
+    m_textToolEndSpin = new QDoubleSpinBox(textPage);
+    m_textToolEndSpin->setRange(0.1, 36000.0);
+    m_textToolEndSpin->setDecimals(2);
+    m_textToolEndSpin->setSingleStep(0.5);
+    m_textToolEndSpin->setSuffix(" s");
+    m_textToolEndSpin->setValue(5.0);
+    form->addRow("表示時間", m_textToolEndSpin);
+
+    // Gradient fill controls (read by applyTextToolOverlay on 適用).
+    m_textToolGradientCheck = new QCheckBox("グラデーション", textPage);
+    form->addRow("", m_textToolGradientCheck);
+    m_textToolGradientStart = Qt::white;
+    m_textToolGradientEnd   = QColor(255, 200, 0);
+    auto styleColorBtn = [](QPushButton *b, const QColor &c) {
+        b->setStyleSheet(QString("background-color: %1; color: %2;")
+                             .arg(c.name())
+                             .arg(c.lightness() > 128 ? "black" : "white"));
+    };
+    m_textToolGradientStartBtn = new QPushButton("開始色", textPage);
+    styleColorBtn(m_textToolGradientStartBtn, m_textToolGradientStart);
+    connect(m_textToolGradientStartBtn, &QPushButton::clicked, this, [this, styleColorBtn]() {
+        QColor picked = QColorDialog::getColor(m_textToolGradientStart, this, "グラデーション開始色");
+        if (picked.isValid()) {
+            m_textToolGradientStart = picked;
+            styleColorBtn(m_textToolGradientStartBtn, picked);
+        }
+    });
+    form->addRow("開始色", m_textToolGradientStartBtn);
+    m_textToolGradientEndBtn = new QPushButton("終了色", textPage);
+    styleColorBtn(m_textToolGradientEndBtn, m_textToolGradientEnd);
+    connect(m_textToolGradientEndBtn, &QPushButton::clicked, this, [this, styleColorBtn]() {
+        QColor picked = QColorDialog::getColor(m_textToolGradientEnd, this, "グラデーション終了色");
+        if (picked.isValid()) {
+            m_textToolGradientEnd = picked;
+            styleColorBtn(m_textToolGradientEndBtn, picked);
+        }
+    });
+    form->addRow("終了色", m_textToolGradientEndBtn);
+    m_textToolGradientAngleSpin = new QDoubleSpinBox(textPage);
+    m_textToolGradientAngleSpin->setRange(0.0, 360.0);
+    m_textToolGradientAngleSpin->setDecimals(0);
+    m_textToolGradientAngleSpin->setSingleStep(15.0);
+    m_textToolGradientAngleSpin->setSuffix(" °");
+    m_textToolGradientAngleSpin->setValue(90.0);
+    form->addRow("角度", m_textToolGradientAngleSpin);
+
+    // Adobe-style fine controls: type (Linear/Radial), midpoint, reverse.
+    m_textToolGradientTypeCombo = new QComboBox(textPage);
+    m_textToolGradientTypeCombo->addItem("線形", 0);
+    m_textToolGradientTypeCombo->addItem("放射状", 1);
+    form->addRow("種類", m_textToolGradientTypeCombo);
+
+    m_textToolGradientMidSpin = new QDoubleSpinBox(textPage);
+    m_textToolGradientMidSpin->setRange(1.0, 99.0);
+    m_textToolGradientMidSpin->setDecimals(0);
+    m_textToolGradientMidSpin->setSingleStep(5.0);
+    m_textToolGradientMidSpin->setSuffix(" %");
+    m_textToolGradientMidSpin->setValue(50.0);
+    form->addRow("中点", m_textToolGradientMidSpin);
+
+    m_textToolGradientReverseCheck = new QCheckBox("反転", textPage);
+    form->addRow("", m_textToolGradientReverseCheck);
+
+    // Illustrator-style multi-stop editor: horizontal gradient bar with
+    // draggable markers. Click empty area to add, right-click to delete.
+    m_textToolStopBar = new GradientStopBar(textPage);
+    form->addRow("ストップ", m_textToolStopBar);
+
+    // Per-stop property controls (active stop is set by GradientStopBar::stopSelected).
+    m_textToolStopColorBtn = new QPushButton("色を選択…", textPage);
+    styleColorBtn(m_textToolStopColorBtn, Qt::white);
+    connect(m_textToolStopColorBtn, &QPushButton::clicked, this, [this, styleColorBtn]() {
+        if (!m_textToolStopBar) return;
+        const int idx = m_textToolStopBar->selectedIndex();
+        if (idx < 0 || idx >= m_textToolStopBar->stops().size()) return;
+        QColor picked = QColorDialog::getColor(m_textToolStopBar->stops()[idx].color,
+                                               this, "ストップ色");
+        if (!picked.isValid()) return;
+        GradientStop s = m_textToolStopBar->stops()[idx];
+        s.color = picked;
+        m_textToolStopBar->updateStop(idx, s);
+        styleColorBtn(m_textToolStopColorBtn, picked);
+        pushTextToolStyleToPreview();
+    });
+    form->addRow("ストップ色", m_textToolStopColorBtn);
+
+    m_textToolStopOpacitySpin = new QDoubleSpinBox(textPage);
+    m_textToolStopOpacitySpin->setRange(0.0, 100.0);
+    m_textToolStopOpacitySpin->setDecimals(0);
+    m_textToolStopOpacitySpin->setSingleStep(5.0);
+    m_textToolStopOpacitySpin->setSuffix(" %");
+    m_textToolStopOpacitySpin->setValue(100.0);
+    connect(m_textToolStopOpacitySpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this](double v) {
+                if (!m_textToolStopBar) return;
+                const int idx = m_textToolStopBar->selectedIndex();
+                if (idx < 0 || idx >= m_textToolStopBar->stops().size()) return;
+                GradientStop s = m_textToolStopBar->stops()[idx];
+                s.opacity = qBound(0.0, v / 100.0, 1.0);
+                m_textToolStopBar->updateStop(idx, s);
+                pushTextToolStyleToPreview();
+            });
+    form->addRow("ストップ不透明度", m_textToolStopOpacitySpin);
+
+    m_textToolStopPosSpin = new QDoubleSpinBox(textPage);
+    m_textToolStopPosSpin->setRange(0.0, 100.0);
+    m_textToolStopPosSpin->setDecimals(0);
+    m_textToolStopPosSpin->setSingleStep(1.0);
+    m_textToolStopPosSpin->setSuffix(" %");
+    m_textToolStopPosSpin->setValue(0.0);
+    connect(m_textToolStopPosSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this](double v) {
+                if (!m_textToolStopBar) return;
+                const int idx = m_textToolStopBar->selectedIndex();
+                if (idx < 0 || idx >= m_textToolStopBar->stops().size()) return;
+                GradientStop s = m_textToolStopBar->stops()[idx];
+                s.position = qBound(0.0, v / 100.0, 1.0);
+                m_textToolStopBar->updateStop(idx, s);
+                pushTextToolStyleToPreview();
+            });
+    form->addRow("ストップ位置", m_textToolStopPosSpin);
+
+    // Sync per-stop controls when a stop is selected on the bar.
+    connect(m_textToolStopBar, &GradientStopBar::stopSelected, this, [this, styleColorBtn](int idx) {
+        if (!m_textToolStopBar || idx < 0 || idx >= m_textToolStopBar->stops().size()) return;
+        const GradientStop &s = m_textToolStopBar->stops()[idx];
+        if (m_textToolStopColorBtn) styleColorBtn(m_textToolStopColorBtn, s.color);
+        if (m_textToolStopOpacitySpin) {
+            QSignalBlocker b(m_textToolStopOpacitySpin);
+            m_textToolStopOpacitySpin->setValue(s.opacity * 100.0);
+        }
+        if (m_textToolStopPosSpin) {
+            QSignalBlocker b(m_textToolStopPosSpin);
+            m_textToolStopPosSpin->setValue(s.position * 100.0);
+        }
+    });
+    connect(m_textToolStopBar, &GradientStopBar::stopsChanged, this, [this]() {
+        pushTextToolStyleToPreview();
+    });
+
+    // Gradient preset save / load buttons — JSON files under AppData/gradients.
+    m_textToolGradientPresetSaveBtn = new QPushButton("保存", textPage);
+    m_textToolGradientPresetLoadBtn = new QPushButton("呼び出し", textPage);
+    connect(m_textToolGradientPresetSaveBtn, &QPushButton::clicked, this, [this]() {
+        if (!m_textToolStopBar) return;
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, "プリセット保存",
+                                                   "名前:", QLineEdit::Normal, "preset", &ok);
+        if (!ok || name.trimmed().isEmpty()) return;
+        const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/gradients";
+        QDir().mkpath(dir);
+        QJsonArray stopsArr;
+        for (const auto &s : m_textToolStopBar->stops()) {
+            QJsonObject so;
+            so["position"] = s.position;
+            so["color"] = s.color.name(QColor::HexArgb);
+            so["opacity"] = s.opacity;
+            stopsArr.append(so);
+        }
+        QJsonObject root;
+        root["name"] = name.trimmed();
+        root["type"] = m_textToolGradientTypeCombo ? m_textToolGradientTypeCombo->currentData().toInt() : 0;
+        root["angle"] = m_textToolGradientAngleSpin ? m_textToolGradientAngleSpin->value() : 90.0;
+        root["reverse"] = m_textToolGradientReverseCheck && m_textToolGradientReverseCheck->isChecked();
+        root["stops"] = stopsArr;
+        const QString path = dir + "/" + name.trimmed() + ".json";
+        QFile f(path);
+        if (f.open(QIODevice::WriteOnly)) {
+            f.write(QJsonDocument(root).toJson());
+            statusBar()->showMessage(QString("プリセット保存: %1").arg(path));
+        } else {
+            statusBar()->showMessage("プリセット保存失敗");
+        }
+    });
+    connect(m_textToolGradientPresetLoadBtn, &QPushButton::clicked, this, [this]() {
+        if (!m_textToolStopBar) return;
+        const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/gradients";
+        QDir().mkpath(dir);
+        const QString path = QFileDialog::getOpenFileName(this, "プリセット呼び出し", dir, "JSON (*.json)");
+        if (path.isEmpty()) return;
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly)) return;
+        const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+        if (m_textToolGradientTypeCombo) {
+            const int t = root["type"].toInt(0);
+            const int idx = m_textToolGradientTypeCombo->findData(t);
+            if (idx >= 0) m_textToolGradientTypeCombo->setCurrentIndex(idx);
+        }
+        if (m_textToolGradientAngleSpin)
+            m_textToolGradientAngleSpin->setValue(root["angle"].toDouble(90.0));
+        if (m_textToolGradientReverseCheck)
+            m_textToolGradientReverseCheck->setChecked(root["reverse"].toBool(false));
+        QVector<GradientStop> stops;
+        for (const auto &v : root["stops"].toArray()) {
+            const QJsonObject so = v.toObject();
+            GradientStop s;
+            s.position = so["position"].toDouble(0.0);
+            s.color = QColor(so["color"].toString("#ffffffff"));
+            s.opacity = so["opacity"].toDouble(1.0);
+            stops.append(s);
+        }
+        if (!stops.isEmpty())
+            m_textToolStopBar->setStops(stops);
+        pushTextToolStyleToPreview();
+        statusBar()->showMessage(QString("プリセット呼び出し: %1").arg(path));
+    });
+    auto *presetRow = new QHBoxLayout();
+    presetRow->addWidget(m_textToolGradientPresetSaveBtn);
+    presetRow->addWidget(m_textToolGradientPresetLoadBtn);
+    form->addRow("プリセット", presetRow);
+
+    // Outline stroke controls.
+    m_textToolOutlineCheck = new QCheckBox("枠線", textPage);
+    form->addRow("", m_textToolOutlineCheck);
+    m_textToolOutlineColor = Qt::black;
+    m_textToolOutlineColorBtn = new QPushButton("枠線色", textPage);
+    styleColorBtn(m_textToolOutlineColorBtn, m_textToolOutlineColor);
+    connect(m_textToolOutlineColorBtn, &QPushButton::clicked, this, [this, styleColorBtn]() {
+        QColor picked = QColorDialog::getColor(m_textToolOutlineColor, this, "枠線色");
+        if (picked.isValid()) {
+            m_textToolOutlineColor = picked;
+            styleColorBtn(m_textToolOutlineColorBtn, picked);
+        }
+    });
+    form->addRow("枠線色", m_textToolOutlineColorBtn);
+    m_textToolOutlineWidthSpin = new QSpinBox(textPage);
+    m_textToolOutlineWidthSpin->setRange(0, 20);
+    m_textToolOutlineWidthSpin->setValue(2);
+    m_textToolOutlineWidthSpin->setSuffix(" px");
+    form->addRow("枠線幅", m_textToolOutlineWidthSpin);
+
+    textLayout->addLayout(form);
+    textLayout->addSpacing(12);
+
+    auto *applyButton = new QPushButton("適用", textPage);
+    applyButton->setMinimumHeight(32);
+    connect(applyButton, &QPushButton::clicked, this, &MainWindow::applyTextToolOverlay);
+    textLayout->addWidget(applyButton);
+
+    auto *hint = new QLabel(
+        "プレビュー上でドラッグしてテキスト枠を指定してください。\n"
+        "ドラッグしない場合は中央に配置されます。", textPage);
+    hint->setWordWrap(true);
+    hint->setStyleSheet("color: #888; font-size: 11px;");
+    textLayout->addWidget(hint);
+    textLayout->addStretch();
+
+    // The text panel grew tall with gradient/stop controls — wrap it in a
+    // scroll area so it doesn't force the main window to an abnormal height
+    // on smaller screens. The scroll area takes the panel slot in the stack.
+    auto *textScroll = new QScrollArea(m_toolPropertyStack);
+    textScroll->setWidget(textPage);
+    textScroll->setWidgetResizable(true);
+    textScroll->setFrameShape(QFrame::NoFrame);
+    textScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_toolPropertyStack->addWidget(textScroll);
+    m_toolPropertyStack->setCurrentIndex(0);
+}
+
+void MainWindow::onTextToolToggled(bool checked)
+{
+    m_textToolActive = checked;
+    if (m_player)
+        m_player->setTextToolActive(checked);
+    if (!m_toolPropertyStack)
+        return;
+    if (checked) {
+        m_toolPropertyStack->setCurrentIndex(1);
+        m_toolPropertyStack->show();
+        pushTextToolStyleToPreview();
+        // Pre-fill time defaults: 開始時間 = current playhead, 表示時間 = 5 s.
+        // Both remain adjustable via the spinboxes before 適用.
+        if (m_timeline && m_textToolStartSpin && m_textToolEndSpin) {
+            m_textToolStartSpin->setValue(m_timeline->playheadPosition());
+            m_textToolEndSpin->setValue(5.0);
+        }
+        statusBar()->showMessage("テキストツール ON — プレビュー上でドラッグして枠を指定、その場で直接入力");
+    } else {
+        m_toolPropertyStack->setCurrentIndex(0);
+        m_toolPropertyStack->hide();
+        m_textToolHasPendingRect = false;
+        statusBar()->showMessage("テキストツール OFF");
+    }
+}
+
+void MainWindow::onTextRectRequested(const QRectF &normalizedRect)
+{
+    m_textToolPendingRect = normalizedRect;
+    m_textToolHasPendingRect = true;
+    pushTextToolStyleToPreview();
+    // Refresh 開始時間 against the current playhead each time a fresh rect
+    // is drawn — makes the text default to "appears at the current playhead
+    // for 5 s". The duration spin is left alone so a user-specified value
+    // carries forward across multiple rect draws.
+    if (m_timeline && m_textToolStartSpin)
+        m_textToolStartSpin->setValue(m_timeline->playheadPosition());
+    statusBar()->showMessage(QString("テキスト枠指定: %1,%2 %3x%4 — プレビュー上で直接入力するか、右パネルで『適用』")
+        .arg(normalizedRect.x(), 0, 'f', 2)
+        .arg(normalizedRect.y(), 0, 'f', 2)
+        .arg(normalizedRect.width(), 0, 'f', 2)
+        .arg(normalizedRect.height(), 0, 'f', 2));
+}
+
+void MainWindow::onTextInlineCommitted(const QString &text, const QRectF &normalizedRect)
+{
+    // Populate the pending state from the inline commit and run the normal
+    // apply path so the overlay inherits the right panel's size/color/time
+    // values. The QLineEdit is filled only so applyTextToolOverlay's empty
+    // guard passes — it's cleared again at the end of the apply.
+    m_textToolPendingRect = normalizedRect;
+    m_textToolHasPendingRect = true;
+    if (m_textToolLineEdit)
+        m_textToolLineEdit->setText(text);
+    applyTextToolOverlay();
+}
+
+void MainWindow::onTextOverlayEditCommitted(int overlayIndex, const QString &newText)
+{
+    // Click-to-edit on an existing overlay — only the text string changes,
+    // the rect / style / time range stay put. Push the updated overlay list
+    // back to the player so the preview re-renders with the new text.
+    if (!m_timeline->updateTextOverlayText(overlayIndex, newText)) {
+        statusBar()->showMessage("テキスト更新失敗");
+        return;
+    }
+    const auto &clips = m_timeline->videoClips();
+    if (!clips.isEmpty() && m_player) {
+        QVector<EnhancedTextOverlay> overlays;
+        const auto &mgr = clips[0].textManager;
+        for (int i = 0; i < mgr.count(); ++i)
+            overlays.append(mgr.overlay(i));
+        m_player->setTextOverlays(overlays);
+    }
+    if (m_player)
+        m_player->clearTextToolRect();
+    statusBar()->showMessage(QString("テキスト更新: 「%1」").arg(newText));
+}
+
+void MainWindow::pushTextToolStyleToPreview()
+{
+    if (!m_player)
+        return;
+    // Use Arial + bold to match EnhancedTextOverlay's default font family;
+    // inheriting the system default here was causing WYSIWYG metric drift
+    // between the inline edit layer and composeFrameWithOverlays.
+    QFont f("Arial");
+    f.setPointSize(m_textToolSizeSpin ? m_textToolSizeSpin->value() : 32);
+    f.setBold(true);
+    m_player->setTextToolStyle(f, m_textToolColor);
+}
+
+void MainWindow::applyTextToolOverlay()
+{
+    // 適用 primarily commits whatever the user has been typing directly on
+    // the preview (Adobe-style in-place edit). If the GLPreview is in edit
+    // mode with non-empty text, just delegate: its commitCurrentTextToolEdit
+    // fires the textInlineCommitted / textOverlayEditCommitted signal which
+    // lands on the normal slot and runs the right-panel apply from there.
+    if (m_player && m_player->isTextToolEditing()
+        && !m_player->currentTextToolInputText().isEmpty()) {
+        m_player->commitCurrentTextToolEdit();
+        return;
+    }
+    if (!m_textToolLineEdit || m_textToolLineEdit->text().isEmpty()) {
+        statusBar()->showMessage("テキストが空です");
+        return;
+    }
+    if (!m_timeline || m_timeline->videoClips().isEmpty()) {
+        statusBar()->showMessage("先にクリップを選択してください");
+        return;
+    }
+
+    EnhancedTextOverlay overlay;
+    overlay.text = m_textToolLineEdit->text();
+    QFont font = overlay.font;
+    font.setPointSize(m_textToolSizeSpin ? m_textToolSizeSpin->value() : 32);
+    overlay.font = font;
+    overlay.color = m_textToolColor;
+    // Transparent background by default — the user explicitly asked for it
+    // so the text sits directly on the video instead of on a translucent box.
+    overlay.backgroundColor = QColor(0, 0, 0, 0);
+    overlay.gradientEnabled = m_textToolGradientCheck && m_textToolGradientCheck->isChecked();
+    overlay.gradientStart = m_textToolGradientStart;
+    overlay.gradientEnd = m_textToolGradientEnd;
+    overlay.gradientAngle = m_textToolGradientAngleSpin ? m_textToolGradientAngleSpin->value() : 90.0;
+    overlay.gradientType = m_textToolGradientTypeCombo ? m_textToolGradientTypeCombo->currentData().toInt() : 0;
+    overlay.gradientMidpoint = m_textToolGradientMidSpin ? m_textToolGradientMidSpin->value() : 50.0;
+    overlay.gradientReverse = m_textToolGradientReverseCheck && m_textToolGradientReverseCheck->isChecked();
+    if (m_textToolStopBar)
+        overlay.gradientStops = m_textToolStopBar->stops();
+    if (m_textToolOutlineCheck && m_textToolOutlineCheck->isChecked()) {
+        overlay.outlineColor = m_textToolOutlineColor;
+        overlay.outlineWidth = m_textToolOutlineWidthSpin ? m_textToolOutlineWidthSpin->value() : 2;
+    } else {
+        overlay.outlineWidth = 0;
+    }
+    overlay.startTime = m_textToolStartSpin ? m_textToolStartSpin->value() : 0.0;
+    // The second spin is 表示時間 (duration), not absolute end time — the
+    // user asked for duration semantics so the text defaults to "now + 5 s".
+    const double duration = m_textToolEndSpin ? m_textToolEndSpin->value() : 5.0;
+    overlay.endTime = overlay.startTime + qMax(0.1, duration);
+    if (m_textToolHasPendingRect) {
+        overlay.x = m_textToolPendingRect.x() + m_textToolPendingRect.width() / 2.0;
+        overlay.y = m_textToolPendingRect.y() + m_textToolPendingRect.height() / 2.0;
+        overlay.width = m_textToolPendingRect.width();
+        overlay.height = m_textToolPendingRect.height();
+    }
+
+    if (!m_timeline->addTextOverlayToFirstVideoClip(overlay)) {
+        statusBar()->showMessage("テキスト追加失敗 — クリップが見つかりません");
+        return;
+    }
+
+    // Push the updated overlay list to the preview so the new text is
+    // visible immediately. MainWindow is the single source of truth that
+    // owns the timeline → player forwarding.
+    const auto &clips = m_timeline->videoClips();
+    if (!clips.isEmpty()) {
+        QVector<EnhancedTextOverlay> overlays;
+        const auto &mgr = clips[0].textManager;
+        for (int i = 0; i < mgr.count(); ++i)
+            overlays.append(mgr.overlay(i));
+        if (m_player)
+            m_player->setTextOverlays(overlays);
+    }
+    statusBar()->showMessage(QString("テキストを追加しました: 「%1」").arg(overlay.text));
+
+    m_textToolLineEdit->clear();
+    m_textToolHasPendingRect = false;
+    if (m_player)
+        m_player->clearTextToolRect();
+}
+
 void MainWindow::addTextOverlay()
 {
     TextOverlayDialog dialog(this);
@@ -986,6 +1734,42 @@ void MainWindow::addTextOverlay()
         // TODO: Store overlay in project and render on preview
         statusBar()->showMessage(QString("Added text: \"%1\"").arg(overlay.text));
     }
+}
+
+void MainWindow::exportTextOverlays()
+{
+    if (!m_timeline || m_timeline->videoClips().isEmpty()) {
+        QMessageBox::information(this, "テキスト書き出し",
+                                 "クリップにテキストオーバーレイがありません。");
+        return;
+    }
+    const auto &clip = m_timeline->videoClips().first();
+    if (clip.textManager.count() == 0) {
+        QMessageBox::information(this, "テキスト書き出し",
+                                 "V1 の先頭クリップにテキストがありません。");
+        return;
+    }
+    QString selectedFilter;
+    const QString path = QFileDialog::getSaveFileName(
+        this, "テキストを書き出し", QString(),
+        "SubRip (*.srt);;CSV (*.csv);;All Files (*)", &selectedFilter);
+    if (path.isEmpty())
+        return;
+
+    QVector<EnhancedTextOverlay> overlays;
+    for (int i = 0; i < clip.textManager.count(); ++i)
+        overlays.append(clip.textManager.overlay(i));
+
+    const bool wantCsv = selectedFilter.contains("CSV")
+                      || path.endsWith(".csv", Qt::CaseInsensitive);
+    const bool ok = wantCsv
+        ? TextManager::exportCSV(overlays, path)
+        : TextManager::exportSRT(overlays, path);
+    if (ok)
+        statusBar()->showMessage(QString("%1 にテキストを書き出しました").arg(path));
+    else
+        QMessageBox::warning(this, "テキスト書き出し",
+                             QString("書き出しに失敗しました: %1").arg(path));
 }
 
 void MainWindow::manageTextOverlays()
@@ -1111,10 +1895,42 @@ void MainWindow::colorCorrection()
         QMessageBox::information(this, "Color Correction", "Select a clip first.");
         return;
     }
-    // カラーグレーディングパネルを表示し、選択クリップの値を反映
-    m_colorGradingPanel->setColorCorrection(m_timeline->clipColorCorrection());
-    m_colorGradingPanel->show();
-    m_colorGradingPanel->raise();
+
+    // サブメニュー: 旧ダイアログ or 新パネル
+    QMenu menu(this);
+    auto *dialogAction = menu.addAction("色補正ダイアログ (クラシック)...");
+    auto *panelAction  = menu.addAction("カラーグレーディングパネル");
+    auto *chosen = menu.exec(QCursor::pos());
+    if (!chosen) return;
+
+    if (chosen == panelAction) {
+        // 新パネルを表示
+        m_colorGradingPanel->setColorCorrection(m_timeline->clipColorCorrection());
+        m_colorGradingPanel->show();
+        m_colorGradingPanel->raise();
+    } else {
+        // 旧ダイアログ (リアルタイムプレビュー付き)
+        ColorCorrection originalCC = m_timeline->clipColorCorrection();
+        ColorCorrectionDialog dialog(originalCC, this);
+
+        // スライダー操作時にリアルタイムでプレビューに反映
+        connect(&dialog, &ColorCorrectionDialog::colorCorrectionChanged,
+                this, [this](const ColorCorrection &cc) {
+            m_player->setColorCorrection(cc);
+        });
+
+        if (dialog.exec() == QDialog::Accepted) {
+            // OK: 確定
+            m_timeline->setClipColorCorrection(dialog.result());
+            m_player->setColorCorrection(dialog.result());
+            // パネルも同期
+            m_colorGradingPanel->setColorCorrection(dialog.result());
+            statusBar()->showMessage("色補正を適用しました");
+        } else {
+            // Cancel: 元に戻す
+            m_player->setColorCorrection(originalCC);
+        }
+    }
 }
 
 void MainWindow::videoEffects()
@@ -1123,11 +1939,20 @@ void MainWindow::videoEffects()
         QMessageBox::information(this, "Video Effects", "Select a clip first.");
         return;
     }
-    VideoEffectDialog dialog(m_timeline->clipEffects(), this);
-    if (dialog.exec() == QDialog::Accepted) {
+    const QVector<VideoEffect> original = m_timeline->clipEffects();
+    VideoEffectDialog dialog(original, this);
+    connect(&dialog, &VideoEffectDialog::effectsChanged, this,
+            [this](const QVector<VideoEffect> &e) {
+        if (m_player) m_player->setPreviewEffects(e);
+    });
+    if (m_player) m_player->setPreviewEffects(original);
+    const bool accepted = dialog.exec() == QDialog::Accepted;
+    if (accepted) {
         m_timeline->setClipEffects(dialog.result());
         statusBar()->showMessage(QString("Applied %1 effect(s)").arg(dialog.result().size()));
     }
+    if (m_player)
+        m_player->setPreviewEffects(accepted ? dialog.result() : original, /*live=*/true);
 }
 
 void MainWindow::pluginEffects()
@@ -2543,6 +3368,9 @@ void MainWindow::restoreWindowState()
     if (settings.contains("windowState")) {
         restoreState(settings.value("windowState").toByteArray());
     }
+    // カラーグレーディングパネルは常に非表示で起動
+    if (m_colorGradingPanel)
+        m_colorGradingPanel->close();
     if (m_mainSplitter && settings.contains("splitterState")) {
         m_mainSplitter->restoreState(settings.value("splitterState").toByteArray());
     }
@@ -2607,8 +3435,17 @@ void MainWindow::showEvent(QShowEvent *event)
     if (!m_autoSaveStarted && m_autoSave) {
         m_autoSaveStarted = true;
         QTimer::singleShot(500, this, [this]() {
-            if (m_autoSave)
-                m_autoSave->start(AutoSaveConfig{});
+            if (!m_autoSave)
+                return;
+            // Default OFF. Interval persisted via QSettings, default 30 min.
+            QSettings prefSettings("VSimpleEditor", "Preferences");
+            const bool enabled = prefSettings.value("autoSaveEnabled", false).toBool();
+            if (!enabled)
+                return;
+            AutoSaveConfig cfg;
+            cfg.enabled = true;
+            cfg.interval = prefSettings.value("autoSaveIntervalSec", 1800).toInt();
+            m_autoSave->start(cfg);
         });
     }
 }

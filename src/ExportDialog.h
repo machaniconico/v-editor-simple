@@ -18,6 +18,8 @@ struct ExportPreset {
     int videoBitrate;    // kbps
     int audioBitrate;    // kbps
     int maxFileSizeMB;   // 0 = no limit
+    bool hdr10 = false;  // when true: 10-bit pipeline + BT.2020/PQ metadata
+    int proresProfile = -1;  // -1 = not ProRes; 0=Proxy,1=LT,2=SQ,3=HQ,4=4444,5=4444XQ
 };
 
 struct ExportConfig {
@@ -32,6 +34,8 @@ struct ExportConfig {
     int fps = 30;
     bool useHardwareAccel = false;
     int maxFileSizeMB = 0;
+    bool hdr10 = false;  // 10-bit BT.2020/PQ output when true
+    int proresProfile = -1;  // -1 = not ProRes; 0..5 = Proxy/LT/SQ/HQ/4444/4444XQ
 
     QString codecDisplayName() const;
 };
@@ -44,6 +48,7 @@ public:
     explicit ExportDialog(const ProjectConfig &project, QWidget *parent = nullptr);
 
     ExportConfig config() const { return m_config; }
+    void setSourceIsHdr(bool hdr);
 
     static QVector<ExportPreset> presets();
 
@@ -68,4 +73,6 @@ private:
     QCheckBox *m_hwAccelCheck;
     QLineEdit *m_outputEdit;
     QLabel *m_summaryLabel;
+    QLabel *m_hdrWarningLabel = nullptr;
+    bool m_sourceIsHdr = false;
 };

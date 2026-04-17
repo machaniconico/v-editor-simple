@@ -132,8 +132,23 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
     encCtx->height = config.height;
     encCtx->time_base = {1, config.fps};
     encCtx->framerate = {config.fps, 1};
-    encCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+    AVPixelFormat targetPixFmt = AV_PIX_FMT_YUV420P;
+    if (config.proresProfile >= 4) {
+        targetPixFmt = AV_PIX_FMT_YUVA444P10LE;
+    } else if (config.proresProfile >= 0) {
+        targetPixFmt = AV_PIX_FMT_YUV422P10LE;
+    } else if (config.hdr10) {
+        targetPixFmt = AV_PIX_FMT_YUV420P10LE;
+    }
+    encCtx->pix_fmt = targetPixFmt;
     encCtx->bit_rate = static_cast<int64_t>(config.videoBitrate) * 1000;
+
+    if (config.hdr10) {
+        encCtx->color_primaries = AVCOL_PRI_BT2020;
+        encCtx->color_trc = AVCOL_TRC_SMPTE2084;
+        encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
+        encCtx->color_range = AVCOL_RANGE_MPEG;
+    }
 
     if (outFmt->oformat->flags & AVFMT_GLOBALHEADER)
         encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -143,12 +158,23 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
     if (config.videoCodec == "libx264" || config.videoCodec == "libx265") {
         av_dict_set(&opts, "preset", "medium", 0);
         av_dict_set(&opts, "crf", "23", 0);
+        if (config.hdr10 && config.videoCodec == "libx265") {
+            av_dict_set(&opts, "profile", "main10", 0);
+            av_dict_set(&opts,
+                        "x265-params",
+                        "hdr10=1:repeat-headers=1:colorprim=bt2020:"
+                        "transfer=smpte2084:colormatrix=bt2020nc:range=limited",
+                        0);
+        }
     } else if (config.videoCodec == "libsvtav1") {
         av_dict_set(&opts, "preset", "8", 0);
         av_dict_set(&opts, "crf", "30", 0);
     } else if (config.videoCodec == "libvpx-vp9") {
         av_dict_set(&opts, "quality", "good", 0);
         av_dict_set(&opts, "cpu-used", "4", 0);
+    } else if (config.videoCodec.startsWith("prores") && config.proresProfile >= 0) {
+        const QByteArray profileStr = QByteArray::number(config.proresProfile);
+        av_dict_set(&opts, "profile", profileStr.constData(), 0);
     }
 
     if (avcodec_open2(encCtx, encoder, &opts) < 0) {
@@ -208,9 +234,15 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
         AVPacket *packet = av_packet_alloc();
         AVFrame *frame = av_frame_alloc();
         AVFrame *outFrame = av_frame_alloc();
-        outFrame->format = AV_PIX_FMT_YUV420P;
+        outFrame->format = targetPixFmt;
         outFrame->width = config.width;
         outFrame->height = config.height;
+        if (config.hdr10) {
+            outFrame->color_primaries = AVCOL_PRI_BT2020;
+            outFrame->color_trc = AVCOL_TRC_SMPTE2084;
+            outFrame->colorspace = AVCOL_SPC_BT2020_NCL;
+            outFrame->color_range = AVCOL_RANGE_MPEG;
+        }
         av_frame_get_buffer(outFrame, 0);
 
         while (av_read_frame(inFmt, packet) >= 0 && !m_cancelled) {
@@ -234,19 +266,21 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                 // Scale frame
                 if (!swsCtx || sws_getContext(
                     frame->width, frame->height, decCtx->pix_fmt,
-                    config.width, config.height, AV_PIX_FMT_YUV420P,
+                    config.width, config.height, targetPixFmt,
                     SWS_BILINEAR, nullptr, nullptr, nullptr) != swsCtx) {
                     if (swsCtx) sws_freeContext(swsCtx);
                     swsCtx = sws_getContext(
                         frame->width, frame->height, decCtx->pix_fmt,
-                        config.width, config.height, AV_PIX_FMT_YUV420P,
+                        config.width, config.height, targetPixFmt,
                         SWS_BILINEAR, nullptr, nullptr, nullptr);
                 }
 
                 av_frame_make_writable(outFrame);
 
-                // Apply color correction & effects if clip has any
-                bool hasEffects = !clip.colorCorrection.isDefault() || !clip.effects.isEmpty();
+                // 10-bit outputs (HDR10 / ProRes) bypass the 8-bit RGB24 effect round-trip.
+                const bool tenBitPath = config.hdr10 || config.proresProfile >= 0;
+                bool hasEffects = !tenBitPath
+                                  && (!clip.colorCorrection.isDefault() || !clip.effects.isEmpty());
                 if (hasEffects) {
                     // Decode to RGB for effect processing
                     QImage rgbFrame(config.width, config.height, QImage::Format_RGB888);

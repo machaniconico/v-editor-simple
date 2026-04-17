@@ -10,7 +10,8 @@
 QVector<ProjectPreset> ProjectSettingsDialog::presets()
 {
     return {
-        {"YouTube (1080p 16:9)",          1920, 1080, 30},
+        {"YouTube (1080p60 16:9)",        1920, 1080, 60},
+        {"YouTube (1440p WQHD 16:9)",     2560, 1440, 30},
         {"YouTube (4K 16:9)",             3840, 2160, 30},
         {"YouTube Shorts (9:16)",         1080, 1920, 30},
         {"TikTok / Reels (9:16)",         1080, 1920, 30},
@@ -23,12 +24,30 @@ QVector<ProjectPreset> ProjectSettingsDialog::presets()
     };
 }
 
-ProjectSettingsDialog::ProjectSettingsDialog(QWidget *parent)
+ProjectSettingsDialog::ProjectSettingsDialog(QWidget *parent, const ProjectConfig *initial)
     : QDialog(parent)
 {
-    setWindowTitle("New Project");
+    setWindowTitle(initial ? "プロジェクト設定" : "New Project");
     setMinimumWidth(420);
     setupUI();
+
+    if (initial) {
+        const auto presetList = presets();
+        int matchIdx = -1;
+        for (int i = 0; i < presetList.size(); ++i) {
+            if (presetList[i].width == initial->width
+                && presetList[i].height == initial->height
+                && presetList[i].fps == initial->fps) {
+                matchIdx = i;
+                break;
+            }
+        }
+        m_presetCombo->setCurrentIndex(matchIdx >= 0 ? matchIdx : presetList.size());
+        m_nameEdit->setText(initial->name);
+        m_widthSpin->setValue(initial->width);
+        m_heightSpin->setValue(initial->height);
+        m_fpsCombo->setCurrentText(QString::number(initial->fps));
+    }
 }
 
 void ProjectSettingsDialog::setupUI()
@@ -87,7 +106,7 @@ void ProjectSettingsDialog::setupUI()
     auto *fpsLayout = new QHBoxLayout(fpsGroup);
     m_fpsCombo = new QComboBox(this);
     m_fpsCombo->addItems({"24", "25", "30", "50", "60"});
-    m_fpsCombo->setCurrentText("30");
+    m_fpsCombo->setCurrentText("60");
     fpsLayout->addWidget(new QLabel("FPS:"));
     fpsLayout->addWidget(m_fpsCombo);
     fpsLayout->addStretch();

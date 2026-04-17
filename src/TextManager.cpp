@@ -320,6 +320,71 @@ QVector<EnhancedTextOverlay> TextManager::importVTT(const QString &filePath) {
     return overlays;
 }
 
+// --- SRT / CSV export ---
+
+static QString formatSrtTime(double seconds) {
+    const int totalMs = qMax(0, static_cast<int>(seconds * 1000.0));
+    const int h = totalMs / 3600000;
+    const int m = (totalMs % 3600000) / 60000;
+    const int s = (totalMs % 60000) / 1000;
+    const int ms = totalMs % 1000;
+    return QString("%1:%2:%3,%4")
+        .arg(h, 2, 10, QChar('0'))
+        .arg(m, 2, 10, QChar('0'))
+        .arg(s, 2, 10, QChar('0'))
+        .arg(ms, 3, 10, QChar('0'));
+}
+
+bool TextManager::exportSRT(const QVector<EnhancedTextOverlay> &overlays, const QString &filePath) {
+    QFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+        return false;
+    QTextStream out(&file);
+    out.setEncoding(QStringConverter::Utf8);
+    int idx = 1;
+    for (const auto &ov : overlays) {
+        if (ov.text.isEmpty()) continue;
+        const double start = qMax(0.0, ov.startTime);
+        const double end = (ov.endTime > start) ? ov.endTime : start + 1.0;
+        out << idx++ << "\n";
+        out << formatSrtTime(start) << " --> " << formatSrtTime(end) << "\n";
+        out << ov.text << "\n\n";
+    }
+    file.close();
+    return true;
+}
+
+bool TextManager::exportCSV(const QVector<EnhancedTextOverlay> &overlays, const QString &filePath) {
+    QFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+        return false;
+    QTextStream out(&file);
+    out.setEncoding(QStringConverter::Utf8);
+    // Header row — timestamps in seconds so downstream spreadsheets can
+    // sort/filter numerically. The text column is RFC 4180 quoted when it
+    // contains quotes, commas, or newlines.
+    out << "index,start_sec,end_sec,text\n";
+    auto quoteText = [](const QString &s) -> QString {
+        const bool needsQuote = s.contains('"') || s.contains(',') || s.contains('\n');
+        if (!needsQuote) return s;
+        QString escaped = s;
+        escaped.replace('"', "\"\"");
+        return '"' + escaped + '"';
+    };
+    int idx = 1;
+    for (const auto &ov : overlays) {
+        if (ov.text.isEmpty()) continue;
+        const double start = qMax(0.0, ov.startTime);
+        const double end = (ov.endTime > start) ? ov.endTime : start + 1.0;
+        out << idx++ << ','
+            << QString::number(start, 'f', 3) << ','
+            << QString::number(end, 'f', 3) << ','
+            << quoteText(ov.text) << '\n';
+    }
+    file.close();
+    return true;
+}
+
 // --- Serialization ---
 
 QJsonArray TextManager::toJson(const QVector<EnhancedTextOverlay> &overlays) {
@@ -343,6 +408,24 @@ QJsonArray TextManager::toJson(const QVector<EnhancedTextOverlay> &overlays) {
         obj["outlineWidth"] = o.outlineWidth;
         obj["outline2Color"] = o.outline2Color.name(QColor::HexArgb);
         obj["outline2Width"] = o.outline2Width;
+        obj["gradientEnabled"] = o.gradientEnabled;
+        obj["gradientStart"] = o.gradientStart.name(QColor::HexArgb);
+        obj["gradientEnd"] = o.gradientEnd.name(QColor::HexArgb);
+        obj["gradientAngle"] = o.gradientAngle;
+        obj["gradientType"] = o.gradientType;
+        obj["gradientMidpoint"] = o.gradientMidpoint;
+        obj["gradientReverse"] = o.gradientReverse;
+        if (!o.gradientStops.isEmpty()) {
+            QJsonArray stopsArr;
+            for (const auto &s : o.gradientStops) {
+                QJsonObject sObj;
+                sObj["position"] = s.position;
+                sObj["color"] = s.color.name(QColor::HexArgb);
+                sObj["opacity"] = s.opacity;
+                stopsArr.append(sObj);
+            }
+            obj["gradientStops"] = stopsArr;
+        }
         obj["shadowEnabled"] = o.shadow.enabled;
         obj["shadowOffX"] = o.shadow.offsetX;
         obj["shadowOffY"] = o.shadow.offsetY;
@@ -393,6 +476,24 @@ QVector<EnhancedTextOverlay> TextManager::fromJson(const QJsonArray &arr) {
         o.outlineWidth = obj["outlineWidth"].toInt(2);
         o.outline2Color = QColor(obj["outline2Color"].toString("#00000000"));
         o.outline2Width = obj["outline2Width"].toInt();
+        o.gradientEnabled = obj["gradientEnabled"].toBool(false);
+        o.gradientStart = QColor(obj["gradientStart"].toString("#ffffffff"));
+        o.gradientEnd = QColor(obj["gradientEnd"].toString("#ffffc800"));
+        o.gradientAngle = obj["gradientAngle"].toDouble(90.0);
+        o.gradientType = obj["gradientType"].toInt(0);
+        o.gradientMidpoint = obj["gradientMidpoint"].toDouble(50.0);
+        o.gradientReverse = obj["gradientReverse"].toBool(false);
+        if (obj.contains("gradientStops")) {
+            const QJsonArray stopsArr = obj["gradientStops"].toArray();
+            for (const auto &v : stopsArr) {
+                const QJsonObject sObj = v.toObject();
+                GradientStop s;
+                s.position = sObj["position"].toDouble(0.0);
+                s.color = QColor(sObj["color"].toString("#ffffffff"));
+                s.opacity = sObj["opacity"].toDouble(1.0);
+                o.gradientStops.append(s);
+            }
+        }
         o.shadow.enabled = obj["shadowEnabled"].toBool();
         o.shadow.offsetX = obj["shadowOffX"].toDouble(3);
         o.shadow.offsetY = obj["shadowOffY"].toDouble(3);

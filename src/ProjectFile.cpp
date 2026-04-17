@@ -116,6 +116,10 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["outPoint"] = clip.outPoint;
     obj["speed"] = clip.speed;
     obj["volume"] = clip.volume;
+    obj["videoScale"] = clip.videoScale;
+    obj["videoDx"] = clip.videoDx;
+    obj["videoDy"] = clip.videoDy;
+    obj["opacity"] = clip.opacity;
 
     if (!clip.colorCorrection.isDefault())
         obj["colorCorrection"] = colorCorrectionToJson(clip.colorCorrection);
@@ -143,6 +147,10 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.outPoint = obj["outPoint"].toDouble();
     clip.speed = obj["speed"].toDouble(1.0);
     clip.volume = obj["volume"].toDouble(1.0);
+    clip.videoScale = obj["videoScale"].toDouble(1.0);
+    clip.videoDx = obj["videoDx"].toDouble(0.0);
+    clip.videoDy = obj["videoDy"].toDouble(0.0);
+    clip.opacity = obj["opacity"].toDouble(1.0);
 
     if (obj.contains("colorCorrection"))
         clip.colorCorrection = colorCorrectionFromJson(obj["colorCorrection"].toObject());

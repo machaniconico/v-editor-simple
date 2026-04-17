@@ -91,6 +91,8 @@ void ColorCorrectionDialog::onSliderChanged()
     m_highlights.valueLabel->setText(QString::number(m_cc.highlights));
     m_shadows.valueLabel->setText(QString::number(m_cc.shadows));
     m_exposure.valueLabel->setText(QString::number(m_cc.exposure, 'f', 2));
+
+    emit colorCorrectionChanged(m_cc);
 }
 
 void ColorCorrectionDialog::resetAll()
@@ -106,6 +108,7 @@ void ColorCorrectionDialog::resetAll()
     m_highlights.slider->setValue(0);
     m_shadows.slider->setValue(0);
     m_exposure.slider->setValue(0);
+    emit colorCorrectionChanged(m_cc);
 }
 
 // ===== VideoEffectDialog =====
@@ -225,6 +228,7 @@ void VideoEffectDialog::addEffect()
     m_effects.append(effect);
     refreshList();
     m_effectList->setCurrentRow(m_effects.size() - 1);
+    emit effectsChanged(m_effects);
 }
 
 void VideoEffectDialog::removeEffect()
@@ -233,6 +237,7 @@ void VideoEffectDialog::removeEffect()
     if (row < 0 || row >= m_effects.size()) return;
     m_effects.removeAt(row);
     refreshList();
+    emit effectsChanged(m_effects);
 }
 
 void VideoEffectDialog::moveUp()
@@ -242,6 +247,7 @@ void VideoEffectDialog::moveUp()
     std::swap(m_effects[row], m_effects[row - 1]);
     refreshList();
     m_effectList->setCurrentRow(row - 1);
+    emit effectsChanged(m_effects);
 }
 
 void VideoEffectDialog::moveDown()
@@ -251,6 +257,7 @@ void VideoEffectDialog::moveDown()
     std::swap(m_effects[row], m_effects[row + 1]);
     refreshList();
     m_effectList->setCurrentRow(row + 1);
+    emit effectsChanged(m_effects);
 }
 
 void VideoEffectDialog::refreshList()
@@ -350,6 +357,7 @@ void VideoEffectDialog::onParamChanged()
     m_effects[row].param3 = m_param3Spin->value();
     refreshList();
     m_effectList->setCurrentRow(row);
+    emit effectsChanged(m_effects);
 }
 
 void VideoEffectDialog::pickColor()
@@ -361,6 +369,7 @@ void VideoEffectDialog::pickColor()
     if (color.isValid()) {
         m_effects[row].keyColor = color;
         m_colorButton->setStyleSheet(QString("background-color: %1").arg(color.name()));
+        emit effectsChanged(m_effects);
     }
 }
 

@@ -1,6 +1,262 @@
 #include "Timeline.h"
 #include "UndoManager.h"
+
+// Small strip drawn above the V/A tracks that visualizes each text
+// overlay's time range as a rounded rectangle with the (truncated) overlay
+// text. The strip is rebuilt from Timeline's clip[0].textManager every
+// time refreshTextStrip() runs. Each bar's left/right edge is draggable
+// to adjust the corresponding overlay's startTime / endTime — the Timeline
+// listens to textOverlayTimeChanged and writes the new values back through
+// updateTextOverlayTime.
+class TextStripWidget : public QWidget {
+public:
+    using TimeChangeCallback = std::function<void(int, double, double)>;
+    using RowHeightChangeCallback = std::function<void(int)>;
+    explicit TextStripWidget(QWidget *parent = nullptr) : QWidget(parent) {
+        // Caller sets the height via setFixedHeight to match Timeline's
+        // m_trackHeight so the text row looks like any V/A row.
+        setStyleSheet("background-color: #2b2b2b;");
+        setMouseTracking(true);
+    }
+    void setOverlays(const QVector<EnhancedTextOverlay> &overlays, double clipDurationSec) {
+        m_overlays = overlays;
+        m_clipDuration = clipDurationSec;
+        rebuildRowLayout();
+        update();
+    }
+    void setPixelsPerSecond(double pps) { m_pps = pps; update(); }
+    // Baseline height used when there is only one overlay (or zero) —
+    // Timeline sets this to m_trackHeight so the T row matches V1/A1.
+    void setSingleRowHeight(int h) {
+        m_singleRowHeight = qMax(20, h);
+        rebuildRowLayout();
+        update();
+    }
+    // Called with (overlayIndex, newStartTime, newEndTime) whenever the
+    // user drags one of an overlay bar's edge handles. A function
+    // callback avoids Q_OBJECT + MOC plumbing for this inline widget.
+    void setTimeChangeCallback(TimeChangeCallback cb) { m_timeChangeCb = std::move(cb); }
+    // Called with the new row height (pixels) while the user drags the
+    // row's bottom edge. Timeline resizes the strip AND its paired header.
+    void setRowHeightChangeCallback(RowHeightChangeCallback cb) { m_rowHeightCb = std::move(cb); }
+protected:
+    void paintEvent(QPaintEvent *) override {
+        QPainter p(this);
+        p.fillRect(rect(), QColor("#2b2b2b"));
+        p.setPen(QColor("#555"));
+        p.drawLine(0, height() - 1, width(), height() - 1);
+        if (m_overlays.isEmpty() || m_pps <= 0.0)
+            return;
+        for (int i = 0; i < m_overlays.size(); ++i) {
+            QRect r = rectForOverlay(i);
+            if (r.width() <= 0) continue;
+            p.setBrush(QColor(90, 130, 210, 200));
+            p.setPen(QColor(140, 170, 230));
+            p.drawRoundedRect(r, 3, 3);
+            // Edge trim handles (brighter when hovering or dragging).
+            const bool leftHot  = (m_hoverIdx == i && m_hoverEdge == -1) || (m_dragIdx == i && m_dragEdge == -1);
+            const bool rightHot = (m_hoverIdx == i && m_hoverEdge == 1)  || (m_dragIdx == i && m_dragEdge == 1);
+            p.fillRect(QRect(r.left(), r.top(), 3, r.height()),
+                       leftHot ? QColor(255, 220, 120, 230) : QColor(255, 255, 255, 120));
+            p.fillRect(QRect(r.right() - 2, r.top(), 3, r.height()),
+                       rightHot ? QColor(255, 220, 120, 230) : QColor(255, 255, 255, 120));
+            const auto &ov = m_overlays[i];
+            // T1, T2, T3 row label — shown at the left of every overlay bar
+            // so the user can immediately identify which text row this is.
+            const QString rowLabel = QString("T%1").arg(m_overlayRowIdx[i] + 1);
+            p.setPen(QColor(255, 220, 120));
+            QFont lf = p.font();
+            lf.setPointSize(qBound(8, qRound(r.height() * 0.45), 14));
+            lf.setBold(true);
+            p.setFont(lf);
+            const QFontMetrics lfm(lf);
+            const int labelW = lfm.horizontalAdvance(rowLabel) + 6;
+            p.drawText(r.adjusted(4, 0, 0, 0),
+                       Qt::AlignVCenter | Qt::AlignLeft, rowLabel);
+            if (!ov.text.isEmpty() && r.width() > 14 + labelW) {
+                p.setPen(Qt::white);
+                QFont f = p.font();
+                const int pt = qBound(8, qRound(r.height() * 0.42), 14);
+                f.setPointSize(pt);
+                f.setBold(false);
+                p.setFont(f);
+                const QString elided = QFontMetrics(f)
+                    .elidedText(ov.text, Qt::ElideRight, r.width() - labelW - 6);
+                p.drawText(r.adjusted(4 + labelW, 0, -4, 0),
+                           Qt::AlignVCenter | Qt::AlignLeft, elided);
+            }
+        }
+    }
+    void mouseMoveEvent(QMouseEvent *event) override {
+        // Row-height drag has priority — it doesn't depend on m_pps.
+        if (m_rowHeightDragging) {
+            const int newH = qBound(20, m_rowHeightDragStartH + (event->pos().y() - m_rowHeightDragStartY), 240);
+            if (m_rowHeightCb)
+                m_rowHeightCb(newH);
+            return;
+        }
+        if (m_pps <= 0.0) {
+            setCursor(Qt::ArrowCursor);
+            return;
+        }
+        if (m_dragIdx >= 0 && m_dragIdx < m_overlays.size()) {
+            const double tSec = qMax(0.0, event->pos().x() / m_pps);
+            auto &ov = m_overlays[m_dragIdx];
+            if (m_dragEdge == -1) {
+                ov.startTime = qMin(tSec, ov.endTime - 0.1);
+            } else if (m_dragEdge == 1) {
+                ov.endTime = qMax(tSec, ov.startTime + 0.1);
+            } else {
+                // Body drag: translate the whole overlay preserving its
+                // duration. The anchor is the press offset inside the bar
+                // so the bar stays glued to the cursor.
+                const double dur = qMax(0.1, m_dragOriginalEnd - m_dragOriginalStart);
+                double newStart = tSec - m_dragAnchorOffsetSec;
+                if (newStart < 0.0) newStart = 0.0;
+                ov.startTime = newStart;
+                ov.endTime = newStart + dur;
+            }
+            // Re-bin-pack so overlays that now overlap move to a new row.
+            rebuildRowLayout();
+            if (m_timeChangeCb)
+                m_timeChangeCb(m_dragIdx, ov.startTime, ov.endTime);
+            update();
+            return;
+        }
+        // Bottom-edge hover (last 4 px) toggles the row-resize cursor so
+        // the user sees the vertical drag affordance even with no overlays.
+        if (event->pos().y() >= height() - 4) {
+            setCursor(Qt::SizeVerCursor);
+            return;
+        }
+        // Hover feedback — wider edge hit (7 px) so edges are easier to
+        // grab, and SizeAllCursor over the body so the user sees it is
+        // draggable as a whole.
+        int hoverIdx = -1;
+        int hoverEdge = 0;
+        bool hoverBody = false;
+        for (int i = 0; i < m_overlays.size(); ++i) {
+            const QRect r = rectForOverlay(i);
+            if (!r.contains(event->pos()))
+                continue;
+            if (qAbs(event->pos().x() - r.left()) <= 7) {
+                hoverIdx = i; hoverEdge = -1; break;
+            }
+            if (qAbs(event->pos().x() - r.right()) <= 7) {
+                hoverIdx = i; hoverEdge = 1; break;
+            }
+            hoverIdx = i; hoverEdge = 0; hoverBody = true; break;
+        }
+        if (hoverIdx != m_hoverIdx || hoverEdge != m_hoverEdge) {
+            m_hoverIdx = hoverIdx;
+            m_hoverEdge = hoverEdge;
+            update();
+        }
+        if (hoverIdx < 0)
+            setCursor(Qt::ArrowCursor);
+        else if (hoverBody)
+            setCursor(Qt::SizeAllCursor);
+        else
+            setCursor(Qt::SizeHorCursor);
+    }
+    void mousePressEvent(QMouseEvent *event) override {
+        if (event->button() != Qt::LeftButton) return;
+        // Row-resize grip — bottom 4 px — starts a vertical drag that
+        // changes THIS row's height independently of V/A tracks.
+        if (event->pos().y() >= height() - 4) {
+            m_rowHeightDragging = true;
+            m_rowHeightDragStartY = event->pos().y();
+            m_rowHeightDragStartH = height();
+            setCursor(Qt::SizeVerCursor);
+            return;
+        }
+        if (m_pps <= 0.0)
+            return;
+        for (int i = 0; i < m_overlays.size(); ++i) {
+            const QRect r = rectForOverlay(i);
+            if (!r.contains(event->pos())) continue;
+            if (qAbs(event->pos().x() - r.left()) <= 7) {
+                m_dragIdx = i; m_dragEdge = -1;
+                return;
+            }
+            if (qAbs(event->pos().x() - r.right()) <= 7) {
+                m_dragIdx = i; m_dragEdge = 1;
+                return;
+            }
+            // Body drag — capture anchor so the bar slides with the cursor
+            // without snapping its leading edge to the click point.
+            m_dragIdx = i;
+            m_dragEdge = 0;
+            m_dragOriginalStart = m_overlays[i].startTime;
+            m_dragOriginalEnd   = (m_overlays[i].endTime > 0.0)
+                                    ? m_overlays[i].endTime
+                                    : qMax(m_dragOriginalStart + 1.0, m_clipDuration);
+            m_dragAnchorOffsetSec = (event->pos().x() / m_pps) - m_dragOriginalStart;
+            return;
+        }
+    }
+    void mouseReleaseEvent(QMouseEvent *) override {
+        m_dragIdx = -1;
+        m_dragEdge = 0;
+        m_rowHeightDragging = false;
+        update();
+    }
+private:
+    QRect rectForOverlay(int i) const {
+        if (i < 0 || i >= m_overlays.size()) return QRect();
+        const auto &ov = m_overlays[i];
+        const double start = qMax(0.0, ov.startTime);
+        const double end   = (ov.endTime > 0.0) ? ov.endTime
+                                                : qMax(start + 1.0, m_clipDuration);
+        if (end <= start) return QRect();
+        const int x = static_cast<int>(start * m_pps);
+        const int w = qMax(4, static_cast<int>((end - start) * m_pps));
+        // Row assignment from bin-packing: overlapping overlays get stacked
+        // on separate sub-rows so they don't visually overlap.
+        const int rows = qMax(1, m_rowCount);
+        const int slotH = qMax(8, (height() - 4) / rows);
+        const int row = (i < m_overlayRowIdx.size()) ? m_overlayRowIdx[i] : 0;
+        const int y = 2 + row * slotH;
+        return QRect(x, y, w, slotH - 1);
+    }
+    // Each overlay gets its own row in insertion order (T1, T2, T3, ...)
+    // so every new text input visibly adds a fresh row below the previous
+    // ones — matches the user's mental model of "T1, T2, T3 grows on each
+    // input" instead of bin-packing multiple non-overlapping overlays
+    // into the same row. The widget height grows to fit all rows so the
+    // user can see every overlay at a reasonable minimum per-row height.
+    void rebuildRowLayout() {
+        m_overlayRowIdx.clear();
+        m_overlayRowIdx.resize(m_overlays.size());
+        for (int i = 0; i < m_overlays.size(); ++i)
+            m_overlayRowIdx[i] = i;
+        m_rowCount = qMax(1, m_overlays.size());
+        const int target = qMax(m_singleRowHeight, m_rowCount * kRowSlotHeight + 4);
+        if (target != height() && m_rowHeightCb)
+            m_rowHeightCb(target);
+    }
+    QVector<EnhancedTextOverlay> m_overlays;
+    QVector<int> m_overlayRowIdx;  // row assignment per overlay
+    int m_rowCount = 1;
+    int m_singleRowHeight = 50;  // baseline when no overlays (matches V1 row)
+    static constexpr int kRowSlotHeight = 26;
+    double m_clipDuration = 0.0;
+    double m_pps = 50.0;
+    int m_dragIdx = -1;
+    int m_dragEdge = 0;   // -1 = left edge, 1 = right edge, 0 = body (move)
+    double m_dragOriginalStart = 0.0;
+    double m_dragOriginalEnd = 0.0;
+    double m_dragAnchorOffsetSec = 0.0;
+    int m_hoverIdx = -1;
+    int m_hoverEdge = 0;
+    TimeChangeCallback m_timeChangeCb;
+    RowHeightChangeCallback m_rowHeightCb;
+    bool m_rowHeightDragging = false;
+    int m_rowHeightDragStartY = 0;
+    int m_rowHeightDragStartH = 0;
+};
 #include <optional>
+#include <functional>
 #include <cmath>
 #include <QPointer>
 #include <QPushButton>
@@ -18,6 +274,7 @@
 #include <QPixmap>
 #include <QPainter>
 #include <QMenu>
+#include <QSettings>
 #include <QAction>
 #include <QHash>
 
@@ -104,7 +361,7 @@ TimeRuler::TimeRuler(QWidget *parent) : QWidget(parent)
 
 void TimeRuler::setPixelsPerSecond(double pps)
 {
-    pps = qBound(0.1, pps, 200.0);
+    pps = qBound(0.02, pps, 200.0);
     if (qFuzzyCompare(pps, m_pixelsPerSecond))
         return;
     m_pixelsPerSecond = pps;
@@ -191,9 +448,9 @@ void TimeRuler::mouseMoveEvent(QMouseEvent *event)
     }
     const int dx = event->globalPosition().toPoint().x() - m_dragStartX;
     // Multiplicative drag: each pixel multiplies zoom by ~2%. Works uniformly
-    // from 0.1 pps (4h clip fits) up to 200 pps (frame-precise).
+    // from 0.02 pps (20h clip fits) up to 200 pps (frame-precise).
     const double factor = std::pow(1.02, static_cast<double>(dx));
-    const double newPps = qBound(0.1, m_dragStartPps * factor, 200.0);
+    const double newPps = qBound(0.02, m_dragStartPps * factor, 200.0);
     if (!qFuzzyCompare(newPps, m_pixelsPerSecond)) {
         m_pixelsPerSecond = newPps;
         emit zoomChanged(newPps);
@@ -440,7 +697,7 @@ void TimelineTrack::moveSelectedClipsGroup(int targetIndex)
 
 void TimelineTrack::setPixelsPerSecond(double pps)
 {
-    m_pixelsPerSecond = qBound(0.1, pps, 200.0);
+    m_pixelsPerSecond = qBound(0.02, pps, 200.0);
     updateMinimumWidth();
     update();
 }
@@ -536,6 +793,16 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
             painter.drawLine(x, 0, x, m_rowHeight);
         }
         painter.fillRect(clipRect, color);
+        // Premiere-style effect indicator: a 3 px purple bar along the top
+        // edge of any clip with a non-default color correction OR any video
+        // effect applied. The bar spans the full clip width so the user can
+        // immediately see the affected time range.
+        const bool hasEffects = !m_clips[i].colorCorrection.isDefault()
+                             || !m_clips[i].effects.isEmpty();
+        if (hasEffects) {
+            const QRect fxBar(x, 0, clipWidth, 3);
+            painter.fillRect(fxBar, QColor(170, 100, 230, 230));
+        }
         // Trim handle indicators — visible on all clips so users can discover
         // the edge-drag-to-trim affordance without having to hunt for it.
         const QColor trimColor = isSelected ? QColor(255, 200, 60, 220)
@@ -621,6 +888,14 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
 
 void TimelineTrack::mousePressEvent(QMouseEvent *event)
 {
+    if (m_locked) {
+        // Let Qt still route scroll/playhead clicks upward if needed, but
+        // block every local edit mode (drag/trim/split). The simplest and
+        // safest way: accept the event and return immediately so no
+        // DragMode / TrimMode is entered.
+        event->accept();
+        return;
+    }
     // Bottom-edge drag → row height resize. Detected before the seek/click
     // handling so the user can resize even when clicking inside a clip area.
     if (event->button() == Qt::LeftButton
@@ -923,6 +1198,10 @@ void TimelineTrack::dragLeaveEvent(QDragLeaveEvent *)
 
 void TimelineTrack::dropEvent(QDropEvent *event)
 {
+    if (m_locked) {
+        event->ignore();
+        return;
+    }
     const int oldIndicator = m_dropIndicatorX;
     m_dropIndicatorX = -1;
     m_dropIndicatorValid = false;
@@ -963,6 +1242,12 @@ void TimelineTrack::dropEvent(QDropEvent *event)
     insertClipPreservingDownstream(plan.insertIdx, clipData, plan.newLeadIn);
 
     event->acceptProposedAction();
+
+    // Notify Timeline to move linked partners (V↔A) to the corresponding track.
+    // Pass the absolute drop time so Timeline can place the partner at the same position.
+    if (clipData.linkGroup > 0) {
+        emit crossTrackDropped(plan.insertIdx, clipData.linkGroup, dropTime);
+    }
 }
 
 // --- Timeline ---
@@ -1095,8 +1380,55 @@ void Timeline::setupUI()
     m_videoTracks.append(m_videoTrack);
     m_audioTracks.append(m_audioTrack);
 
+    // Text strip lives inside the V group — above V1 so it's visually part
+    // of the video category. Matching header spacer is added to the header
+    // column at the same logical row so V1 stays aligned.
+    m_textStrip = new TextStripWidget(m_tracksWidget);
+    m_textStrip->setFixedHeight(m_trackHeight);
+    m_textStrip->setSingleRowHeight(m_trackHeight);
+    m_textStrip->setPixelsPerSecond(m_zoomLevel);
+    m_textStrip->setTimeChangeCallback([this](int idx, double start, double end) {
+        if (updateTextOverlayTime(idx, start, end))
+            emit textOverlayTimeChanged(idx, start, end);
+    });
+    // Row-resize drag: resize ONLY the text row (m_textStrip + paired
+    // header), independent of V/A track height, so the user can make the
+    // T1 row taller without affecting the rest of the timeline. Once the
+    // user drags, setTrackHeight stops overwriting this row's height.
+    m_textStrip->setRowHeightChangeCallback([this](int newH) {
+        if (m_textStrip)
+            m_textStrip->setFixedHeight(newH);
+        if (m_textStripHeader)
+            m_textStripHeader->setFixedHeight(newH);
+        m_textStripCustomHeight = newH;
+    });
+    m_textStripHeader = new QWidget(m_headerColumn);
+    m_textStripHeader->setFixedHeight(m_trackHeight);
+    m_textStripHeader->setStyleSheet(
+        "background-color: #353535; color: #ddd; border-right: 1px solid #1a1a1a;");
+    auto *thLayout = new QHBoxLayout(m_textStripHeader);
+    thLayout->setContentsMargins(6, 0, 6, 0);
+    auto *thLabel = new QLabel("T1", m_textStripHeader);
+    thLabel->setStyleSheet("color: #ddd; font-size: 11px; font-weight: bold;");
+    thLayout->addWidget(thLabel);
+    thLayout->addStretch();
+    m_headerLayout->addWidget(m_textStripHeader);
+    m_tracksLayout->addWidget(m_textStrip);
+
     m_headerLayout->addWidget(createTrackHeader(m_videoTrack, "V1", false));
     m_tracksLayout->addWidget(m_videoTrack);
+
+    // Boundary separator between the video and audio categories — 3 px
+    // bright bar so the V/A split is immediately visible. Mirrored in the
+    // header column so the row ordering stays aligned.
+    m_vaSeparator = new QWidget(m_tracksWidget);
+    m_vaSeparator->setFixedHeight(3);
+    m_vaSeparator->setStyleSheet("background-color: #6aa0ff;");
+    m_vaSeparatorHeader = new QWidget(m_headerColumn);
+    m_vaSeparatorHeader->setFixedHeight(3);
+    m_vaSeparatorHeader->setStyleSheet("background-color: #6aa0ff;");
+    m_headerLayout->addWidget(m_vaSeparatorHeader);
+    m_tracksLayout->addWidget(m_vaSeparator);
 
     m_headerLayout->addWidget(createTrackHeader(m_audioTrack, "A1", true));
     m_tracksLayout->addWidget(m_audioTrack);
@@ -1144,42 +1476,58 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
     hbox->setContentsMargins(4, 4, 4, 4);
     hbox->setSpacing(3);
 
-    // Speaker icon (audio mute toggle). Uses Unicode glyphs that render in
-    // Segoe UI on Windows: 🔊 normal / 🔇 muted (we keep the same glyph and
-    // rely on the checked state's red background to indicate muted).
-    auto *muteBtn = new QPushButton(QString::fromUtf8("\xF0\x9F\x94\x8A"), w); // 🔊
-    muteBtn->setFixedSize(28, 28);
-    muteBtn->setCheckable(true);
-    muteBtn->setToolTip(QStringLiteral("ミュート (audio)"));
-    muteBtn->setStyleSheet(
+    // Edit lock button (both track types). 🔓 unlocked / 🔒 locked.
+    // When locked, mousePressEvent/dropEvent on the track early-return so
+    // drag/trim/split/drop edits are blocked — playback is unaffected.
+    auto *lockBtn = new QPushButton(QString::fromUtf8("\xF0\x9F\x94\x93"), w); // 🔓
+    lockBtn->setFixedSize(28, 28);
+    lockBtn->setCheckable(true);
+    lockBtn->setToolTip(QStringLiteral("編集ロック"));
+    lockBtn->setStyleSheet(
         "QPushButton { background-color: #444; color: #ddd; border: 1px solid #666;"
         "  border-radius: 3px; font-size: 14px; padding: 0; }"
         "QPushButton:hover { background-color: #555; }"
-        "QPushButton:checked { background-color: #c44; color: white; border: 1px solid #f88; }");
+        "QPushButton:checked { background-color: #cc8; color: #222; border: 1px solid #ffd; }");
 
-    // Visibility toggle. ◉ (circled bullet) reads as an "eye with iris" /
-    // silhouette and is more compact than the full 👁 emoji. ◯ (large circle)
-    // is the empty/closed-eye state.
-    auto *hideBtn = new QPushButton(QString::fromUtf8("\xE2\x97\x89"), w); // ◉
-    hideBtn->setFixedSize(28, 28);
-    hideBtn->setCheckable(true);
-    hideBtn->setToolTip(QStringLiteral("非表示 (hide video)"));
-    hideBtn->setStyleSheet(
-        "QPushButton { background-color: #444; color: #ddd; border: 1px solid #666;"
-        "  border-radius: 3px; font-size: 16px; padding: 0; }"
-        "QPushButton:hover { background-color: #555; }"
-        "QPushButton:checked { background-color: #666; color: #888; border: 1px solid #999; }");
+    // Audio rows get a mute toggle; video rows get a hide toggle. Previously
+    // both rows carried both icons which had no semantic fit on the wrong
+    // track type.
+    QPushButton *muteBtn = nullptr;
+    QPushButton *hideBtn = nullptr;
+    if (isAudioRow) {
+        muteBtn = new QPushButton(QString::fromUtf8("\xF0\x9F\x94\x8A"), w); // 🔊
+        muteBtn->setFixedSize(28, 28);
+        muteBtn->setCheckable(true);
+        muteBtn->setToolTip(QStringLiteral("ミュート (audio)"));
+        muteBtn->setStyleSheet(
+            "QPushButton { background-color: #444; color: #ddd; border: 1px solid #666;"
+            "  border-radius: 3px; font-size: 14px; padding: 0; }"
+            "QPushButton:hover { background-color: #555; }"
+            "QPushButton:checked { background-color: #c44; color: white; border: 1px solid #f88; }");
+    } else {
+        hideBtn = new QPushButton(QString::fromUtf8("\xE2\x97\x89"), w); // ◉
+        hideBtn->setFixedSize(28, 28);
+        hideBtn->setCheckable(true);
+        hideBtn->setToolTip(QStringLiteral("非表示 (hide video)"));
+        hideBtn->setStyleSheet(
+            "QPushButton { background-color: #444; color: #ddd; border: 1px solid #666;"
+            "  border-radius: 3px; font-size: 16px; padding: 0; }"
+            "QPushButton:hover { background-color: #555; }"
+            "QPushButton:checked { background-color: #666; color: #888; border: 1px solid #999; }");
+    }
 
     auto *label = new QLabel(name, w);
     label->setStyleSheet(isAudioRow
         ? "QLabel { background: transparent; border: none; color: #44AA88; font-weight: bold; font-size: 12px; }"
         : "QLabel { background: transparent; border: none; color: #4488CC; font-weight: bold; font-size: 12px; }");
 
-    hbox->addWidget(muteBtn);
-    hbox->addWidget(hideBtn);
+    hbox->addWidget(lockBtn);
+    if (muteBtn) hbox->addWidget(muteBtn);
+    if (hideBtn) hbox->addWidget(hideBtn);
     hbox->addWidget(label, 1);
 
     QPointer<TimelineTrack> trackPtr(track);
+    QPointer<QPushButton> lockBtnPtr(lockBtn);
     QPointer<QPushButton> muteBtnPtr(muteBtn);
     QPointer<QPushButton> hideBtnPtr(hideBtn);
     QPointer<QWidget> headerPtr(w);
@@ -1190,31 +1538,46 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
         if (headerPtr) headerPtr->setFixedHeight(newH);
     });
 
-    connect(muteBtn, &QPushButton::toggled, this, [this, trackPtr, muteBtnPtr](bool checked) {
+    connect(lockBtn, &QPushButton::toggled, this, [trackPtr, lockBtnPtr](bool checked) {
         if (!trackPtr) return;
-        qInfo() << "Timeline: mute toggled =" << checked << "track=" << trackPtr.data();
-        trackPtr->setMuted(checked);
-        if (muteBtnPtr) {
-            muteBtnPtr->setText(checked
-                ? QString::fromUtf8("\xF0\x9F\x94\x87")    // 🔇
-                : QString::fromUtf8("\xF0\x9F\x94\x8A")); // 🔊
+        qInfo() << "Timeline: lock toggled =" << checked << "track=" << trackPtr.data();
+        trackPtr->setLocked(checked);
+        if (lockBtnPtr) {
+            lockBtnPtr->setText(checked
+                ? QString::fromUtf8("\xF0\x9F\x94\x92")    // 🔒
+                : QString::fromUtf8("\xF0\x9F\x94\x93")); // 🔓
         }
-        // Re-emit sequence so VideoPlayer picks up the audioMuted flag on the
-        // currently active entry. setSequence is fast in the no-file-switch case.
-        emit sequenceChanged(computePlaybackSequence());
     });
-    connect(hideBtn, &QPushButton::toggled, this, [this, trackPtr, hideBtnPtr](bool checked) {
-        if (!trackPtr) return;
-        qInfo() << "Timeline: hide toggled =" << checked << "track=" << trackPtr.data();
-        trackPtr->setHidden(checked);
-        if (hideBtnPtr) {
-            // ◉ open eye (visible) / ⊘ struck-out (hidden)
-            hideBtnPtr->setText(checked
-                ? QString::fromUtf8("\xE2\x8A\x98")    // ⊘
-                : QString::fromUtf8("\xE2\x97\x89")); // ◉
-        }
-        emit sequenceChanged(computePlaybackSequence());
-    });
+
+    if (muteBtn) {
+        connect(muteBtn, &QPushButton::toggled, this, [this, trackPtr, muteBtnPtr](bool checked) {
+            if (!trackPtr) return;
+            qInfo() << "Timeline: mute toggled =" << checked << "track=" << trackPtr.data();
+            trackPtr->setMuted(checked);
+            if (muteBtnPtr) {
+                muteBtnPtr->setText(checked
+                    ? QString::fromUtf8("\xF0\x9F\x94\x87")    // 🔇
+                    : QString::fromUtf8("\xF0\x9F\x94\x8A")); // 🔊
+            }
+            // Re-emit sequences so VideoPlayer picks up the audioMuted flag.
+            emit sequenceChanged(computePlaybackSequence());
+            emit audioSequenceChanged(computeAudioPlaybackSequence());
+        });
+    }
+    if (hideBtn) {
+        connect(hideBtn, &QPushButton::toggled, this, [this, trackPtr, hideBtnPtr](bool checked) {
+            if (!trackPtr) return;
+            qInfo() << "Timeline: hide toggled =" << checked << "track=" << trackPtr.data();
+            trackPtr->setHidden(checked);
+            if (hideBtnPtr) {
+                hideBtnPtr->setText(checked
+                    ? QString::fromUtf8("\xE2\x8A\x98")    // ⊘
+                    : QString::fromUtf8("\xE2\x97\x89")); // ◉
+            }
+            emit sequenceChanged(computePlaybackSequence());
+            emit audioSequenceChanged(computeAudioPlaybackSequence());
+        });
+    }
 
     return w;
 }
@@ -1227,13 +1590,13 @@ void Timeline::addVideoTrack()
     track->setSnapEnabled(snapEnabled());
     track->setRowHeight(m_trackHeight);
 
-    // tracksLayout starts with widgets directly (no leading spacer), but
-    // m_headerLayout starts with an addSpacing(...) item that aligns the
-    // first header with the first track widget. Compensate with +1 on the
-    // header insert index so V2 ends up below V1, not above.
+    // Young number on top: V1 stays at index 1 in the tracks layout
+    // (textStrip occupies index 0), V2 inserts directly after V1, V3 after
+    // V2, and so on. Header column has magnetArea at 0 and textStripHeader
+    // at 1, so V1 header is at 2 and V2 header belongs at 3.
     const int trackIdx = m_videoTracks.size();
-    m_tracksLayout->insertWidget(trackIdx, track);
-    m_headerLayout->insertWidget(trackIdx + 1,
+    m_tracksLayout->insertWidget(trackIdx + 1, track);
+    m_headerLayout->insertWidget(trackIdx + 2,
         createTrackHeader(track, QString("V%1").arg(num), false));
 
     m_videoTracks.append(track);
@@ -1281,31 +1644,49 @@ void Timeline::addClip(const QString &filePath)
     // explicitly severs the sync via the clip's context menu.
     clip.linkGroup = allocateLinkGroup();
 
-    // Premiere-style stacking: each drop goes onto the first EMPTY video track
-    // (creating a new V<n>/A<n> track if every existing track is occupied).
-    // The first drop fills V1/A1, the second drop fills V2/A2, and so on.
-    int videoTrackIdx = -1;
-    for (int t = 0; t < m_videoTracks.size(); ++t) {
-        if (m_videoTracks[t] && m_videoTracks[t]->clipCount() == 0) {
-            videoTrackIdx = t;
-            break;
-        }
-    }
-    if (videoTrackIdx < 0) {
-        addVideoTrack();
-        videoTrackIdx = m_videoTracks.size() - 1;
-    }
+    // Import placement policy — user chooses between parallel stacking
+    // (V1→V2→V3...) and append-to-first-track (V1/A1 continuous sequence).
+    // Toggled from MainWindow's 環境設定 submenu.
+    QSettings prefs("VSimpleEditor", "Preferences");
+    const ImportPlacement placement = static_cast<ImportPlacement>(
+        prefs.value("importPlacement", static_cast<int>(ImportPlacement::ParallelTrack)).toInt());
 
+    int videoTrackIdx = -1;
     int audioTrackIdx = -1;
-    for (int t = 0; t < m_audioTracks.size(); ++t) {
-        if (m_audioTracks[t] && m_audioTracks[t]->clipCount() == 0) {
-            audioTrackIdx = t;
-            break;
+    if (placement == ImportPlacement::AppendToFirstTrack) {
+        // Extend the existing sequence: always V1/A1, appending after
+        // whatever clips already live there. Create V1/A1 if the project
+        // starts with zero tracks.
+        if (m_videoTracks.isEmpty())
+            addVideoTrack();
+        if (m_audioTracks.isEmpty())
+            addAudioTrack();
+        videoTrackIdx = 0;
+        audioTrackIdx = 0;
+    } else {
+        // Premiere-style stacking: each drop lands on the first EMPTY video
+        // track (creating V<n>/A<n> as needed). First drop fills V1/A1,
+        // second fills V2/A2, and so on.
+        for (int t = 0; t < m_videoTracks.size(); ++t) {
+            if (m_videoTracks[t] && m_videoTracks[t]->clipCount() == 0) {
+                videoTrackIdx = t;
+                break;
+            }
         }
-    }
-    if (audioTrackIdx < 0) {
-        addAudioTrack();
-        audioTrackIdx = m_audioTracks.size() - 1;
+        if (videoTrackIdx < 0) {
+            addVideoTrack();
+            videoTrackIdx = m_videoTracks.size() - 1;
+        }
+        for (int t = 0; t < m_audioTracks.size(); ++t) {
+            if (m_audioTracks[t] && m_audioTracks[t]->clipCount() == 0) {
+                audioTrackIdx = t;
+                break;
+            }
+        }
+        if (audioTrackIdx < 0) {
+            addAudioTrack();
+            audioTrackIdx = m_audioTracks.size() - 1;
+        }
     }
 
     qInfo() << "Timeline::addClip routing video→V" << (videoTrackIdx + 1)
@@ -1426,6 +1807,119 @@ void Timeline::deleteSelectedClip()
 void Timeline::rippleDeleteSelectedClip() { deleteSelectedClip(); }
 bool Timeline::hasSelection() const { return m_videoTrack->selectedClip() >= 0; }
 
+bool Timeline::addTextOverlayToFirstVideoClip(const EnhancedTextOverlay &overlay)
+{
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
+        return false;
+    auto *track = m_videoTracks.first();
+    QVector<ClipInfo> clips = track->clips();
+    if (clips.isEmpty())
+        return false;
+    clips[0].textManager.addOverlay(overlay);
+    track->setClips(clips);
+    saveUndoState("Add text overlay");
+    refreshTextStrip();
+    return true;
+}
+
+bool Timeline::updateTextOverlayText(int overlayIndex, const QString &newText)
+{
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
+        return false;
+    auto *track = m_videoTracks.first();
+    QVector<ClipInfo> clips = track->clips();
+    if (clips.isEmpty())
+        return false;
+    auto &mgr = clips[0].textManager;
+    if (overlayIndex < 0 || overlayIndex >= mgr.count())
+        return false;
+    mgr.overlay(overlayIndex).text = newText;
+    track->setClips(clips);
+    saveUndoState("Edit text overlay");
+    refreshTextStrip();
+    return true;
+}
+
+bool Timeline::updateTextOverlayRect(int overlayIndex, double x, double y, double width, double height)
+{
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
+        return false;
+    auto *track = m_videoTracks.first();
+    QVector<ClipInfo> clips = track->clips();
+    if (clips.isEmpty())
+        return false;
+    auto &mgr = clips[0].textManager;
+    if (overlayIndex < 0 || overlayIndex >= mgr.count())
+        return false;
+    auto &ov = mgr.overlay(overlayIndex);
+    ov.x = x;
+    ov.y = y;
+    ov.width = qMax(0.0, width);
+    ov.height = qMax(0.0, height);
+    track->setClips(clips);
+    saveUndoState("Resize text overlay");
+    refreshTextStrip();
+    return true;
+}
+
+bool Timeline::setClipVideoTransform(int trackIdx, int clipIdx,
+                                     double scale, double dx, double dy)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size())
+        return false;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track) return false;
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return false;
+    clips[clipIdx].videoScale = qBound(0.1, scale, 10.0);
+    clips[clipIdx].videoDx = qBound(-5.0, dx, 5.0);
+    clips[clipIdx].videoDy = qBound(-5.0, dy, 5.0);
+    track->setClips(clips);
+    emit sequenceChanged(computePlaybackSequence());
+    return true;
+}
+
+bool Timeline::updateTextOverlayTime(int overlayIndex, double startTime, double endTime)
+{
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
+        return false;
+    auto *track = m_videoTracks.first();
+    QVector<ClipInfo> clips = track->clips();
+    if (clips.isEmpty())
+        return false;
+    auto &mgr = clips[0].textManager;
+    if (overlayIndex < 0 || overlayIndex >= mgr.count())
+        return false;
+    mgr.overlay(overlayIndex).startTime = qMax(0.0, startTime);
+    mgr.overlay(overlayIndex).endTime = qMax(startTime + 0.1, endTime);
+    track->setClips(clips);
+    // No undo snapshot during a live drag — otherwise every pixel of drag
+    // pollutes the undo stack. Caller can add a snapshot on mouseRelease
+    // if needed. For now, skip to keep the UX snappy.
+    refreshTextStrip();
+    return true;
+}
+
+void Timeline::refreshTextStrip()
+{
+    if (!m_textStrip)
+        return;
+    QVector<EnhancedTextOverlay> overlays;
+    double clipDur = 0.0;
+    if (!m_videoTracks.isEmpty() && m_videoTracks.first()) {
+        const auto &clips = m_videoTracks.first()->clips();
+        if (!clips.isEmpty()) {
+            const auto &mgr = clips[0].textManager;
+            for (int i = 0; i < mgr.count(); ++i)
+                overlays.append(mgr.overlay(i));
+            clipDur = clips[0].effectiveDuration();
+        }
+    }
+    m_textStrip->setOverlays(overlays, clipDur);
+    m_textStrip->setPixelsPerSecond(m_zoomLevel);
+}
+
 void Timeline::copySelectedClip()
 {
     int sel = m_videoTrack->selectedClip();
@@ -1482,6 +1976,101 @@ void Timeline::unlinkClipGroup(int linkGroup)
     }
 }
 
+void Timeline::relinkClipAt(TimelineTrack *track, int clipIndex)
+{
+    if (!track || clipIndex < 0 || clipIndex >= track->clips().size()) return;
+
+    const auto clickedClips = track->clips();
+    const ClipInfo &clicked = clickedClips[clipIndex];
+    if (clicked.linkGroup > 0) return;  // already linked — nothing to do
+
+    auto clipTimelineStart = [](const QVector<ClipInfo> &clips, int idx) {
+        double accum = 0.0;
+        for (int i = 0; i <= idx && i < clips.size(); ++i) {
+            accum += qMax(0.0, clips[i].leadInSec);
+            if (i == idx) return accum;
+            accum += clips[i].effectiveDuration();
+        }
+        return accum;
+    };
+    const double clickedStart = clipTimelineStart(clickedClips, clipIndex);
+
+    // Find the best counterpart on the OPPOSITE track family (V→A or A→V).
+    // Two-pass search: prefer UNLINKED candidates first (same filePath,
+    // smallest |timelineStart - clickedStart|). Only fall back to an
+    // already-linked candidate if no unlinked match exists — otherwise a
+    // duplicate-imported clip or a split-clip neighbor could silently steal
+    // the re-sync from the real counterpart.
+    const bool clickedIsVideo = m_videoTracks.contains(track);
+    const auto &oppositeTracks = clickedIsVideo ? m_audioTracks : m_videoTracks;
+
+    struct Hit { TimelineTrack *track = nullptr; int idx = -1; double start = 0.0; };
+    auto findBest = [&](bool requireUnlinked) {
+        Hit best;
+        double bestDist = 1e18;
+        for (auto *t : oppositeTracks) {
+            if (!t) continue;
+            const auto &clips = t->clips();
+            double accum = 0.0;
+            for (int i = 0; i < clips.size(); ++i) {
+                accum += qMax(0.0, clips[i].leadInSec);
+                const double start = accum;
+                accum += clips[i].effectiveDuration();
+                if (clips[i].filePath != clicked.filePath) continue;
+                if (requireUnlinked && clips[i].linkGroup > 0) continue;
+                const double dist = qAbs(start - clickedStart);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    best = {t, i, start};
+                }
+            }
+        }
+        return best;
+    };
+
+    Hit hit = findBest(/*requireUnlinked=*/true);
+    if (!hit.track) hit = findBest(/*requireUnlinked=*/false);
+    if (!hit.track) return;
+
+    // Snap the counterpart's timelineStart onto the clicked clip's start by
+    // shifting its leadInSec, and compensate the NEXT clip's leadInSec so
+    // downstream clips stay put (same trick as the linked-drag path). If
+    // the move is clamped at 0 because the counterpart butts up against a
+    // preceding neighbor, we settle for a partial alignment — the clips are
+    // still re-grouped so further linked drags will track together.
+    {
+        auto clips = hit.track->clips();
+        const double delta = clickedStart - hit.start;
+        const double oldLeadIn = clips[hit.idx].leadInSec;
+        const double newLeadIn = qMax(0.0, oldLeadIn + delta);
+        const double applied = newLeadIn - oldLeadIn;
+        clips[hit.idx].leadInSec = newLeadIn;
+        if (hit.idx + 1 < clips.size()) {
+            clips[hit.idx + 1].leadInSec =
+                qMax(0.0, clips[hit.idx + 1].leadInSec - applied);
+        }
+        hit.track->setClips(clips);
+    }
+
+    const int targetGroup = (hit.track->clips()[hit.idx].linkGroup > 0)
+        ? hit.track->clips()[hit.idx].linkGroup
+        : allocateLinkGroup();
+
+    auto stamp = [targetGroup](TimelineTrack *t, int idx) {
+        auto clips = t->clips();
+        if (idx < 0 || idx >= clips.size()) return;
+        clips[idx].linkGroup = targetGroup;
+        t->setClips(clips);
+    };
+    stamp(track, clipIndex);
+    stamp(hit.track, hit.idx);
+
+    saveUndoState("Relink clip");
+    emit sequenceChanged(computePlaybackSequence());
+    emit audioSequenceChanged(computeAudioPlaybackSequence());
+    updateInfoLabel();
+}
+
 void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QPoint &globalPos)
 {
     if (!track || clipIndex < 0 || clipIndex >= track->clips().size()) return;
@@ -1499,6 +2088,8 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     menu.addSeparator();
     QAction *unlinkAct = menu.addAction(QStringLiteral("同期を切る"));
     unlinkAct->setEnabled(linkGroup > 0);
+    QAction *relinkAct = menu.addAction(QStringLiteral("再同期"));
+    relinkAct->setEnabled(linkGroup == 0);
 
     QAction *chosen = menu.exec(globalPos);
     if (!chosen) return;
@@ -1506,6 +2097,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     else if (chosen == copyAct) copySelectedClip();
     else if (chosen == deleteAct) deleteSelectedClip();
     else if (chosen == unlinkAct) unlinkClipGroup(linkGroup);
+    else if (chosen == relinkAct) relinkClipAt(track, clipIndex);
 }
 
 void Timeline::undo()
@@ -1571,11 +2163,13 @@ void Timeline::clearZoomAnchor()
 
 void Timeline::setZoomLevel(double pixelsPerSecond)
 {
-    m_zoomLevel = qBound(0.1, pixelsPerSecond, 200.0);
+    m_zoomLevel = qBound(0.02, pixelsPerSecond, 200.0);
     for (auto *t : m_videoTracks) t->setPixelsPerSecond(m_zoomLevel);
     for (auto *t : m_audioTracks) t->setPixelsPerSecond(m_zoomLevel);
     if (m_timeRuler)
         m_timeRuler->setPixelsPerSecond(m_zoomLevel);
+    if (m_textStrip)
+        m_textStrip->setPixelsPerSecond(m_zoomLevel);
 
     if (m_zoomAnchorViewportX >= 0 && m_scrollArea && m_videoTrack) {
         // Force the scroll area to refresh its content width synchronously so
@@ -1850,6 +2444,10 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         revertLinkedDragPartners();
         clearLinkedDragState();
     });
+    connect(track, &TimelineTrack::crossTrackDropped, this,
+        [this, track](int /*insertIdx*/, int linkGroup, double dropTime) {
+            handleCrossTrackLinkedDrop(track, linkGroup, dropTime);
+        });
 }
 
 void Timeline::captureLinkedDragPartners(TimelineTrack *source, int clipIdx)
@@ -1921,6 +2519,66 @@ void Timeline::clearLinkedDragState()
     m_linkedDragPartners.clear();
 }
 
+void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime)
+{
+    if (linkGroup <= 0 || !destTrack) return;
+
+    // Determine if dest is a video or audio track, and its index
+    int destVideoIdx = m_videoTracks.indexOf(destTrack);
+    int destAudioIdx = m_audioTracks.indexOf(destTrack);
+    bool destIsVideo = (destVideoIdx >= 0);
+    int destIdx = destIsVideo ? destVideoIdx : destAudioIdx;
+
+    // Find the partner clips on the OTHER track type that share this linkGroup
+    auto &partnerTracks = destIsVideo ? m_audioTracks : m_videoTracks;
+
+    for (int ti = 0; ti < partnerTracks.size(); ++ti) {
+        TimelineTrack *srcPartnerTrack = partnerTracks[ti];
+        const auto &clips = srcPartnerTrack->clips();
+        for (int ci = 0; ci < clips.size(); ++ci) {
+            if (clips[ci].linkGroup != linkGroup) continue;
+
+            // Found the linked partner. Determine the target partner track.
+            // If dest is V[n], partner should go to A[n] (create if needed).
+            // If dest is A[n], partner should go to V[n] (create if needed).
+            auto &targetTracks = destIsVideo ? m_audioTracks : m_videoTracks;
+            while (targetTracks.size() <= destIdx) {
+                if (destIsVideo)
+                    addAudioTrack();
+                else
+                    addVideoTrack();
+            }
+            TimelineTrack *targetTrack = targetTracks[destIdx];
+
+            // If the partner is already on the target track, nothing to do
+            if (srcPartnerTrack == targetTrack) return;
+
+            // Copy the partner clip data and remove from source
+            const ClipInfo partnerClip = srcPartnerTrack->clips()[ci];
+            const double partnerDur = partnerClip.effectiveDuration();
+
+            // Use planDrop on the target track to find the right insertion point.
+            // Fall back to appending at end if the exact position can't fit.
+            auto plan = targetTrack->planDrop(dropTime, partnerDur);
+            if (!plan.valid) {
+                // Append at end of track as fallback
+                plan.valid = true;
+                plan.insertIdx = targetTrack->clipCount();
+                plan.newLeadIn = dropTime;
+                // Subtract accumulated duration of existing clips
+                double accum = 0.0;
+                for (const auto &c : targetTrack->clips())
+                    accum += c.leadInSec + c.effectiveDuration();
+                plan.newLeadIn = qMax(0.0, dropTime - accum);
+            }
+
+            srcPartnerTrack->removeClipPreservingDownstream(ci);
+            targetTrack->insertClipPreservingDownstream(plan.insertIdx, partnerClip, plan.newLeadIn);
+            return;  // Only one partner per linkGroup on the other track type
+        }
+    }
+}
+
 void Timeline::clearAllSelections()
 {
     bool changed = false;
@@ -1945,6 +2603,7 @@ void Timeline::onTrackModified()
     // visually clipped). Then recompute the flat playback schedule.
     ensureSequenceFitsViewport();
     emit sequenceChanged(computePlaybackSequence());
+    emit audioSequenceChanged(computeAudioPlaybackSequence());
 }
 
 void Timeline::setTrackHeight(int h)
@@ -1954,11 +2613,23 @@ void Timeline::setTrackHeight(int h)
     m_trackHeight = h;
     for (auto *t : m_videoTracks) if (t) t->setRowHeight(m_trackHeight);
     for (auto *t : m_audioTracks) if (t) t->setRowHeight(m_trackHeight);
+    // Preserve a user-customized text row height — if the user has
+    // dragged the T1 row's bottom edge, don't clobber that override when
+    // the global V/A row height changes.
+    if (m_textStrip && m_textStripCustomHeight <= 0)
+        m_textStrip->setFixedHeight(m_trackHeight);
     if (m_headerLayout) {
         for (int i = 0; i < m_headerLayout->count(); ++i) {
             if (auto *item = m_headerLayout->itemAt(i)) {
-                if (auto *hw = item->widget())
+                if (auto *hw = item->widget()) {
+                    // Keep the V/A separator at its fixed 3 px height so
+                    // it doesn't balloon with the rest of the headers.
+                    if (hw == m_vaSeparatorHeader)
+                        continue;
+                    if (hw == m_textStripHeader && m_textStripCustomHeight > 0)
+                        continue;
                     hw->setFixedHeight(m_trackHeight);
+                }
             }
         }
     }
@@ -1984,7 +2655,7 @@ void Timeline::ensureSequenceFitsViewport()
 
     // Required pps to make the entire sequence fit safeW horizontally.
     const double requiredPps = static_cast<double>(safeW) / total;
-    const double newPps = qBound(0.1, requiredPps, 200.0);
+    const double newPps = qBound(0.02, requiredPps, 200.0);
 
     // Only auto-zoom OUT — never zoom in (that's the user's prerogative).
     if (newPps < m_zoomLevel - 1e-6) {
@@ -2001,17 +2672,11 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
     if (m_videoTracks.isEmpty())
         return result;
 
-    // V1-wins resolution (lower track index = higher priority). This is the
-    // INVERSE of Premiere Pro semantics: V1 (the topmost displayed track) is
-    // the primary playback layer; V2 only plays in time ranges where V1 has a
-    // gap; V3 only fills gaps in V1+V2; and so on.
-    //
-    // Algorithm:
-    //   1. Build per-track intervals laid out sequentially from t=0.
-    //   2. Walk tracks from V1 upward. For each track, subtract every range
-    //      already in `visible` (covered by higher-priority tracks) from the
-    //      track's clips, then append surviving fragments.
-    //   3. Sort by timelineStart and emit.
+    // PiP overlay resolution: every visible track contributes its full clip
+    // intervals without mutual subtraction. The compositor stacks layers using
+    // sourceTrack (V1 = front, higher = back). VideoPlayer's findActiveEntryAt
+    // walks the sorted sequence in order, so the (timelineStart, sourceTrack
+    // asc) sort below keeps V1 as the "primary" entry when multiple overlap.
 
     struct Interval {
         double timelineStart;
@@ -2021,6 +2686,13 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double speed;
         QString filePath;
         int trackIdx;
+        // US-T35 per-clip video source transform + owning clip index for
+        // round-trip updates when the user drags the preview transform.
+        double videoScale = 1.0;
+        double videoDx = 0.0;
+        double videoDy = 0.0;
+        double opacity = 1.0;
+        int clipIdx = -1;
     };
 
     QVector<QVector<Interval>> trackIntervals;
@@ -2032,7 +2704,8 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         if (track && !track->isHidden()) {
             const auto &clips = track->clips();
             double accum = 0.0;
-            for (const auto &c : clips) {
+            for (int ci = 0; ci < clips.size(); ++ci) {
+                const auto &c = clips[ci];
                 accum += qMax(0.0, c.leadInSec); // leading gap before this clip
                 const double clipDur = c.effectiveDuration();
                 if (clipDur <= 0.0) continue;
@@ -2044,6 +2717,109 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.speed = (c.speed > 0.0) ? c.speed : 1.0;
                 iv.filePath = c.filePath;
                 iv.trackIdx = t;
+                iv.videoScale = c.videoScale;
+                iv.videoDx = c.videoDx;
+                iv.videoDy = c.videoDy;
+                iv.opacity = c.opacity;
+                iv.clipIdx = ci;
+                ivs.append(iv);
+                accum += clipDur;
+            }
+        }
+        trackIntervals.append(ivs);
+    }
+
+    QVector<Interval> visible;
+    for (const auto &trackClips : trackIntervals) {
+        for (const auto &iv : trackClips)
+            visible.append(iv);
+    }
+
+    // (timelineStart, sourceTrack asc) so overlapping entries at the same time
+    // list V1 first. findActiveEntryAt returns the first match, giving V1 the
+    // "primary" playback role until the multi-layer compositor lands.
+    std::sort(visible.begin(), visible.end(),
+              [](const Interval &a, const Interval &b) {
+                  if (a.timelineStart != b.timelineStart)
+                      return a.timelineStart < b.timelineStart;
+                  return a.trackIdx < b.trackIdx;
+              });
+
+    result.reserve(visible.size());
+    for (const auto &iv : visible) {
+        if (iv.timelineEnd - iv.timelineStart < 1e-6) continue;
+        PlaybackEntry e;
+        e.filePath = iv.filePath;
+        e.clipIn = iv.clipIn;
+        e.clipOut = iv.clipOut;
+        e.timelineStart = iv.timelineStart;
+        e.timelineEnd = iv.timelineEnd;
+        e.speed = iv.speed;
+        e.sourceTrack = iv.trackIdx;
+        e.videoScale = iv.videoScale;
+        e.videoDx = iv.videoDx;
+        e.videoDy = iv.videoDy;
+        e.opacity = iv.opacity;
+        e.sourceClipIndex = iv.clipIdx;
+        qInfo() << "[SEQ] entry idx=" << result.size()
+                << "tl=[" << iv.timelineStart << "," << iv.timelineEnd << "]"
+                << "clip=[" << iv.clipIn << "," << iv.clipOut << "]"
+                << "track=" << iv.trackIdx << "file=" << iv.filePath;
+        // Audio routing: the corresponding A<n> track at the same index acts as
+        // the audio mute switch for this entry's media file.
+        if (iv.trackIdx >= 0 && iv.trackIdx < m_audioTracks.size()
+            && m_audioTracks[iv.trackIdx] && m_audioTracks[iv.trackIdx]->isMuted()) {
+            e.audioMuted = true;
+        }
+        result.append(e);
+    }
+    return result;
+}
+
+QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
+{
+    // A1-wins resolution across A1..An, mirroring computePlaybackSequence's
+    // V1-wins video logic. A1 is the primary audio layer; A2 only plays in
+    // time ranges where A1 has a gap; A3 only fills A1+A2 gaps; and so on.
+    // This is what lets V2 "fill" clips produce audible audio: when V2 is
+    // showing a clip, the corresponding A2 clip (created together at import)
+    // fills A1's gap and the audio schedule emits an A2 entry.
+    QVector<PlaybackEntry> result;
+    if (m_audioTracks.isEmpty())
+        return result;
+
+    struct Interval {
+        double timelineStart;
+        double timelineEnd;
+        double clipIn;
+        double clipOut;
+        double speed;
+        QString filePath;
+        int trackIdx;
+        bool muted;
+    };
+
+    QVector<QVector<Interval>> trackIntervals;
+    trackIntervals.reserve(m_audioTracks.size());
+    for (int t = 0; t < m_audioTracks.size(); ++t) {
+        QVector<Interval> ivs;
+        auto *track = m_audioTracks[t];
+        if (track && !track->isHidden()) {
+            const auto &clips = track->clips();
+            double accum = 0.0;
+            for (const auto &c : clips) {
+                accum += qMax(0.0, c.leadInSec);
+                const double clipDur = c.effectiveDuration();
+                if (clipDur <= 0.0) continue;
+                Interval iv;
+                iv.timelineStart = accum;
+                iv.timelineEnd = accum + clipDur;
+                iv.clipIn = c.inPoint;
+                iv.clipOut = (c.outPoint > 0.0) ? c.outPoint : c.duration;
+                iv.speed = (c.speed > 0.0) ? c.speed : 1.0;
+                iv.filePath = c.filePath;
+                iv.trackIdx = t;
+                iv.muted = track->isMuted();
                 ivs.append(iv);
                 accum += clipDur;
             }
@@ -2079,8 +2855,6 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
     QVector<Interval> visible;
     for (int t = 0; t < trackIntervals.size(); ++t) {
         QVector<Interval> trackClips = trackIntervals[t];
-        // Subtract every range already covered by higher-priority tracks
-        // (lower track index). V1 always wins, V2 fills V1's gaps, etc.
         for (const auto &existing : visible) {
             trackClips = subtractRange(trackClips, existing.timelineStart, existing.timelineEnd);
         }
@@ -2104,16 +2878,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.timelineEnd = iv.timelineEnd;
         e.speed = iv.speed;
         e.sourceTrack = iv.trackIdx;
-        qInfo() << "[SEQ] entry idx=" << result.size()
-                << "tl=[" << iv.timelineStart << "," << iv.timelineEnd << "]"
-                << "clip=[" << iv.clipIn << "," << iv.clipOut << "]"
-                << "track=" << iv.trackIdx << "file=" << iv.filePath;
-        // Audio routing: the corresponding A<n> track at the same index acts as
-        // the audio mute switch for this entry's media file.
-        if (iv.trackIdx >= 0 && iv.trackIdx < m_audioTracks.size()
-            && m_audioTracks[iv.trackIdx] && m_audioTracks[iv.trackIdx]->isMuted()) {
-            e.audioMuted = true;
-        }
+        e.audioMuted = iv.muted;
         result.append(e);
     }
     return result;
@@ -2154,6 +2919,7 @@ void Timeline::restoreState(const TimelineState &state)
     // setClips bypasses the modified() signal path; trigger explicitly so the
     // VideoPlayer rebuilds its sequence after undo/redo.
     emit sequenceChanged(computePlaybackSequence());
+    emit audioSequenceChanged(computeAudioPlaybackSequence());
 }
 
 // --- Project save/load ---
@@ -2205,6 +2971,7 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
     updateInfoLabel();
     // setClips bypasses modified(); trigger sequence rebuild explicitly.
     emit sequenceChanged(computePlaybackSequence());
+    emit audioSequenceChanged(computeAudioPlaybackSequence());
 }
 
 void Timeline::syncPlayheadOverlay()
