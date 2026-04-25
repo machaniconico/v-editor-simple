@@ -155,8 +155,10 @@ void VideoPlayer::setupUI()
     m_stepBackButton = new QPushButton(QString::fromUtf8("\xE2\x8F\xAE"), this); // ⏮
     m_stepFwdButton  = new QPushButton(QString::fromUtf8("\xE2\x8F\xAD"), this); // ⏭
     // Unicode media controls: ▶ U+25B6 / ⏸ U+23F8 / ⏹ U+23F9
+    // m_playButton doubles as pause: updatePlayButton() flips its glyph
+    // and tooltip based on m_playing, and the click is wired to togglePlay()
+    // so a single press swaps the state instead of needing two buttons.
     m_playButton = new QPushButton(QString::fromUtf8("\xE2\x96\xB6"), this);
-    m_pauseButton = new QPushButton(QString::fromUtf8("\xE2\x8F\xB8"), this);
     m_stopButton = new QPushButton(QString::fromUtf8("\xE2\x8F\xB9"), this);
     m_seekBar = new QSlider(Qt::Horizontal, this);
     m_timeLabel = new QLabel("00:00 / 00:00", this);
@@ -168,13 +170,10 @@ void VideoPlayer::setupUI()
         "QPushButton:pressed { background-color: #666; }"
         "QPushButton:disabled { color: #777; background-color: #383838; }";
     m_playButton->setFixedSize(40, 32);
-    m_pauseButton->setFixedSize(40, 32);
     m_stopButton->setFixedSize(40, 32);
     m_playButton->setStyleSheet(mediaBtnStyle);
-    m_pauseButton->setStyleSheet(mediaBtnStyle);
     m_stopButton->setStyleSheet(mediaBtnStyle);
     m_playButton->setToolTip(QStringLiteral("再生"));
-    m_pauseButton->setToolTip(QStringLiteral("一時停止"));
     m_stopButton->setToolTip(QStringLiteral("停止"));
     m_stepBackButton->setFixedSize(40, 32);
     m_stepFwdButton->setFixedSize(40, 32);
@@ -214,7 +213,6 @@ void VideoPlayer::setupUI()
     controls->addWidget(m_proxyButton);
     controls->addWidget(m_stepBackButton);
     controls->addWidget(m_playButton);
-    controls->addWidget(m_pauseButton);
     controls->addWidget(m_stopButton);
     controls->addWidget(m_stepFwdButton);
     controls->addWidget(m_seekBar);
@@ -222,8 +220,7 @@ void VideoPlayer::setupUI()
 
     layout->addLayout(controls);
 
-    connect(m_playButton, &QPushButton::clicked, this, &VideoPlayer::play);
-    connect(m_pauseButton, &QPushButton::clicked, this, &VideoPlayer::pause);
+    connect(m_playButton, &QPushButton::clicked, this, &VideoPlayer::togglePlay);
     connect(m_stopButton, &QPushButton::clicked, this, &VideoPlayer::stop);
     connect(m_seekBar, &QSlider::sliderMoved, this, [this](int pos) {
         m_lastDragMs = pos;
@@ -987,12 +984,18 @@ void VideoPlayer::togglePlay()
 
 void VideoPlayer::updatePlayButton()
 {
-    // With separate Play / Pause / Stop buttons, the icons no longer toggle.
-    // Instead enable/disable the buttons that don't apply to the current state
-    // so the user gets a visual hint about what's actionable.
-    if (m_playButton)  m_playButton->setEnabled(!m_playing);
-    if (m_pauseButton) m_pauseButton->setEnabled(m_playing);
-    if (m_stopButton)  m_stopButton->setEnabled(true);
+    // The play button doubles as pause: flip its glyph and tooltip
+    // depending on the current state. Stop stays always enabled.
+    if (m_playButton) {
+        m_playButton->setText(m_playing
+            ? QString::fromUtf8("\xE2\x8F\xB8")    // ⏸ pause
+            : QString::fromUtf8("\xE2\x96\xB6")); // ▶ play
+        m_playButton->setToolTip(m_playing
+            ? QStringLiteral("一時停止")
+            : QStringLiteral("再生"));
+        m_playButton->setEnabled(true);
+    }
+    if (m_stopButton) m_stopButton->setEnabled(true);
 }
 
 void VideoPlayer::displayFrame(const QImage &image)

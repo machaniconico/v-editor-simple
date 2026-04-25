@@ -212,8 +212,10 @@ private:
     QPushButton *m_proxyButton = nullptr;
     QPushButton *m_stepBackButton = nullptr;
     QPushButton *m_stepFwdButton = nullptr;
+    // Doubles as the pause button: clicked is wired to togglePlay() and
+    // updatePlayButton() flips its glyph between ▶ and ⏸ depending on
+    // m_playing.
     QPushButton *m_playButton;
-    QPushButton *m_pauseButton;
     QPushButton *m_stopButton;
     QSlider *m_seekBar;
     QLabel *m_timeLabel;
