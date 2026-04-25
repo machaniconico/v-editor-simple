@@ -95,8 +95,12 @@ void ProxyProgressDialog::onProxyCancelled(const QString &clipName)
 void ProxyProgressDialog::closeEvent(QCloseEvent *event)
 {
     // If a generation is in flight, treat close as cancel request rather
-    // than orphaning the ffmpeg child process.
-    if (m_progressBar->maximum() == 0 && m_cancelButton->isEnabled()) {
+    // than orphaning the ffmpeg child process. We detect "in flight" by
+    // the cancel button still saying its initial label — onProxyFinished /
+    // onProxyCancelled both rewrite the button text to「閉じる」, so any
+    // other text means we're still mid-job regardless of determinate vs
+    // indeterminate progress bar mode.
+    if (m_cancelButton->text() == tr("キャンセル") && m_cancelButton->isEnabled()) {
         emit cancelRequested();
     }
     QDialog::closeEvent(event);

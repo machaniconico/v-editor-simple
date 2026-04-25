@@ -1,8 +1,8 @@
 #include "ProxyManager.h"
-#include "CodecDetector.h"
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -297,8 +297,10 @@ void ProxyManager::processNextInQueue()
 
 #if defined(VEDITOR_AV1)
     // Modern Edition: AV1 proxy via SVT-AV1 with sidx fragmented MP4 for accurate seeking.
-    // Runtime fallback to H.264 if the linked ffmpeg lacks libsvtav1.
-    const bool av1Available = CodecDetector::isEncoderAvailable("libsvtav1");
+    // Runtime fallback to H.264 if the runtime ffmpeg.exe lacks libsvtav1.
+    // We probe the actual binary (not the linked libavcodec) because the two
+    // can disagree when ffmpeg is on PATH but built independently.
+    const bool av1Available = ffmpegHasEncoder("libsvtav1");
     if (av1Available) {
         args << "-c:v" << "libsvtav1"
              << "-preset" << "8"
@@ -378,4 +380,43 @@ void ProxyManager::processNextInQueue()
     });
 
     m_process->start("ffmpeg", args);
+}
+
+bool ProxyManager::ffmpegHasEncoder(const QString &encoderName)
+{
+    // Cache per encoder name — ffmpeg's encoder list doesn't change at
+    // runtime so a one-shot probe is enough.
+    static QHash<QString, bool> cache;
+    static bool probeBroken = false;
+
+    auto it = cache.constFind(encoderName);
+    if (it != cache.constEnd())
+        return it.value();
+
+    // If a previous probe couldn't even spawn ffmpeg, don't keep retrying —
+    // the user has bigger problems and we should fall back to libx264.
+    if (probeBroken)
+        return false;
+
+    QProcess probe;
+    probe.start("ffmpeg", QStringList() << "-hide_banner" << "-encoders");
+    if (!probe.waitForStarted(2000)) {
+        probeBroken = true;
+        return false;
+    }
+    if (!probe.waitForFinished(5000)) {
+        probe.kill();
+        probeBroken = true;
+        return false;
+    }
+
+    // `ffmpeg -encoders` output lists one encoder per line, e.g.
+    //   V..... libsvtav1            SVT-AV1 encoder (codec av1)
+    // A simple substring search on the encoder name is sufficient because
+    // ffmpeg never emits the encoder identifier outside its own column.
+    const QByteArray out = probe.readAllStandardOutput()
+                         + probe.readAllStandardError();
+    const bool has = out.contains(encoderName.toUtf8());
+    cache.insert(encoderName, has);
+    return has;
 }

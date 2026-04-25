@@ -89,6 +89,15 @@ private:
     void processNextInQueue();
     void parseFfmpegProgress(const QByteArray &chunk);
 
+    // Probe the runtime ffmpeg.exe (the binary we'll actually invoke) for an
+    // encoder by parsing `ffmpeg -hide_banner -encoders` output. This is
+    // *different* from CodecDetector::isEncoderAvailable — that one queries
+    // the linked libavcodec, which can disagree with the PATH ffmpeg when
+    // they were built independently. Result is cached per encoder name for
+    // the lifetime of the singleton (encoders never appear/disappear at
+    // runtime).
+    static bool ffmpegHasEncoder(const QString &encoderName);
+
     // Source duration in microseconds, looked up via QMediaPlayer probe at
     // queue time. Used to convert ffmpeg's out_time_ms into a percentage.
     qint64 m_currentSourceDurationUs = 0;
