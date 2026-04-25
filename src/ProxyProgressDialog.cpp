@@ -40,10 +40,24 @@ ProxyProgressDialog::ProxyProgressDialog(QWidget *parent)
     layout->addWidget(m_progressBar);
     layout->addWidget(m_statusLabel);
     layout->addLayout(buttons);
+
+    // Auto-hide timer used after a cancel completes. Stored as a member
+    // (not QTimer::singleShot) so onProxyStarted / onProxyFinished can
+    // stop a pending hide if the user immediately kicks off another
+    // generation — otherwise the 800ms timer would fire mid-new-job and
+    // pull the dialog out from under it.
+    m_autoHideTimer = new QTimer(this);
+    m_autoHideTimer->setSingleShot(true);
+    m_autoHideTimer->setInterval(800);
+    connect(m_autoHideTimer, &QTimer::timeout, this, &QDialog::hide);
 }
 
 void ProxyProgressDialog::onProxyStarted(const QString &clipName)
 {
+    // Cancel any pending auto-hide from a prior cancel — otherwise the
+    // 800ms timer scheduled in onProxyCancelled would fire mid-new-job.
+    if (m_autoHideTimer)
+        m_autoHideTimer->stop();
     m_clipLabel->setText(tr("処理中: %1").arg(clipName));
     m_progressBar->setRange(0, 0); // indeterminate until first percent arrives
     m_progressBar->setValue(0);
@@ -85,6 +99,8 @@ void ProxyProgressDialog::onProxyProgress(const QString &clipName, int percent)
 
 void ProxyProgressDialog::onProxyFinished(const QString &clipName, bool ok)
 {
+    if (m_autoHideTimer)
+        m_autoHideTimer->stop();
     m_progressBar->setRange(0, 100);
     m_progressBar->setValue(ok ? 100 : 0);
     m_statusLabel->setText(ok ? tr("完了: %1").arg(clipName)
@@ -107,8 +123,10 @@ void ProxyProgressDialog::onProxyCancelled(const QString &clipName)
     // Auto-hide so the user doesn't have to manually dismiss a residual
     // "cancelled" dialog before kicking off a new generation. hide() (not
     // accept()) keeps the QDialog instance alive so onProxyStarted can
-    // resurrect it for the next run.
-    QTimer::singleShot(800, this, &QDialog::hide);
+    // resurrect it for the next run. The timer is a member so a fresh
+    // generation kicked off within 800ms can stop() it before it fires.
+    if (m_autoHideTimer)
+        m_autoHideTimer->start();
 }
 
 void ProxyProgressDialog::closeEvent(QCloseEvent *event)

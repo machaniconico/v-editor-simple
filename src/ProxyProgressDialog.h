@@ -6,6 +6,7 @@
 class QLabel;
 class QProgressBar;
 class QPushButton;
+class QTimer;
 
 // Modeless dialog showing the active proxy generation. Created on demand
 // by MainWindow when ProxyManager emits proxyStarted, hidden again on
@@ -35,4 +36,5 @@ private:
     QProgressBar *m_progressBar = nullptr;
     QPushButton *m_cancelButton = nullptr;
     QLabel *m_statusLabel = nullptr;
+    QTimer *m_autoHideTimer = nullptr;
 };
