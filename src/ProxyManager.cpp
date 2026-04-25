@@ -1,11 +1,6 @@
 #include "ProxyManager.h"
 
-namespace {
-// Shared between probeDurationUs and probeSourceCodec — once we learn
-// ffprobe is missing from PATH, every subsequent probe (regardless of which
-// helper) skips its 2 s waitForStarted timeout.
-bool g_ffprobeMissing = false;
-}
+#include <atomic>
 
 #include <QDateTime>
 #include <QDir>
@@ -20,6 +15,31 @@ bool g_ffprobeMissing = false;
 #include <QDirIterator>
 #include <QTextStream>
 #include <QSettings>
+#include <QMutex>
+#include <QMutexLocker>
+
+namespace {
+// Shared between probeDurationUs and probeSourceCodec — once we learn
+// ffprobe is missing from PATH, every subsequent probe (regardless of which
+// helper) skips its 2 s waitForStarted timeout.
+bool g_ffprobeMissing = false;
+
+// proxyDir() used to QSettings + QFileInfo + isDir() on every call, which
+// landed in hot paths (proxyFilePath → getProxyPath at preview time). The
+// revision counter is bumped by setProxyStorageDir(); proxyDir() can then
+// short-circuit to the cached value while the revision is unchanged.
+// std::atomic so a future worker thread that touches paths can't see a
+// torn revision read.
+std::atomic<int> g_proxyDirRevision{0};
+QString g_cachedProxyDir;
+int g_cachedProxyDirRevision = -1;
+// Guards both g_cachedProxyDir and g_cachedProxyDirRevision. The QString
+// itself is implicitly-shared so a concurrent read while another thread
+// reassigns it would touch its refcount unsafely (Gemini review,
+// 2026-04-25). proxyDir() is static so we can't rely on instance-level
+// scheduling — defend at the data instead.
+QMutex g_proxyDirMutex;
+}
 
 ProxyManager &ProxyManager::instance()
 {
@@ -118,20 +138,24 @@ void ProxyManager::generateProxy(const QString &originalFilePath)
     if (!QFile::exists(originalFilePath))
         return;
 
-    if (m_entries.contains(originalFilePath)) {
-        auto status = m_entries[originalFilePath].status;
+    const QString key = normalizePath(originalFilePath);
+    if (key.isEmpty())
+        return;
+
+    if (m_entries.contains(key)) {
+        auto status = m_entries[key].status;
         if (status == ProxyStatus::Ready || status == ProxyStatus::Generating)
             return;
     }
 
     ProxyEntry entry;
-    entry.originalPath = originalFilePath;
-    entry.proxyPath = proxyFilePath(originalFilePath);
+    entry.originalPath = key;
+    entry.proxyPath = proxyFilePath(key);
     entry.proxySize = QSize(m_config.proxyWidth, m_config.proxyHeight);
     entry.status = ProxyStatus::Generating;
-    m_entries[originalFilePath] = entry;
+    m_entries[key] = entry;
 
-    m_queue.append(originalFilePath);
+    m_queue.append(key);
     m_totalQueued = m_queue.size();
     m_completed = 0;
 
@@ -148,20 +172,24 @@ void ProxyManager::generateAllProxies(const QStringList &filePaths)
         if (!QFile::exists(path))
             continue;
 
-        if (m_entries.contains(path)) {
-            auto status = m_entries[path].status;
+        const QString key = normalizePath(path);
+        if (key.isEmpty())
+            continue;
+
+        if (m_entries.contains(key)) {
+            auto status = m_entries[key].status;
             if (status == ProxyStatus::Ready || status == ProxyStatus::Generating)
                 continue;
         }
 
         ProxyEntry entry;
-        entry.originalPath = path;
-        entry.proxyPath = proxyFilePath(path);
+        entry.originalPath = key;
+        entry.proxyPath = proxyFilePath(key);
         entry.proxySize = QSize(m_config.proxyWidth, m_config.proxyHeight);
         entry.status = ProxyStatus::Generating;
-        m_entries[path] = entry;
+        m_entries[key] = entry;
 
-        m_queue.append(path);
+        m_queue.append(key);
     }
 
     m_totalQueued = m_queue.size();
@@ -171,8 +199,9 @@ void ProxyManager::generateAllProxies(const QStringList &filePaths)
 
 QString ProxyManager::getProxyPath(const QString &originalPath) const
 {
-    if (m_proxyMode && m_entries.contains(originalPath)) {
-        const auto &entry = m_entries[originalPath];
+    const QString key = normalizePath(originalPath);
+    if (m_proxyMode && !key.isEmpty() && m_entries.contains(key)) {
+        const auto &entry = m_entries[key];
         if (entry.status == ProxyStatus::Ready
             && !isEntryStale(entry)
             && QFile::exists(entry.proxyPath))
@@ -183,12 +212,44 @@ QString ProxyManager::getProxyPath(const QString &originalPath) const
 
 bool ProxyManager::hasProxy(const QString &originalPath) const
 {
-    if (!m_entries.contains(originalPath))
+    const QString key = normalizePath(originalPath);
+    if (key.isEmpty() || !m_entries.contains(key))
         return false;
-    const auto &entry = m_entries[originalPath];
+    const auto &entry = m_entries[key];
     return entry.status == ProxyStatus::Ready
         && !isEntryStale(entry)
         && QFile::exists(entry.proxyPath);
+}
+
+// Single source of truth for the GPU H.264 priority chain. Both
+// chosenGpuH264Encoder() and pickRuntimeEncoder() walk this list — keeping
+// it in one place stops the two from drifting (Codex review, 2026-04-25).
+static const QStringList &gpuH264Priority()
+{
+    static const QStringList kOrder = {
+        QStringLiteral("h264_nvenc"),
+        QStringLiteral("h264_qsv"),
+        QStringLiteral("h264_amf")
+    };
+    return kOrder;
+}
+
+QString ProxyManager::pickRuntimeEncoder(const QString &proposed) const
+{
+    if (proposed.isEmpty())
+        return QString();
+    if (!m_runtimeFailedEncoders.contains(proposed))
+        return proposed;
+
+    for (const QString &candidate : gpuH264Priority()) {
+        if (candidate == proposed)
+            continue;
+        if (m_runtimeFailedEncoders.contains(candidate))
+            continue;
+        if (ffmpegHasEncoder(candidate))
+            return candidate;
+    }
+    return QString();
 }
 
 QString ProxyManager::currentEffectiveEncoder() const
@@ -196,9 +257,22 @@ QString ProxyManager::currentEffectiveEncoder() const
     static const QStringList kValid = {
         "h264_nvenc", "h264_qsv", "h264_amf", "libx264"
     };
-    if (!m_encoderOverride.isEmpty() && kValid.contains(m_encoderOverride))
-        return m_encoderOverride;
-    const QString gpu = chosenGpuH264Encoder();
+    QString gpu;
+    if (!m_encoderOverride.isEmpty() && kValid.contains(m_encoderOverride)) {
+        if (m_encoderOverride == "libx264")
+            return QStringLiteral("libx264");
+        gpu = m_encoderOverride;
+    } else {
+        gpu = chosenGpuH264Encoder();
+    }
+    // Mirror processNextInQueue: it pipes the proposed GPU encoder through
+    // pickRuntimeEncoder() to respect the runtime-failed blocklist. If we
+    // skipped that here, an entry generated under the active fallback
+    // (e.g. libx264 because h264_nvenc has been blocklisted) would carry
+    // fingerprint "libx264|..." while this method still returns
+    // "h264_nvenc|..." — every such entry would show as stale forever
+    // until the app is restarted (Codex review, 2026-04-25).
+    gpu = pickRuntimeEncoder(gpu);
     if (!gpu.isEmpty())
         return gpu;
     // Mirror the #if VEDITOR_AV1 branch in processNextInQueue: when no GPU
@@ -207,7 +281,7 @@ QString ProxyManager::currentEffectiveEncoder() const
     // proxy would carry a libsvtav1 fingerprint while currentEffectiveEncoder
     // returns libx264, marking every entry permanently stale.
 #if defined(VEDITOR_AV1)
-    if (ffmpegHasEncoder("libsvtav1"))
+    if (m_encoderOverride.isEmpty() && ffmpegHasEncoder("libsvtav1"))
         return QStringLiteral("libsvtav1");
 #endif
     return QStringLiteral("libx264");
@@ -236,9 +310,10 @@ bool ProxyManager::isEntryStale(const ProxyEntry &entry) const
 
 QString ProxyManager::staleReason(const QString &originalPath) const
 {
-    if (!m_entries.contains(originalPath))
+    const QString key = normalizePath(originalPath);
+    if (key.isEmpty() || !m_entries.contains(key))
         return QString();
-    const ProxyEntry &entry = m_entries[originalPath];
+    const ProxyEntry &entry = m_entries[key];
     if (entry.configFingerprint.isEmpty())
         return QString();
 
@@ -263,12 +338,13 @@ void ProxyManager::setProxyMode(bool enabled)
 
 void ProxyManager::deleteProxy(const QString &originalPath)
 {
-    if (!m_entries.contains(originalPath))
+    const QString key = normalizePath(originalPath);
+    if (key.isEmpty() || !m_entries.contains(key))
         return;
 
-    const auto &entry = m_entries[originalPath];
+    const auto &entry = m_entries[key];
     QFile::remove(entry.proxyPath);
-    m_entries.remove(originalPath);
+    m_entries.remove(key);
     saveIndex();
 }
 
@@ -283,18 +359,65 @@ void ProxyManager::deleteAllProxies()
 
 QString ProxyManager::proxyDir()
 {
-    // User-overridable storage path (US-3). Read every call so a settings
-    // change is immediately reflected — note that proxy_index.json is NOT
-    // stored under proxyDir() (see proxyIndexPath()), so swapping storageDir
-    // doesn't strand existing Ready entries.
+    // User-overridable storage path (US-3). Cache invalidated by
+    // setProxyStorageDir() bumping g_proxyDirRevision. Without the cache,
+    // every preview frame would pay QSettings + QFileInfo + isDir(), which
+    // turned into UI stutter on network-mounted storage (Gemini review,
+    // 2026-04-25). proxy_index.json is NOT stored here (see
+    // proxyIndexPath()), so swapping storageDir doesn't strand entries.
+    const int rev = g_proxyDirRevision.load(std::memory_order_acquire);
+    {
+        QMutexLocker lock(&g_proxyDirMutex);
+        if (rev == g_cachedProxyDirRevision && !g_cachedProxyDir.isEmpty())
+            return g_cachedProxyDir;
+    }
+
     QSettings prefs("VSimpleEditor", "Preferences");
     const QString custom = prefs.value("proxyStorageDir").toString();
+    QString resolved;
+    bool customResolvedOk = false;
     if (!custom.isEmpty()) {
         QFileInfo info(custom);
-        if (info.exists() && info.isDir())
-            return custom;
+        if (info.exists() && info.isDir()) {
+            resolved = custom;
+            customResolvedOk = true;
+        }
     }
-    return QDir::homePath() + "/.veditor/proxies";
+    if (resolved.isEmpty())
+        resolved = QDir::homePath() + "/.veditor/proxies";
+
+    // Don't cache the homePath fallback when the user actually has a
+    // custom path configured but it transiently doesn't exist (mid-mkpath,
+    // detached drive, etc.) — otherwise we'd pin the fallback for the
+    // entire revision and the user's storage would silently stop being
+    // honoured even after the directory becomes available again
+    // (Gemini v2 review, 2026-04-25).
+    const bool safeToCache = custom.isEmpty() || customResolvedOk;
+    if (safeToCache) {
+        QMutexLocker lock(&g_proxyDirMutex);
+        g_cachedProxyDir = resolved;
+        g_cachedProxyDirRevision = rev;
+    }
+    return resolved;
+}
+
+void ProxyManager::setProxyStorageDir(const QString &dir)
+{
+    // Create the target directory BEFORE persisting the setting so that
+    // a concurrent proxyDir() can't observe `custom != "" && !exists()`,
+    // fall back to the default homePath, and pin that fallback into the
+    // cache for the new revision (Gemini v2 review, 2026-04-25). Without
+    // this, the user would have to restart or re-open settings before
+    // the new path took effect.
+    if (!dir.isEmpty())
+        QDir().mkpath(dir);
+
+    QSettings prefs("VSimpleEditor", "Preferences");
+    prefs.setValue("proxyStorageDir", dir);
+    // Release-side bump pairs with the acquire-load in proxyDir(). This
+    // only orders the revision counter; the cached QString is separately
+    // protected by g_proxyDirMutex.
+    g_proxyDirRevision.fetch_add(1, std::memory_order_release);
 }
 
 qint64 ProxyManager::diskUsage() const
@@ -310,6 +433,33 @@ qint64 ProxyManager::diskUsage() const
 
 // --- private ---
 
+QString ProxyManager::normalizePath(const QString &path)
+{
+    if (path.isEmpty())
+        return QString();
+
+    // Deterministic, I/O-free normalisation. Earlier drafts called
+    // QFileInfo::canonicalFilePath() but that has two failure modes the
+    // multi-LLM review (Gemini, 2026-04-25) flagged as blockers:
+    //   1. canonicalFilePath() does a stat() — getting hit on every
+    //      preview frame turned proxyDir()'s I/O cache (US-1) into a
+    //      no-op for network drives and spun-down disks.
+    //   2. canonicalFilePath() returns empty when the file is gone, so
+    //      a temporarily-detached external drive would silently rewrite
+    //      the m_entries key from canonical to fallback form, losing
+    //      the existing entry.
+    // Cleaning the path and lowercasing on Windows is enough to collapse
+    // `C:\foo.mp4` and `c:/foo.mp4` onto the same key, which is the
+    // duplicate-entry case the original Codex review flagged. Symlink
+    // resolution is intentionally dropped — it's rare in editing
+    // workflows and not worth the I/O regression.
+    QString clean = QDir::cleanPath(path);
+#ifdef Q_OS_WIN
+    clean = clean.toLower();
+#endif
+    return clean;
+}
+
 QString ProxyManager::hashPath(const QString &path) const
 {
     QByteArray data = path.toUtf8();
@@ -319,7 +469,10 @@ QString ProxyManager::hashPath(const QString &path) const
 
 QString ProxyManager::proxyFilePath(const QString &originalPath) const
 {
-    QString hash = hashPath(originalPath);
+    // Hash the canonicalised key — callers already canonicalise before
+    // passing in, but doing it here too keeps the hash stable for any
+    // private-only call site that forgets.
+    QString hash = hashPath(normalizePath(originalPath));
     return proxyDir() + "/" + hash + "." + m_config.format;
 }
 
@@ -378,10 +531,19 @@ void ProxyManager::loadIndex()
     QJsonObject root = doc.object();
     QJsonArray entries = root["entries"].toArray();
 
+    // Migration (2026-04-25): pre-existing indices keyed entries on the
+    // raw user-typed path, so the same source could appear twice under
+    // case- or slash-variants. We canonicalise on load and, when two
+    // legacy entries collapse onto the same key, keep the one with the
+    // newer sourceMtimeMs and drop the loser's proxy file from disk.
+    bool migrated = false;
     for (const auto &val : entries) {
         QJsonObject obj = val.toObject();
         ProxyEntry entry;
-        entry.originalPath = obj["originalPath"].toString();
+        const QString rawPath = obj["originalPath"].toString();
+        entry.originalPath = normalizePath(rawPath);
+        if (entry.originalPath.isEmpty())
+            entry.originalPath = rawPath; // best-effort: keep raw if normalize fails
         entry.proxyPath = obj["proxyPath"].toString();
         entry.originalSize = QSize(obj["originalWidth"].toInt(), obj["originalHeight"].toInt());
         entry.proxySize = QSize(obj["proxyWidth"].toInt(), obj["proxyHeight"].toInt());
@@ -396,8 +558,52 @@ void ProxyManager::loadIndex()
         else
             entry.status = ProxyStatus::None;
 
-        m_entries[entry.originalPath] = entry;
+        if (entry.originalPath != rawPath)
+            migrated = true;
+
+        if (m_entries.contains(entry.originalPath)) {
+            // Duplicate after canonicalisation. Tie-break order (Codex
+            // review, 2026-04-25):
+            //   1. Prefer the entry whose proxy file actually exists on
+            //      disk and is in Ready state — losing a usable proxy to
+            //      a stale Failed/None twin would force pointless
+            //      regeneration.
+            //   2. If both (or neither) are usable, prefer the newer
+            //      source mtime — it tracks which version of the source
+            //      the user most recently re-encoded for.
+            // Drop the loser's proxy file so we don't strand orphan
+            // bytes in the storage dir.
+            const ProxyEntry &existing = m_entries[entry.originalPath];
+            auto isUsable = [](const ProxyEntry &e) {
+                return e.status == ProxyStatus::Ready && QFile::exists(e.proxyPath);
+            };
+            const bool incomingUsable = isUsable(entry);
+            const bool existingUsable = isUsable(existing);
+            bool incomingWins;
+            if (incomingUsable && !existingUsable)
+                incomingWins = true;
+            else if (!incomingUsable && existingUsable)
+                incomingWins = false;
+            else
+                incomingWins = entry.sourceMtimeMs > existing.sourceMtimeMs;
+
+            if (incomingWins) {
+                if (existing.proxyPath != entry.proxyPath)
+                    QFile::remove(existing.proxyPath);
+                m_entries[entry.originalPath] = entry;
+            } else if (existing.proxyPath != entry.proxyPath) {
+                QFile::remove(entry.proxyPath);
+            }
+            migrated = true;
+        } else {
+            m_entries[entry.originalPath] = entry;
+        }
     }
+
+    // If any keys were rewritten or duplicates merged, persist the
+    // canonical form so a future load pass doesn't re-do this work.
+    if (migrated)
+        saveIndex();
 }
 
 void ProxyManager::saveIndex()
@@ -464,6 +670,7 @@ void ProxyManager::cancelGeneration()
     m_cancelRequested = false;
     m_currentClipName.clear();
     m_currentSourceDurationUs = 0;
+    m_currentStderrBuffer.clear();
 }
 
 void ProxyManager::parseFfmpegProgress(const QByteArray &chunk)
@@ -507,6 +714,7 @@ void ProxyManager::processNextInQueue()
     m_currentSourceDurationUs = probeDurationUs(originalPath);
     const QString srcCodec = probeSourceCodec(originalPath);
     m_cancelRequested = false;
+    m_currentStderrBuffer.clear();
     emit proxyStarted(m_currentClipName);
     if (m_currentSourceDurationUs <= 0) {
         // Probe failed or input has no duration (image, broken file). Push
@@ -531,6 +739,10 @@ void ProxyManager::processNextInQueue()
     } else {
         jobGpuEnc = chosenGpuH264Encoder();
     }
+    // Honour the runtime-failed blocklist: if a previous job for this
+    // session already learned that e.g. h264_nvenc can't actually open a
+    // device on this machine, don't keep retrying the same encoder.
+    jobGpuEnc = pickRuntimeEncoder(jobGpuEnc);
     QString jobEncoder = jobGpuEnc;
     if (jobEncoder.isEmpty()) {
 #if defined(VEDITOR_AV1)
@@ -691,18 +903,105 @@ void ProxyManager::processNextInQueue()
     args.prepend("pipe:1");
     args.prepend("-progress");
 
-    connect(m_process, &QProcess::readyReadStandardOutput, this, [this]() {
-        if (!m_process) return;
-        parseFfmpegProgress(m_process->readAllStandardOutput());
+    // Capture the process pointer so a late-firing readyRead from a
+    // previous job (queued in the event loop after we've already torn
+    // down its QProcess and started a new one) reads from its own
+    // process and bails out instead of writing the previous job's
+    // stderr into the current job's buffer (Gemini review,
+    // 2026-04-25).
+    QProcess *proc = m_process;
+    connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]() {
+        if (m_process != proc) return; // stale signal from a torn-down job
+        parseFfmpegProgress(proc->readAllStandardOutput());
     });
 
-    connect(m_process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this, originalPath, jobEncoder](int exitCode, QProcess::ExitStatus exitStatus) {
+    // Buffer stderr so the finished lambda can pattern-match against
+    // device-unavailable strings (`Cannot load nvcuda.dll`, `Failed to
+    // initialize MFX library`, `[AMF] no devices`) and retry with the
+    // next encoder instead of surfacing the failure to the user.
+    connect(proc, &QProcess::readyReadStandardError, this, [this, proc]() {
+        if (m_process != proc) return; // stale signal from a torn-down job
+        m_currentStderrBuffer.append(proc->readAllStandardError());
+    });
+
+    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, [this, originalPath, jobEncoder, jobGpuEnc, proc](int exitCode, QProcess::ExitStatus exitStatus) {
+
+        // Drain whatever stderr is still queued before we pattern-match.
+        // QProcess does not guarantee a readyReadStandardError fires for
+        // every chunk before finished — the device-error line we care
+        // about (e.g. "Cannot load nvcuda.dll" right before exit) is
+        // exactly the kind of trailing output that gets left behind, and
+        // missing it would silently drop the runtime fallback path
+        // (Codex review, 2026-04-25).
+        if (m_process == proc)
+            m_currentStderrBuffer.append(proc->readAllStandardError());
 
         const bool wasCancelled = m_cancelRequested;
         const bool success = !wasCancelled
             && (exitCode == 0 && exitStatus == QProcess::NormalExit);
         const QString clipName = m_currentClipName;
+
+        // GPU device-unavailable retry. Only fires when:
+        //   - we ran a GPU encoder (jobGpuEnc not empty),
+        //   - the job actually failed (not a clean cancel),
+        //   - the captured stderr matches a known driver/device error.
+        // On match: blocklist the failed encoder for the rest of this
+        // session, requeue this clip at the front, and tail-call into
+        // processNextInQueue. The retry will hit pickRuntimeEncoder and
+        // pick the next backend (or libx264).
+        if (!wasCancelled && !success && !jobGpuEnc.isEmpty()) {
+            static const QHash<QString, QStringList> kDeviceErrors = {
+                {QStringLiteral("h264_nvenc"), {
+                    QStringLiteral("Cannot load nvcuda.dll"),
+                    QStringLiteral("Failed loading nvcuda.dll"),
+                    QStringLiteral("OpenEncodeSessionEx failed"),
+                    QStringLiteral("No NVENC capable devices found"),
+                    QStringLiteral("Cannot load nvEncodeAPI"),
+                }},
+                {QStringLiteral("h264_qsv"), {
+                    QStringLiteral("Failed to initialize MFX library"),
+                    QStringLiteral("Error opening QSV"),
+                    QStringLiteral("Error initializing an MFX session"),
+                    QStringLiteral("MFX session"),
+                }},
+                {QStringLiteral("h264_amf"), {
+                    QStringLiteral("[AMF] no devices"),
+                    QStringLiteral("AMF Failed to initialize"),
+                    QStringLiteral("AMFCreateContext"),
+                    QStringLiteral("DLL libmfx"),
+                }},
+            };
+            const QStringList patterns = kDeviceErrors.value(jobGpuEnc);
+            bool deviceUnavailable = false;
+            for (const QString &pat : patterns) {
+                if (m_currentStderrBuffer.contains(pat.toUtf8())) {
+                    deviceUnavailable = true;
+                    break;
+                }
+            }
+            if (deviceUnavailable) {
+                appendEncoderLog(QString("[%1] runtime fallback: %2 device unavailable for %3 (exit=%4) — re-queueing")
+                    .arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate),
+                         jobGpuEnc, clipName, QString::number(exitCode)));
+                m_runtimeFailedEncoders.insert(jobGpuEnc);
+
+                if (m_entries.contains(originalPath)) {
+                    auto &entry = m_entries[originalPath];
+                    QFile::remove(entry.proxyPath);
+                    entry.status = ProxyStatus::None;
+                }
+                m_queue.prepend(originalPath);
+
+                m_process->deleteLater();
+                m_process = nullptr;
+                m_currentClipName.clear();
+                m_currentSourceDurationUs = 0;
+                m_currentStderrBuffer.clear();
+                processNextInQueue();
+                return;
+            }
+        }
 
         if (m_entries.contains(originalPath)) {
             auto &entry = m_entries[originalPath];
@@ -735,6 +1034,7 @@ void ProxyManager::processNextInQueue()
         m_process = nullptr;
         m_currentClipName.clear();
         m_currentSourceDurationUs = 0;
+        m_currentStderrBuffer.clear();
 
         if (wasCancelled) {
             m_cancelRequested = false;
@@ -924,9 +1224,12 @@ QString ProxyManager::chosenGpuH264Encoder()
         return cached;
     probed = true;
 
-    if (ffmpegHasEncoder("h264_nvenc")) cached = "h264_nvenc";
-    else if (ffmpegHasEncoder("h264_qsv")) cached = "h264_qsv";
-    else if (ffmpegHasEncoder("h264_amf")) cached = "h264_amf";
+    for (const QString &candidate : gpuH264Priority()) {
+        if (ffmpegHasEncoder(candidate)) {
+            cached = candidate;
+            break;
+        }
+    }
 
     appendEncoderLog(QString("[%1] chosen=%2")
                      .arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate),

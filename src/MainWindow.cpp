@@ -2746,7 +2746,7 @@ void MainWindow::openProxySettings()
     pm.setEncoderOverride(encoderCombo->currentData(Qt::UserRole).toString());
     pm.setQualityPreset(static_cast<QualityPreset>(qualityCombo->currentData().toInt()));
     if (!pendingStorage.isEmpty()) {
-        QSettings("VSimpleEditor", "Preferences").setValue("proxyStorageDir", pendingStorage);
+        ProxyManager::setProxyStorageDir(pendingStorage);
         QDir().mkpath(pendingStorage);
     }
 

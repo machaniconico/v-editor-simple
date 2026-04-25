@@ -4,6 +4,7 @@
 #include <QString>
 #include <QSize>
 #include <QHash>
+#include <QSet>
 #include <QStringList>
 #include <QProcess>
 #include <QThread>
@@ -40,6 +41,19 @@ struct ProxyEntry {
     qint64 sourceMtimeMs = 0;    // 0 for legacy
 };
 
+// Thread-safety contract:
+//   - Static helpers (proxyDir, setProxyStorageDir, normalizePath,
+//     ffmpegHasEncoder, ffmpegHasDecoder, probeDurationUs,
+//     probeSourceCodec, chosenGpuH264Encoder) protect their own state
+//     and are safe to call from any thread.
+//   - All non-static methods (generateProxy, getProxyPath, hasProxy,
+//     deleteProxy, isEntryStale, …) and the m_* members they touch
+//     (m_entries, m_runtimeFailedEncoders, m_currentStderrBuffer, …)
+//     are MAIN-THREAD ONLY. The class is wired into the Qt event loop
+//     via QObject signals so worker threads must marshal through queued
+//     signals instead of calling these directly. If you ever need
+//     cross-thread access, add a QMutex around m_entries — don't paper
+//     over it with a partial fix.
 class ProxyManager : public QObject
 {
     Q_OBJECT
@@ -63,6 +77,12 @@ public:
     void deleteAllProxies();
 
     static QString proxyDir();
+    // Update the user-configurable proxy storage directory and bump the
+    // internal revision so the next proxyDir() call recomputes instead of
+    // serving its cached value. All call sites that change
+    // QSettings("proxyStorageDir") MUST go through here — a direct
+    // setValue() leaves the cache stale.
+    static void setProxyStorageDir(const QString &dir);
     qint64 diskUsage() const;
 
     // Manual encoder override. Empty string = Auto (existing behaviour:
@@ -126,6 +146,16 @@ private:
     void loadIndex();
     void saveIndex();
 
+    // Canonicalize originalPath so the same source file always lands under
+    // the same m_entries key regardless of how the user typed it. On
+    // Windows the OS treats `C:\foo.mp4` and `c:/foo.mp4` as the same
+    // file but Qt's QString comparison doesn't, which used to leak
+    // duplicate entries (and duplicate proxy files) for one source.
+    // Returns the canonical absolute path when the file exists; falls
+    // back to a clean+lowercased path so even pre-existing-file lookups
+    // converge. Empty input returns empty.
+    static QString normalizePath(const QString &path);
+
     // Encoder that the next proxy job would use given the current settings.
     // Mirrors the override + auto-fallback chain inside processNextInQueue
     // so isEntryStale can predict the fingerprint without re-running it.
@@ -176,6 +206,26 @@ private:
     qint64 m_currentSourceDurationUs = 0;
     QString m_currentClipName;
     bool m_cancelRequested = false;
+
+    // Captured stderr of the currently running ffmpeg job. We need it
+    // available in the finished lambda so we can pattern-match against
+    // known device-unavailable strings before deciding to retry with a
+    // different encoder. Cleared at the top of every processNextInQueue.
+    QByteArray m_currentStderrBuffer;
+
+    // GPU encoders that failed at runtime in *this* process — typically
+    // because the driver / DLL is missing on this machine even though the
+    // ffmpeg binary lists the encoder. We blocklist them for the rest of
+    // the session so we don't keep retrying the same broken backend on
+    // every clip. Cleared on process restart.
+    QSet<QString> m_runtimeFailedEncoders;
+
+    // Resolve the proposed GPU encoder against the runtime-failed
+    // blocklist. If the proposed encoder is blocklisted, walk the
+    // standard h264_nvenc → h264_qsv → h264_amf priority chain skipping
+    // any other blocklisted entries; returns empty when every GPU branch
+    // is exhausted, signalling the caller to fall through to libx264.
+    QString pickRuntimeEncoder(const QString &proposed) const;
 
     ProxyConfig m_config;
     bool m_proxyMode = true;
