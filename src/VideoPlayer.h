@@ -18,25 +18,29 @@
 #include "TextManager.h"
 #include "DecoderSlotManager.h"
 
-// Identifies a per-clip decoder in the V2+ pool. Keyed on the source
-// (sourceClipIndex, sourceTrack) tuple rather than the m_sequence index so
-// the entry can survive Timeline::sequenceChanged re-emits (which renumber
-// the sequence even when the underlying clip set hasn't changed). V1
-// (sourceTrack == 0) is *never* keyed into the pool — it stays on the
-// legacy single-decoder path (m_formatCtx/m_codecCtx).
+// Identifies a per-clip decoder in the V2+ pool. Keyed on
+// (filePath, clipIn, sourceTrack) so the key stays stable across
+// Timeline::sequenceChanged re-emits AND across clip reorders (which would
+// shift sourceClipIndex even when the underlying file/clipIn pair is
+// unchanged). V1 (sourceTrack == 0) is *never* keyed into the pool — it
+// stays on the legacy single-decoder path (m_formatCtx/m_codecCtx).
 struct TrackKey {
-    int sourceClipIndex = -1;
+    QString filePath;
+    double clipIn = 0.0;
     int sourceTrack = 0;
     bool operator==(const TrackKey &other) const noexcept
     {
-        return sourceClipIndex == other.sourceClipIndex
-            && sourceTrack == other.sourceTrack;
+        return sourceTrack == other.sourceTrack
+            && qFuzzyCompare(clipIn + 1.0, other.clipIn + 1.0)
+            && filePath == other.filePath;
     }
 };
 
 inline uint qHash(const TrackKey &k, uint seed = 0) noexcept
 {
-    return qHash(k.sourceClipIndex, seed) ^ qHash(k.sourceTrack, seed + 0x9e3779b9u);
+    return qHash(k.filePath, seed)
+         ^ qHash(k.sourceTrack, seed + 0x9e3779b9u)
+         ^ qHash(static_cast<int>(k.clipIn * 1000.0), seed + 0x517cc1b7u);
 }
 
 class GLPreview;
@@ -247,6 +251,11 @@ private:
         int sourceClipIndex = -1;
         int sourceTrack = 0;
         QString filePath;
+        // Source-file clip-in seconds. Cached so the eviction grace pool
+        // can match decoders by stable identity (filePath + clipIn +
+        // sourceTrack) across clip reorders without going through the
+        // sequence index, which can shift independently.
+        double clipIn = 0.0;
         AVFormatContext *formatCtx = nullptr;
         AVCodecContext *codecCtx = nullptr;
         SwsContext *swsCtx = nullptr;
@@ -386,6 +395,12 @@ private:
     // setHiddenTextOverlayIndex can re-compose while paused (the cached
     // m_currentFrameImage is already composited and can't be re-filtered).
     QImage m_lastSourceFrame;
+    // Phase 1d compositor base: a never-composed copy of the latest V1
+    // frame. m_lastSourceFrame may end up holding the post-composite image
+    // through displayFrame's caching path; the compositor reads this
+    // dedicated field instead so multi-track ticks never paint overlays
+    // on top of a previously-composited frame (B7 double-bake fix).
+    QImage m_lastV1RawFrame;
     // Overlay index to skip during compose (-1 = none), toggled by
     // GLPreview edit-started/ended signals.
     int m_hiddenTextOverlayIndex = -1;
