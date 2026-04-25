@@ -18,9 +18,7 @@ ProxyProgressDialog::ProxyProgressDialog(QWidget *parent)
     m_clipLabel->setWordWrap(true);
 
     m_progressBar = new QProgressBar(this);
-    // Indeterminate by default — switches to determinate when a percent
-    // arrives via onProxyProgress.
-    m_progressBar->setRange(0, 0);
+    m_progressBar->setRange(0, 0); // indeterminate until first percent arrives
 
     m_statusLabel = new QLabel(this);
     m_statusLabel->setStyleSheet("color: #888;");

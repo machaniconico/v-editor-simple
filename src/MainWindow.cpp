@@ -256,10 +256,9 @@ void MainWindow::setupUI()
         m_player->setAudioSequence(resolved);
     });
 
-    // Proxy generation progress dialog (US-3): modeless window with the
-    // current clip name + progress bar + cancel button. Created on demand
-    // when ProxyManager emits proxyStarted; reused across the session so
-    // the user keeps a stable place to monitor / abort the queue.
+    // Proxy generation progress dialog: modeless window created lazily on
+    // the first proxyStarted and reused for the rest of the session, so the
+    // user has a stable place to monitor / abort the queue.
     auto &proxyMgr = ProxyManager::instance();
     connect(&proxyMgr, &ProxyManager::proxyStarted, this, [this](const QString &clipName) {
         if (!m_proxyDialog) {

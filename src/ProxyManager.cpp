@@ -195,7 +195,6 @@ void ProxyManager::loadIndex()
         entry.originalSize = QSize(obj["originalWidth"].toInt(), obj["originalHeight"].toInt());
         entry.proxySize = QSize(obj["proxyWidth"].toInt(), obj["proxyHeight"].toInt());
 
-        // Verify the proxy file still exists on disk
         if (QFile::exists(entry.proxyPath))
             entry.status = ProxyStatus::Ready;
         else
