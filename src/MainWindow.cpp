@@ -2676,6 +2676,40 @@ void MainWindow::openProxySettings()
     }
     layout->addWidget(qualityCombo);
 
+    // Storage directory (US-3). Read-only QLineEdit shows the resolved path
+    // (custom QSettings value or default). 'フォルダ選択...' opens a dir
+    // picker; we validate write-ability before persisting.
+    layout->addWidget(new QLabel(QStringLiteral("保存先:"), &dlg));
+    auto *storageRow = new QHBoxLayout();
+    auto *storageEdit = new QLineEdit(&dlg);
+    storageEdit->setReadOnly(true);
+    storageEdit->setText(ProxyManager::proxyDir());
+    auto *storageBtn = new QPushButton(QStringLiteral("フォルダ選択..."), &dlg);
+    storageRow->addWidget(storageEdit);
+    storageRow->addWidget(storageBtn);
+    layout->addLayout(storageRow);
+    auto *storageNote = new QLabel(
+        QStringLiteral("既存 proxy は元の場所に残ります"), &dlg);
+    storageNote->setStyleSheet("color:#888; font-size:10px;");
+    layout->addWidget(storageNote);
+    QString pendingStorage; // empty = no change
+    connect(storageBtn, &QPushButton::clicked, &dlg, [&dlg, storageEdit, &pendingStorage]() {
+        const QString picked = QFileDialog::getExistingDirectory(
+            &dlg,
+            QStringLiteral("プロキシ保存先を選択"),
+            storageEdit->text());
+        if (picked.isEmpty())
+            return;
+        QFileInfo info(picked);
+        if (!info.isDir() || !info.isWritable()) {
+            QMessageBox::warning(&dlg, QStringLiteral("プロキシ保存先"),
+                QStringLiteral("選択したフォルダに書き込めません。\n別のフォルダを選択してください。"));
+            return;
+        }
+        pendingStorage = picked;
+        storageEdit->setText(picked);
+    });
+
     auto *divisorLabel = new QLabel(
         QStringLiteral("プレビュー解像度 (CPU エフェクト適用時に効く):"), &dlg);
     layout->addWidget(divisorLabel);
@@ -2704,6 +2738,10 @@ void MainWindow::openProxySettings()
 
     pm.setEncoderOverride(encoderCombo->currentData(Qt::UserRole).toString());
     pm.setQualityPreset(static_cast<QualityPreset>(qualityCombo->currentData().toInt()));
+    if (!pendingStorage.isEmpty()) {
+        QSettings("VSimpleEditor", "Preferences").setValue("proxyStorageDir", pendingStorage);
+        QDir().mkpath(pendingStorage);
+    }
 
     // Apply proxy mode flip first — the refresh below relies on the new
     // mode to resolve paths correctly.

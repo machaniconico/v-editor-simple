@@ -203,6 +203,17 @@ void ProxyManager::deleteAllProxies()
 
 QString ProxyManager::proxyDir()
 {
+    // User-overridable storage path (US-3). Read every call so a settings
+    // change is immediately reflected — note that proxy_index.json is NOT
+    // stored under proxyDir() (see proxyIndexPath()), so swapping storageDir
+    // doesn't strand existing Ready entries.
+    QSettings prefs("VSimpleEditor", "Preferences");
+    const QString custom = prefs.value("proxyStorageDir").toString();
+    if (!custom.isEmpty()) {
+        QFileInfo info(custom);
+        if (info.exists() && info.isDir())
+            return custom;
+    }
     return QDir::homePath() + "/.veditor/proxies";
 }
 
