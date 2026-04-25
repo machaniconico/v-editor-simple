@@ -300,7 +300,7 @@ void ProxyManager::processNextInQueue()
          << "-vf" << QString("scale=%1:%2").arg(m_config.proxyWidth).arg(m_config.proxyHeight);
 
 #if defined(VEDITOR_AV1)
-    // Modern Edition: AV1 proxy via SVT-AV1 with sidx fragmented MP4 for accurate seeking.
+    // Modern Edition: AV1 proxy via SVT-AV1 with fragmented MP4 for accurate seeking.
     // Runtime fallback to H.264 if the runtime ffmpeg.exe lacks libsvtav1.
     // We probe the actual binary (not the linked libavcodec) because the two
     // can disagree when ffmpeg is on PATH but built independently.
