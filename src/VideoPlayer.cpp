@@ -409,17 +409,15 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 {
     qInfo() << "VideoPlayer::setSequence count=" << entries.size();
 
-    // PiP staging shim (Stage 1): Timeline now emits every track's entries
-    // without mutual subtraction, but VideoPlayer still drives a single
-    // decoder. Drop V2+ entries so findActiveEntryAt / advanceToEntry stay
-    // monotonic in timelineStart. The multi-layer compositor (Stage 2+) will
-    // replace this with per-sourceTrack LayerDecoders and this filter is
-    // removed at that time.
-    QVector<PlaybackEntry> primary;
-    primary.reserve(entries.size());
-    for (const auto &e : entries) {
-        if (e.sourceTrack == 0) primary.append(e);
-    }
+    // Topmost-track-wins via single-decoder pipeline: take Timeline's
+    // sequence as-is. Timeline::computePlaybackSequence sorts by
+    // (timelineStart asc, sourceTrack asc), so findActiveEntryAt naturally
+    // hits V1 first wherever V1 exists; in V1-empty gaps only V2 (or V3,
+    // ...) matches, which is what makes seeks into V2-only regions actually
+    // load V2's source instead of bouncing back to V1's head. The Stage 2
+    // multi-layer compositor will replace this with per-sourceTrack
+    // LayerDecoders.
+    QVector<PlaybackEntry> primary = entries;
 
     // Compute total duration in microseconds from the full (multi-track) set
     // so the slider range still reflects V2-only segments beyond V1's tail.
