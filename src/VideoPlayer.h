@@ -75,6 +75,13 @@ public:
     // on setSequence's clamped restoration which drifts back to the head
     // when the new entries trigger a fresh decoder open.
     int64_t timelinePositionUs() const { return m_timelinePositionUs; }
+
+    // Proxy preview divisor (1 = full, 2 = half, 4 = quarter, 8 = eighth)
+    // exposed so the proxy settings dialog (opened from the seekbar-left
+    // button) can read and update it without touching VideoPlayer's
+    // internals directly.
+    int proxyDivisor() const { return m_proxyDivisor; }
+    void setProxyDivisor(int divisor);
     GLPreview *glPreview() const { return m_glPreview; }
 
     struct HdrInfo {
@@ -136,6 +143,11 @@ signals:
     void durationChanged(double durationSeconds);
     void stateChanged(bool playing);
     void playbackSpeedChanged(double speed);
+    // Emitted when the user clicks the seekbar-left proxy button. MainWindow
+    // owns the settings dialog so it can drive both the file-level proxy
+    // mode (ProxyManager) and the preview divisor (VideoPlayer) through
+    // the same affordance.
+    void proxySettingsRequested();
     void textRectRequested(const QRectF &normalizedRect);
     void textInlineCommitted(const QString &text, const QRectF &normalizedRect);
     void textOverlayEditCommitted(int overlayIndex, const QString &newText);

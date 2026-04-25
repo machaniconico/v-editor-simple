@@ -249,10 +249,25 @@ void ProxyManager::cancelGeneration()
     m_cancelRequested = true;
     m_queue.clear();
     if (m_process) {
+        // Detach the finished/readyRead lambdas first — without this, the
+        // old QProcess emits finished() (synchronously when terminate +
+        // waitForFinished succeed, asynchronously after kill) and re-enters
+        // processNextInQueue() against a m_process pointer the next
+        // generateAllProxies has already overwritten with a new QProcess.
+        // That ghost lambda is the regenerate crash.
+        disconnect(m_process, nullptr, this, nullptr);
         m_process->terminate();
         if (!m_process->waitForFinished(2000))
             m_process->kill();
+        m_process->waitForFinished(1000);
+        m_process->deleteLater();
+        m_process = nullptr;
     }
+    // Reset synchronously so a follow-up generateAllProxies on the same
+    // call stack doesn't see leftover cancel state.
+    m_cancelRequested = false;
+    m_currentClipName.clear();
+    m_currentSourceDurationUs = 0;
 }
 
 void ProxyManager::parseFfmpegProgress(const QByteArray &chunk)

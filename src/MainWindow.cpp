@@ -41,6 +41,8 @@
 #include <QDir>
 #include "GradientStopBar.h"
 #include <QPushButton>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QColorDialog>
 #include <QFormLayout>
 #include <QLabel>
@@ -136,6 +138,8 @@ void MainWindow::setupUI()
     m_mainSplitter = new QSplitter(Qt::Vertical, this);
 
     m_player = new VideoPlayer(this);
+    connect(m_player, &VideoPlayer::proxySettingsRequested,
+            this, &MainWindow::openProxySettings);
     m_timeline = new Timeline(this);
 
     // Welcome widget (shown when empty)
@@ -2604,6 +2608,71 @@ void MainWindow::manageLuts()
     QMessageBox::information(this, "Manage LUTs", info);
 }
 
+void MainWindow::openProxySettings()
+{
+    auto &pm = ProxyManager::instance();
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("プロキシ設定"));
+    auto *layout = new QVBoxLayout(&dlg);
+
+    auto *modeCheck = new QCheckBox(
+        QStringLiteral("プロキシ再生 (低解像度ファイルで再生)"), &dlg);
+    modeCheck->setChecked(pm.isProxyMode());
+    modeCheck->setToolTip(QStringLiteral(
+        "ON: 生成済みプロキシをタイムラインで使用 (高速再生)\n"
+        "OFF: 元解像度ファイルを使用"));
+    layout->addWidget(modeCheck);
+
+    auto *divisorLabel = new QLabel(
+        QStringLiteral("プレビュー解像度 (CPU エフェクト適用時に効く):"), &dlg);
+    layout->addWidget(divisorLabel);
+    auto *divisorCombo = new QComboBox(&dlg);
+    divisorCombo->addItem(QStringLiteral("Full (1/1)"), 1);
+    divisorCombo->addItem(QStringLiteral("Half (1/2)"), 2);
+    divisorCombo->addItem(QStringLiteral("Quarter (1/4)"), 4);
+    divisorCombo->addItem(QStringLiteral("Eighth (1/8)"), 8);
+    const int currentDivisor = m_player ? m_player->proxyDivisor() : 1;
+    for (int i = 0; i < divisorCombo->count(); ++i) {
+        if (divisorCombo->itemData(i).toInt() == currentDivisor) {
+            divisorCombo->setCurrentIndex(i);
+            break;
+        }
+    }
+    layout->addWidget(divisorCombo);
+
+    auto *buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    layout->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    // Apply proxy mode flip first — the refresh below relies on the new
+    // mode to resolve paths correctly.
+    const bool newMode = modeCheck->isChecked();
+    if (pm.isProxyMode() != newMode) {
+        pm.setProxyMode(newMode);
+        statusBar()->showMessage(newMode
+            ? QStringLiteral("Proxy mode ON (low-res playback)")
+            : QStringLiteral("Proxy mode OFF (original quality)"));
+        if (m_timeline && m_player) {
+            const bool wasPlaying = m_player->isPlaying();
+            const int64_t posUs = m_player->timelinePositionUs();
+            if (wasPlaying)
+                m_player->pause();
+            m_timeline->refreshPlaybackSequence();
+            m_player->seek(static_cast<int>(posUs / 1000));
+            if (wasPlaying)
+                m_player->play();
+        }
+    }
+    if (m_player)
+        m_player->setProxyDivisor(divisorCombo->currentData().toInt());
+}
+
 void MainWindow::toggleProxyMode()
 {
     auto &pm = ProxyManager::instance();
@@ -2645,6 +2714,15 @@ void MainWindow::generateProxies()
         paths << c.filePath;
 
     auto &pm = ProxyManager::instance();
+
+    // Drop any prior allProxiesReady / progressChanged lambdas before
+    // wiring up the new ones. Qt::UniqueConnection does NOT deduplicate
+    // distinct lambda objects (each closure is a separate functor type),
+    // so without this disconnect the Nth generateProxies call fires the
+    // refresh handler N times on completion — the visible symptom is the
+    // preview snapping back to position multiple times in a row.
+    disconnect(&pm, &ProxyManager::allProxiesReady, this, nullptr);
+    disconnect(&pm, &ProxyManager::progressChanged, this, nullptr);
 
     // generateAllProxies skips clips whose entry is Ready/Generating, so a
     // bare invocation on a project that already has proxies would emit
@@ -2689,6 +2767,9 @@ void MainWindow::generateProxies()
     }
 
     connect(&pm, &ProxyManager::allProxiesReady, this, [this]() {
+        // Qt::SingleShotConnection so the lambda is removed automatically
+        // after one fire, in addition to the upfront disconnect — defense
+        // in depth against the same lambda accumulating across calls.
         statusBar()->showMessage("All proxies generated");
         if (!m_timeline || !m_player)
             return;
@@ -2710,10 +2791,10 @@ void MainWindow::generateProxies()
         m_player->seek(static_cast<int>(posUs / 1000));
         if (wasPlaying)
             m_player->play();
-    }, Qt::UniqueConnection);
+    }, Qt::SingleShotConnection);
     connect(&pm, &ProxyManager::progressChanged, this, [this](int pct) {
         statusBar()->showMessage(QString("Generating proxies... %1%").arg(pct));
-    }, Qt::UniqueConnection);
+    });
 
     pm.generateAllProxies(paths);
     statusBar()->showMessage("Generating proxy files...");

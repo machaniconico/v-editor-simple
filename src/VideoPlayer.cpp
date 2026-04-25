@@ -1,4 +1,5 @@
 #include "VideoPlayer.h"
+#include <QSet>
 #include "GLPreview.h"
 #include <QSettings>
 #include <QResizeEvent>
@@ -201,17 +202,11 @@ void VideoPlayer::setupUI()
     m_proxyButton->setText(proxyLabel(m_proxyDivisor));
     m_proxyButton->setFixedSize(56, 32);
     m_proxyButton->setStyleSheet(mediaBtnStyle);
-    m_proxyButton->setToolTip(QStringLiteral("プレビュー プロキシ解像度 (CPUエフェクト再生時に適用)"));
-    connect(m_proxyButton, &QPushButton::clicked, this, [this, proxyLabel]() {
-        const int order[] = {1, 2, 4, 8};
-        int idx = 0;
-        for (int i = 0; i < 4; ++i) if (order[i] == m_proxyDivisor) { idx = i; break; }
-        m_proxyDivisor = order[(idx + 1) % 4];
-        m_proxyButton->setText(proxyLabel(m_proxyDivisor));
-        QSettings("VSimpleEditor", "Preferences").setValue("proxyDivisor", m_proxyDivisor);
-        if (!m_lastSourceFrame.isNull())
-            displayFrame(m_lastSourceFrame);
-    });
+    m_proxyButton->setToolTip(QStringLiteral("プロキシ設定 (再生用プロキシ ON/OFF と プレビュー解像度)"));
+    // Forward to MainWindow's proxy settings dialog so this seekbar-left
+    // affordance and the toolbar's "プロキシモード切替" / "プロキシ生成..."
+    // entries all drive the same configuration surface.
+    connect(m_proxyButton, &QPushButton::clicked, this, &VideoPlayer::proxySettingsRequested);
     m_timeLabel->setFixedWidth(120);
     m_seekBar->setRange(0, 0);
     m_seekBar->setTracking(false);
@@ -246,6 +241,22 @@ void VideoPlayer::setupUI()
         if (!m_seekBar->isSliderDown())
             seek(value);
     });
+}
+
+void VideoPlayer::setProxyDivisor(int divisor)
+{
+    static const QSet<int> allowed = {1, 2, 4, 8};
+    if (!allowed.contains(divisor) || divisor == m_proxyDivisor)
+        return;
+    m_proxyDivisor = divisor;
+    if (m_proxyButton) {
+        const QString text = (divisor == 1) ? QStringLiteral("Full")
+                            : QStringLiteral("1/%1").arg(divisor);
+        m_proxyButton->setText(text);
+    }
+    QSettings("VSimpleEditor", "Preferences").setValue("proxyDivisor", m_proxyDivisor);
+    if (!m_lastSourceFrame.isNull())
+        displayFrame(m_lastSourceFrame);
 }
 
 void VideoPlayer::loadFile(const QString &filePath)

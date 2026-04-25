@@ -141,6 +141,11 @@ private slots:
     void manageLuts();
     void toggleProxyMode();
     void generateProxies();
+    // Modal dialog driving the seekbar-left proxy button. Lets the user
+    // flip ProxyManager's proxy-mode flag and pick the preview divisor
+    // from the same place. Replaces the divisor-only cycle handler that
+    // used to live inside VideoPlayer.
+    void openProxySettings();
     void setSpeedRamp();
     void audioEqualizer();
     void audioEffects();
