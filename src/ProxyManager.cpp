@@ -308,7 +308,7 @@ void ProxyManager::processNextInQueue()
              << "-pix_fmt" << "yuv420p"
              << "-c:a" << "aac"
              << "-b:a" << "128k"
-             << "-movflags" << "+faststart+sidx+frag_keyframe+empty_moov+default_base_moof"
+             << "-movflags" << "+faststart+frag_keyframe+empty_moov+default_base_moof"
              << entry.proxyPath;
     } else
 #endif
