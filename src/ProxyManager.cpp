@@ -54,6 +54,17 @@ void ProxyManager::setQualityPreset(QualityPreset preset)
     prefs.setValue("proxyQualityPreset", static_cast<int>(preset));
 }
 
+QString ProxyManager::computeConfigFingerprint(const ProxyConfig &cfg,
+                                               const QString &encoder,
+                                               QualityPreset preset)
+{
+    const char *presetTag = (preset == QualityPreset::High) ? "H"
+                          : (preset == QualityPreset::Low)  ? "L" : "M";
+    return QString("%1|%2|%3x%4").arg(encoder, QString(presetTag),
+                                       QString::number(cfg.proxyWidth),
+                                       QString::number(cfg.proxyHeight));
+}
+
 int ProxyManager::qualityValueForEncoder(const QString &encoder, QualityPreset preset)
 {
     // Backend-specific tables — CRF and QP scales aren't equivalent across
@@ -305,6 +316,11 @@ void ProxyManager::loadIndex()
         entry.proxyPath = obj["proxyPath"].toString();
         entry.originalSize = QSize(obj["originalWidth"].toInt(), obj["originalHeight"].toInt());
         entry.proxySize = QSize(obj["proxyWidth"].toInt(), obj["proxyHeight"].toInt());
+        // New fields (post-2026-04-25). Old indices missing them → defaults
+        // preserve backward compatibility (empty fingerprint / 0 mtime).
+        entry.configFingerprint = obj.value("configFingerprint").toString();
+        entry.sourceMtimeMs =
+            static_cast<qint64>(obj.value("sourceMtimeMs").toDouble(0.0));
 
         if (QFile::exists(entry.proxyPath))
             entry.status = ProxyStatus::Ready;
@@ -332,6 +348,8 @@ void ProxyManager::saveIndex()
         obj["originalHeight"] = entry.originalSize.height();
         obj["proxyWidth"] = entry.proxySize.width();
         obj["proxyHeight"] = entry.proxySize.height();
+        obj["configFingerprint"] = entry.configFingerprint;
+        obj["sourceMtimeMs"] = static_cast<double>(entry.sourceMtimeMs);
         entries.append(obj);
     }
 
@@ -610,7 +628,7 @@ void ProxyManager::processNextInQueue()
     });
 
     connect(m_process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this, originalPath](int exitCode, QProcess::ExitStatus exitStatus) {
+            this, [this, originalPath, jobEncoder](int exitCode, QProcess::ExitStatus exitStatus) {
 
         const bool wasCancelled = m_cancelRequested;
         const bool success = !wasCancelled
@@ -621,6 +639,10 @@ void ProxyManager::processNextInQueue()
             auto &entry = m_entries[originalPath];
             if (success && QFile::exists(entry.proxyPath)) {
                 entry.status = ProxyStatus::Ready;
+                entry.configFingerprint = computeConfigFingerprint(
+                    m_config, jobEncoder, m_qualityPreset);
+                entry.sourceMtimeMs =
+                    QFileInfo(originalPath).lastModified().toMSecsSinceEpoch();
                 saveIndex();
                 emit proxyGenerated(originalPath, entry.proxyPath);
             } else {

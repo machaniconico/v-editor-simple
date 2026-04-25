@@ -12,7 +12,8 @@ enum class ProxyStatus {
     None,
     Generating,
     Ready,
-    Error
+    Error,
+    Stale
 };
 
 enum class QualityPreset {
@@ -35,6 +36,8 @@ struct ProxyEntry {
     QSize originalSize;
     QSize proxySize;
     ProxyStatus status = ProxyStatus::None;
+    QString configFingerprint;   // empty for legacy entries (pre-2026-04-25 indices)
+    qint64 sourceMtimeMs = 0;    // 0 for legacy
 };
 
 class ProxyManager : public QObject
@@ -176,4 +179,11 @@ private:
     // arg branch. Tables are calibrated per-backend because libx264 CRF and
     // h264_qsv global_quality scales aren't equivalent.
     static int qualityValueForEncoder(const QString &encoder, QualityPreset preset);
+
+    // Stable, human-readable identifier for the (encoder, preset, size) tuple
+    // a proxy was generated under. Mismatch against the current effective
+    // config means the proxy is stale and should be regenerated.
+    static QString computeConfigFingerprint(const ProxyConfig &cfg,
+                                            const QString &encoder,
+                                            QualityPreset preset);
 };
