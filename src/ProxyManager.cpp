@@ -32,6 +32,11 @@ ProxyManager::ProxyManager()
     QDir().mkpath(proxyDir());
     QSettings prefs("VSimpleEditor", "Preferences");
     m_encoderOverride = prefs.value("proxyEncoderOverride").toString();
+    int presetInt = prefs.value("proxyQualityPreset",
+                                static_cast<int>(QualityPreset::Medium)).toInt();
+    if (presetInt < 0 || presetInt > 2)
+        presetInt = static_cast<int>(QualityPreset::Medium);
+    m_qualityPreset = static_cast<QualityPreset>(presetInt);
     loadIndex();
 }
 
@@ -40,6 +45,42 @@ void ProxyManager::setEncoderOverride(const QString &name)
     m_encoderOverride = name;
     QSettings prefs("VSimpleEditor", "Preferences");
     prefs.setValue("proxyEncoderOverride", name);
+}
+
+void ProxyManager::setQualityPreset(QualityPreset preset)
+{
+    m_qualityPreset = preset;
+    QSettings prefs("VSimpleEditor", "Preferences");
+    prefs.setValue("proxyQualityPreset", static_cast<int>(preset));
+}
+
+int ProxyManager::qualityValueForEncoder(const QString &encoder, QualityPreset preset)
+{
+    // Backend-specific tables — CRF and QP scales aren't equivalent across
+    // encoders, so a single magic 28 would over- or under-quantize on three
+    // of the four backends. Values picked from Codex review.
+    if (encoder == "libx264") {
+        switch (preset) {
+            case QualityPreset::High:   return 22;
+            case QualityPreset::Medium: return 28;
+            case QualityPreset::Low:    return 35;
+        }
+    }
+    if (encoder == "h264_nvenc" || encoder == "h264_amf") {
+        switch (preset) {
+            case QualityPreset::High:   return 24;
+            case QualityPreset::Medium: return 28;
+            case QualityPreset::Low:    return 34;
+        }
+    }
+    if (encoder == "h264_qsv") {
+        switch (preset) {
+            case QualityPreset::High:   return 20;
+            case QualityPreset::Medium: return 26;
+            case QualityPreset::Low:    return 32;
+        }
+    }
+    return 28;
 }
 
 ProxyManager::~ProxyManager()
@@ -427,11 +468,20 @@ void ProxyManager::processNextInQueue()
         srcCodec.isEmpty()  ? QStringLiteral("<probe-failed>") :
                               QStringLiteral("<default>");
 
-    appendEncoderLog(QString("[%1] job source=%2 encoder=%3 decoder=%4")
+    const int qualVal = qualityValueForEncoder(jobEncoder, m_qualityPreset);
+    const char *presetTag = "M";
+    switch (m_qualityPreset) {
+        case QualityPreset::High:   presetTag = "H"; break;
+        case QualityPreset::Medium: presetTag = "M"; break;
+        case QualityPreset::Low:    presetTag = "L"; break;
+    }
+    appendEncoderLog(QString("[%1] job source=%2 encoder=%3 decoder=%4 quality=%5 preset=%6")
                      .arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate),
                           m_currentClipName,
                           jobEncoder,
-                          jobDecoder));
+                          jobDecoder,
+                          QString::number(qualVal),
+                          QString::fromLatin1(presetTag)));
 
     m_process = new QProcess(this);
 
@@ -446,6 +496,9 @@ void ProxyManager::processNextInQueue()
 
     const QString gpuEnc = jobGpuEnc;
     const QString scaleSize = QString("%1:%2").arg(m_config.proxyWidth).arg(m_config.proxyHeight);
+    // Pre-resolve quality (US-2 + US-8). For the libx264 / libsvtav1 paths
+    // this is also recomputed inline since they use different scales.
+    const QString qStr = QString::number(qualityValueForEncoder(jobEncoder, m_qualityPreset));
 
     if (gpuEnc == "h264_nvenc") {
         // Full CUDA pipeline: NVDEC decode → scale_cuda → NVENC encode, no
@@ -462,7 +515,7 @@ void ProxyManager::processNextInQueue()
              << "-vf" << QString("scale_cuda=%1").arg(scaleSize)
              << "-c:v" << "h264_nvenc"
              << "-preset" << "p1"
-             << "-rc" << "constqp" << "-qp" << "28"
+             << "-rc" << "constqp" << "-qp" << qStr
              << "-c:a" << "aac"
              << "-b:a" << "128k"
              << "-movflags" << "+faststart"
@@ -478,7 +531,7 @@ void ProxyManager::processNextInQueue()
              << "-vf" << QString("scale_qsv=%1").arg(scaleSize)
              << "-c:v" << "h264_qsv"
              << "-preset" << "veryfast"
-             << "-global_quality" << "28"
+             << "-global_quality" << qStr
              << "-c:a" << "aac"
              << "-b:a" << "128k"
              << "-movflags" << "+faststart"
@@ -492,7 +545,7 @@ void ProxyManager::processNextInQueue()
              << "-vf" << QString("scale=%1").arg(scaleSize)
              << "-c:v" << "h264_amf"
              << "-quality" << "speed"
-             << "-rc" << "cqp" << "-qp_i" << "28" << "-qp_p" << "28"
+             << "-rc" << "cqp" << "-qp_i" << qStr << "-qp_p" << qStr
              << "-pix_fmt" << "yuv420p"
              << "-c:a" << "aac"
              << "-b:a" << "128k"
@@ -518,10 +571,12 @@ void ProxyManager::processNextInQueue()
     else {
         // Last-resort software H.264 — slowest but always available. -g 120
         // forces keyframes every ~4 s so the seekbar stays accurate.
+        const QString libQ = QString::number(
+            qualityValueForEncoder("libx264", m_qualityPreset));
         args << "-i" << originalPath
              << "-vf" << QString("scale=%1").arg(scaleSize)
              << "-c:v" << "libx264"
-             << "-crf" << QString::number(m_config.quality)
+             << "-crf" << libQ
              << "-g" << "120"
              << "-c:a" << "aac"
              << "-b:a" << "128k"

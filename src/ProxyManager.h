@@ -15,6 +15,12 @@ enum class ProxyStatus {
     Error
 };
 
+enum class QualityPreset {
+    High = 0,
+    Medium = 1,
+    Low = 2
+};
+
 struct ProxyConfig {
     int proxyWidth = 640;
     int proxyHeight = 360;
@@ -63,6 +69,12 @@ public:
     // "proxyEncoderOverride".
     QString encoderOverride() const { return m_encoderOverride; }
     void setEncoderOverride(const QString &name);
+
+    // Quality preset (US-2). Persisted via QSettings under
+    // "proxyQualityPreset" as int (0/1/2). Mapping to encoder-specific
+    // CRF/QP values lives in qualityValueForEncoder.
+    QualityPreset qualityPreset() const { return m_qualityPreset; }
+    void setQualityPreset(QualityPreset preset);
 
     // Probe the runtime ffmpeg.exe for the named encoder. Public so the
     // settings dialog can grey out unsupported items. Cached internally.
@@ -155,4 +167,10 @@ private:
     QThread *m_thread = nullptr;
 
     QString m_encoderOverride;
+    QualityPreset m_qualityPreset = QualityPreset::Medium;
+
+    // Map (encoder, preset) → CRF/QP value used in the corresponding ffmpeg
+    // arg branch. Tables are calibrated per-backend because libx264 CRF and
+    // h264_qsv global_quality scales aren't equivalent.
+    static int qualityValueForEncoder(const QString &encoder, QualityPreset preset);
 };

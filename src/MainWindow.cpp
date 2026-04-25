@@ -2659,6 +2659,23 @@ void MainWindow::openProxySettings()
     }
     layout->addWidget(encoderCombo);
 
+    // Quality preset (US-2). Index 0..2 maps to QualityPreset enum directly.
+    layout->addWidget(new QLabel(QStringLiteral("品質:"), &dlg));
+    auto *qualityCombo = new QComboBox(&dlg);
+    qualityCombo->addItem(QStringLiteral("High"),   static_cast<int>(QualityPreset::High));
+    qualityCombo->addItem(QStringLiteral("Medium"), static_cast<int>(QualityPreset::Medium));
+    qualityCombo->addItem(QStringLiteral("Low"),    static_cast<int>(QualityPreset::Low));
+    {
+        const int cur = static_cast<int>(pm.qualityPreset());
+        for (int i = 0; i < qualityCombo->count(); ++i) {
+            if (qualityCombo->itemData(i).toInt() == cur) {
+                qualityCombo->setCurrentIndex(i);
+                break;
+            }
+        }
+    }
+    layout->addWidget(qualityCombo);
+
     auto *divisorLabel = new QLabel(
         QStringLiteral("プレビュー解像度 (CPU エフェクト適用時に効く):"), &dlg);
     layout->addWidget(divisorLabel);
@@ -2686,6 +2703,7 @@ void MainWindow::openProxySettings()
         return;
 
     pm.setEncoderOverride(encoderCombo->currentData(Qt::UserRole).toString());
+    pm.setQualityPreset(static_cast<QualityPreset>(qualityCombo->currentData().toInt()));
 
     // Apply proxy mode flip first — the refresh below relies on the new
     // mode to resolve paths correctly.
