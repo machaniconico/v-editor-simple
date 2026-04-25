@@ -24,13 +24,12 @@
 //   - importing the same file with the same trim onto the same track
 //     twice does NOT collide (each ClipInfo carries its own
 //     sourceClipIndex, so two distinct clips own two distinct decoders
-//     instead of stealing each other's slot — MAJ-6);
+//     instead of stealing each other's slot);
 //   - clipIn is quantized to 1ms (qint64) so operator== and qHash use
-//     IDENTICAL bucketing (MAJ-1: previous version mixed qFuzzyCompare
-//     with int(clipIn*1000), and the 1.9999999999 / 2.0000000001 case
-//     compared equal but hashed differently, breaking the QHash
-//     contract).
-// V1 (sourceTrack == 0) is *never* keyed into the pool — it stays on
+//     IDENTICAL bucketing — qFuzzyCompare on raw doubles can compare
+//     equal while int(x*1000) hashes to neighbouring buckets, which
+//     would silently break QHash's contract.
+// V1 (sourceTrack == 0) is never keyed into the pool — it stays on
 // the legacy single-decoder path (m_formatCtx/m_codecCtx).
 struct TrackKey {
     QString filePath;
@@ -372,11 +371,11 @@ private:
     // step in handlePlaybackTick can blend overlays on top before pushing
     // the final image to the GLPreview.
     bool m_deferDisplayThisTick = false;
-    // CRIT-3: remembers whether the previous tick took the compositor
-    // path. When the compositor path runs we force the GL viewport to
-    // identity (1,0,0) so V1's transform isn't applied twice on top of an
-    // already-baked composite. The next non-composite tick has to undo
-    // that — push V1's own scale/dx/dy back into the GL viewport before
+    // Tracks whether the previous tick took the compositor path. The
+    // compositor forces the GL viewport to identity (1,0,0) so the active
+    // entry's transform isn't applied twice on top of an already-baked
+    // composite. The next non-composite tick has to undo that — push the
+    // entry's own scale/dx/dy back into the GL viewport before
     // displayFrame ships the raw V1 frame, otherwise V1 snaps to identity
     // the moment the overlay ends.
     bool m_lastTickWasComposite = false;
@@ -418,9 +417,9 @@ private:
     // frame. m_lastSourceFrame may end up holding the post-composite image
     // through displayFrame's caching path; the compositor reads this
     // dedicated field instead so multi-track ticks never paint overlays
-    // on top of a previously-composited frame (B7 double-bake fix).
+    // on top of a previously-composited frame.
     QImage m_lastV1RawFrame;
-    // MAJ-5: persistent canvas-sized scratch buffer for the compositor.
+    // Persistent canvas-sized scratch buffer for the compositor.
     // Re-allocated only on canvas size / format change; refilled with
     // black every compositor tick. Avoids ~8MB ARGB allocations per tick
     // at 1080p which under playback cadence (60fps) translated to
@@ -443,10 +442,10 @@ private:
     // Active V2+ decoders, keyed on TrackKey. V1 never lives here — it
     // stays on m_formatCtx/m_codecCtx.
     QHash<TrackKey, TrackDecoder*> m_trackDecoders;
-    // cpp-MEDIUM: reverse lookup from DecoderSlotManager's int slotClipId
-    // back to the TrackKey that originally claimed the slot. Without this,
-    // eviction had to walk m_trackDecoders comparing qHash(it.key()) to
-    // evictedClipId — a hash collision would evict the wrong decoder.
+    // Reverse lookup from DecoderSlotManager's int slotClipId back to the
+    // TrackKey that originally claimed the slot. Without this, eviction
+    // had to walk m_trackDecoders comparing qHash(it.key()) to
+    // evictedClipId — a hash collision would surface the wrong decoder.
     // Maintained alongside m_trackDecoders insert/erase.
     QHash<int, TrackKey> m_slotIdToKey;
     // Bounded grace pool for evicted decoders. Each entry counts down

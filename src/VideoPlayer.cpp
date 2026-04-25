@@ -487,7 +487,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         // identity instead of inheriting the last clip's scale/offset.
         if (m_glPreview)
             m_glPreview->resetVideoSourceTransform();
-        // CRIT-1: drop the cached compositor base on Timeline-empty too.
+        // Drop the cached compositor base on Timeline-empty too.
         // Otherwise a re-import after clearing keeps the previous V1 frame
         // around and the first compositor tick on the new clip flashes
         // the stale picture (paired with resetDecoder's clear).
@@ -1429,11 +1429,11 @@ void VideoPlayer::resetDecoder()
         av_buffer_unref(&m_hwDeviceCtx);
     m_hwPixFmt = AV_PIX_FMT_NONE;
 
-    // CRIT-1: drop the cached compositor base too. Otherwise the next
-    // tick after a clip switch (advanceToEntry → loadFile → resetDecoder
-    // → fresh decode) hands the compositor the PREVIOUS clip's V1 frame
-    // as the canvas base, so the user briefly sees the old clip behind
-    // any V2+ overlays.
+    // Drop the cached compositor base. Otherwise the next tick after a
+    // clip switch (advanceToEntry → loadFile → resetDecoder → fresh
+    // decode) hands the compositor the previous clip's V1 frame as the
+    // canvas base, and the user briefly sees the old clip behind any
+    // V2+ overlays.
     m_lastV1RawFrame = QImage();
 
     updatePlayButton();
@@ -1725,7 +1725,7 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
         // overlays on, even when we defer the displayFrame call below.
         // m_lastV1RawFrame is the dedicated compositor base — it stays a
         // pristine V1 frame regardless of what displayFrame writes back
-        // into m_lastSourceFrame later in the pipeline (B7).
+        // into m_lastSourceFrame later in the pipeline.
         m_lastV1RawFrame = image;
         m_lastSourceFrame = image;
         if (!m_deferDisplayThisTick)
@@ -1924,10 +1924,10 @@ void VideoPlayer::handlePlaybackTick()
     if (!m_playing)
         return;
 
-    // B9 fix: feed the slot manager's LRU heuristic. Without this, every
-    // eviction falls back to insertion order (m_playheadSec=0) and the
-    // wrong decoder gets dropped under contention. Cheap — just stores a
-    // double on the slot manager.
+    // Feed the slot manager's distance-from-playhead eviction heuristic.
+    // Without this every slot looks equidistant from a stale playhead at
+    // 0, so eviction degenerates to "drop the slot with the largest
+    // clipStartSec" regardless of what's actually playing.
     m_slotManager.setPlayheadPosition(
         static_cast<double>(m_timelinePositionUs) / static_cast<double>(AV_TIME_BASE));
 
@@ -1958,12 +1958,13 @@ void VideoPlayer::handlePlaybackTick()
                                && hasOverlayActive(findActiveEntriesAt(m_timelinePositionUs));
     m_deferDisplayThisTick = willComposite;
 
-    // CRIT-3: when leaving the compositor path, restore the V1 entry's
-    // OBS-style transform on the GL viewport. The compositor reset it to
-    // identity (1,0,0) so the canvas-final composite isn't transformed
-    // again on top — but a non-composite tick ships the raw V1 frame
-    // straight to GL, so the viewport has to carry V1's scale/dx/dy or
-    // V1 snaps to identity the instant the overlay ends.
+    // When leaving the compositor path, restore the active entry's
+    // OBS-style transform on the GL viewport. The compositor resets the
+    // viewport to identity (1,0,0) so the canvas-final composite isn't
+    // transformed again — but a non-composite tick ships the raw frame
+    // straight to GL, so the viewport has to carry the entry's
+    // scale/dx/dy or the user's pan/zoom snaps off the moment the
+    // overlay ends.
     if (m_lastTickWasComposite && !willComposite && m_glPreview
         && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
         const auto &v1e = m_sequence[m_activeEntry];
@@ -1994,12 +1995,12 @@ void VideoPlayer::handlePlaybackTick()
     // path because m_deferDisplayThisTick was false above).
     if (advanced && willComposite && !m_lastV1RawFrame.isNull()) {
         const QVector<int> activeIdxs = findActiveEntriesAt(m_timelinePositionUs);
-        // B4 fix: GL viewport's setVideoSourceTransform is normally driven
-        // by V1's videoScale/Dx/Dy in advanceToEntry. When we hand GL a
-        // composed canvas-final image we have to (a) bake V1's transform
-        // INTO the canvas via a V1 layer, and (b) reset GL viewport to
-        // identity so it doesn't apply V1's transform a second time on top
-        // of the already-baked composite.
+        // GL viewport's setVideoSourceTransform is normally driven by the
+        // active entry's videoScale/Dx/Dy in advanceToEntry. When we hand
+        // GL a composed canvas-final image we have to (a) bake the
+        // entry's transform into the canvas via a base layer, and (b)
+        // reset GL viewport to identity so it doesn't apply the same
+        // transform a second time on top of the already-baked composite.
         QVector<DecodedLayer> layers;
         layers.reserve(activeIdxs.size() + 1);
         if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
@@ -2029,12 +2030,12 @@ void VideoPlayer::handlePlaybackTick()
             }
         }
         if (overlayPresent) {
-            // MAJ-5: keep a canvas-sized scratch buffer on the player so
-            // we don't allocate ~8MB (1080p ARGB) every tick. Re-allocates
-            // only when the canvas size or format changes; otherwise we
-            // just refill it with black. composeMultiTrackFrame still
-            // promotes through convertToFormat, but starting with a
-            // matching format keeps that to a no-op detach.
+            // Reuse a canvas-sized scratch buffer so we don't allocate
+            // ~8MB (1080p ARGB) every tick. Re-allocates only when the
+            // canvas size or format changes; otherwise we just refill it
+            // with black. composeMultiTrackFrame still promotes through
+            // convertToFormat, but starting with a matching format keeps
+            // that to a no-op detach.
             if (m_canvasBase.size() != QSize(m_canvasWidth, m_canvasHeight)
                 || m_canvasBase.format() != QImage::Format_ARGB32_Premultiplied) {
                 m_canvasBase = QImage(m_canvasWidth, m_canvasHeight,
@@ -2065,7 +2066,7 @@ void VideoPlayer::handlePlaybackTick()
             // on the GL viewport — composite branch sets it to identity to
             // keep the baked transform from being applied twice, but we're
             // back on the raw V1 frame now so V1 has to carry its own
-            // transform again or it snaps to identity (CRIT-3).
+            // transform again or it snaps to identity.
             if (m_glPreview && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
                 const auto &v1e = m_sequence[m_activeEntry];
                 m_glPreview->setVideoSourceTransform(v1e.videoScale, v1e.videoDx, v1e.videoDy);
@@ -2183,10 +2184,10 @@ VideoPlayer::TrackDecoder *VideoPlayer::acquireDecoderForClip(const PlaybackEntr
     }
 
     if (evictedClipId != -1) {
-        // cpp-MEDIUM: look the evicted slot up in the reverse map instead
-        // of re-hashing every TrackKey and comparing the hash. The previous
-        // re-hash compare evicted the wrong decoder on hash collisions
-        // (same int packing for two different keys).
+        // Look the evicted slot up in the reverse map instead of
+        // re-hashing every TrackKey and comparing the hash — re-hash
+        // compare evicts the wrong decoder on any hash collision (same
+        // int packing for two different keys).
         auto kit = m_slotIdToKey.find(evictedClipId);
         if (kit != m_slotIdToKey.end()) {
             const TrackKey evictedKey = kit.value();
@@ -2427,12 +2428,12 @@ VideoPlayer::TrackDecoder *VideoPlayer::openTrackDecoder(const PlaybackEntry &en
     }
     d->currentPositionUs = clipInUs;
 
-    // Race fix (B10): performPendingSeek() may have already set
-    // m_postSeekResyncRequested before this fresh decoder existed. The flag
-    // is cleared on the next handlePlaybackTick — any decoder opened in
-    // that window would otherwise miss the firstFrameDecoded reset and
-    // skip its catch-up loop on the very first harvest. Mirror the flag
-    // here so the new decoder is treated like every other pool decoder.
+    // performPendingSeek() may have already set m_postSeekResyncRequested
+    // before this fresh decoder existed. The flag is cleared on the next
+    // handlePlaybackTick — any decoder opened in that window would
+    // otherwise miss the firstFrameDecoded reset and skip its catch-up
+    // loop on the very first harvest. Mirror the flag here so the new
+    // decoder is treated like every other pool decoder.
     if (m_postSeekResyncRequested) {
         d->firstFrameDecoded = false;
     }
@@ -2504,16 +2505,14 @@ QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
     if (v1Frame.isNull() || overlayLayers.isEmpty())
         return v1Frame;
 
-    // B3 fix: write canvas-relative dst rects directly (no translate/scale
-    // around source center) so the geometry matches GLPreview's
-    // setVideoSourceTransform exactly. dx/dy are in normalized canvas
-    // units (0..1); positive dy moves the layer DOWN. QImage Y is
-    // top-down so a larger cy paints further down the canvas. That
-    // matches GL's user-facing dy direction: in paintGL, positive dy
-    // decreases viewportY, which on an OpenGL Y-up framebuffer puts
-    // the rendered region nearer the bottom = lower on screen. The
-    // QImage Y-top-down direction therefore matches the GL
-    // viewportY-down direction for the user-facing dy semantics.
+    // Write canvas-relative dst rects directly (no translate/scale stack)
+    // so the geometry matches GLPreview's setVideoSourceTransform 1:1.
+    // dx/dy are normalized canvas units (0..1); positive dy moves the
+    // layer DOWN visually. QImage Y is top-down so a larger cy paints
+    // further down the canvas — and in paintGL positive dy decreases
+    // viewportY, which on an OpenGL Y-up framebuffer puts the rendered
+    // region nearer the bottom of the screen. Both pipelines therefore
+    // agree on the user-facing dy direction with `cy = h/2 + dy * h`.
     // We fill the entire canvas rect with the (scaled) layer image so a
     // 100% opaque base layer paints over the canvas just like GL does.
     QImage composed = v1Frame.convertToFormat(QImage::Format_ARGB32_Premultiplied);
@@ -2550,20 +2549,22 @@ bool VideoPlayer::decodePoolFrame(TrackDecoder *d)
         return false;
 
     const auto receiveFrame = [this, d]() -> bool {
-        // B6 fix: avcodec_receive_frame doesn't always reset the frame
-        // before writing — leftover side-data buffers from a prior frame
-        // can leak the HW-frame ref it overwrites. Explicit unref makes
-        // the contract symmetric with av_read_frame / av_packet_unref.
+        // avcodec_receive_frame doesn't always reset the frame before
+        // writing — leftover side-data buffers from a prior frame can
+        // leak the HW-frame ref it overwrites. Explicit unref makes the
+        // contract symmetric with av_read_frame / av_packet_unref.
         av_frame_unref(d->frame);
         const int receiveResult = avcodec_receive_frame(d->codecCtx, d->frame);
         if (receiveResult != 0)
             return false;
 
-        // Compute file-local position in microseconds. We DO NOT commit it
-        // to d->currentPositionUs here — see the bottom of the lambda. The
-        // commit is gated on sws_scale success so any failure path between
-        // here and there leaves currentPositionUs at its pre-call value
-        // (B8: stale-position leak when HW transfer / sws fails halfway).
+        // Compute file-local position in microseconds. We do NOT commit
+        // it to d->currentPositionUs here — see the bottom of the lambda.
+        // The commit is gated on sws_scale success so any failure path
+        // between here and there leaves currentPositionUs at its pre-call
+        // value; otherwise a HW-transfer or sws_scale hiccup advances the
+        // anchor past the real frame and harvest's drift gate stops being
+        // able to detect that the decoder is stuck.
         AVStream *stream = d->formatCtx->streams[d->videoStreamIndex];
         const int64_t bestEffortTimestamp =
             (d->frame->best_effort_timestamp != AV_NOPTS_VALUE)
@@ -2691,8 +2692,8 @@ bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, Decode
         // Fresh decoder with no successful decode yet — try the eviction
         // grace pool for the same identity. Match the TrackKey contract
         // exactly: sourceTrack + sourceClipIndex + qRound64(clipIn*1000)
-        // + filePath. Mixing qFuzzyCompare here would re-introduce the
-        // hash/equality skew MAJ-1 fixed at the TrackKey level.
+        // + filePath. Using qFuzzyCompare on raw doubles here would
+        // re-introduce the hash/equality skew that breaks QHash's contract.
         const qint64 eClipMs = qRound64(e.clipIn * 1000.0);
         for (TrackDecoder *g : m_evictionGracePool) {
             if (!g)
