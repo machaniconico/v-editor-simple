@@ -294,6 +294,7 @@ void ProxyManager::processNextInQueue()
 
     m_currentClipName = QFileInfo(originalPath).fileName();
     m_currentSourceDurationUs = probeDurationUs(originalPath);
+    const QString srcCodec = probeSourceCodec(originalPath);
     m_cancelRequested = false;
     emit proxyStarted(m_currentClipName);
     if (m_currentSourceDurationUs <= 0) {
@@ -313,10 +314,41 @@ void ProxyManager::processNextInQueue()
 #endif
             jobEncoder = "libx264";
     }
-    appendEncoderLog(QString("[%1] job source=%2 encoder=%3")
+
+    // Pick the matching hardware decoder for this source codec when the
+    // encoder branch is GPU. -hwaccel <api> alone tells ffmpeg "you may use
+    // <api>" but doesn't override the decoder selection — AV1 sources still
+    // route through libdav1d unless we explicitly say -c:v av1_cuvid. The
+    // helpers fall back to QString() when probe fails or the decoder isn't
+    // built into ffmpeg, in which case we don't inject anything and let
+    // ffmpeg's default decoder run (no regression vs Phase 3).
+    //
+    // Known cuvid limitations (consumer NVDEC silently rejects these):
+    //  - h264_cuvid: H.264 Hi10P (10-bit) and High 4:4:4 Predictive
+    //  - hevc_cuvid: HEVC Main 4:4:4 and some HDR10+ streams
+    //  - av1_cuvid:  AV1 8/10-bit OK on Ampere+; 12-bit profiles unsupported
+    // ffmpeg exits non-zero in those cases; the proxy job is marked Error,
+    // partial output is removed, and the queue continues with the next clip.
+    auto resolveHwDecoder = [&srcCodec](const char *suffix) -> QString {
+        if (srcCodec.isEmpty()) return QString();
+        static const QStringList supported = {"av1", "h264", "hevc", "vp9"};
+        if (!supported.contains(srcCodec)) return QString();
+        const QString candidate = srcCodec + QLatin1Char('_') + QLatin1String(suffix);
+        return ffmpegHasDecoder(candidate) ? candidate : QString();
+    };
+    const QString cuvidDec = (jobGpuEnc == "h264_nvenc") ? resolveHwDecoder("cuvid") : QString();
+    const QString qsvDec   = (jobGpuEnc == "h264_qsv")   ? resolveHwDecoder("qsv")   : QString();
+    const QString jobDecoder =
+        !cuvidDec.isEmpty() ? cuvidDec :
+        !qsvDec.isEmpty()   ? qsvDec   :
+        srcCodec.isEmpty()  ? QStringLiteral("<probe-failed>") :
+                              QStringLiteral("<default>");
+
+    appendEncoderLog(QString("[%1] job source=%2 encoder=%3 decoder=%4")
                      .arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate),
                           m_currentClipName,
-                          jobEncoder));
+                          jobEncoder,
+                          jobDecoder));
 
     m_process = new QProcess(this);
 
@@ -336,9 +368,14 @@ void ProxyManager::processNextInQueue()
         // Full CUDA pipeline: NVDEC decode → scale_cuda → NVENC encode, no
         // VRAM↔RAM round-trips. Crucial on long sources where software decode
         // and scale would dominate wall-clock even with NVENC encode.
+        // The cuvid decoder must be named explicitly: -hwaccel cuda alone
+        // doesn't override decoder selection, so AV1/HEVC/VP9 sources would
+        // otherwise fall back to libdav1d / libx265 / libvpx.
         args << "-hwaccel" << "cuda"
-             << "-hwaccel_output_format" << "cuda"
-             << "-i" << originalPath
+             << "-hwaccel_output_format" << "cuda";
+        if (!cuvidDec.isEmpty())
+            args << "-c:v" << cuvidDec;
+        args << "-i" << originalPath
              << "-vf" << QString("scale_cuda=%1").arg(scaleSize)
              << "-c:v" << "h264_nvenc"
              << "-preset" << "p1"
@@ -349,9 +386,12 @@ void ProxyManager::processNextInQueue()
              << entry.proxyPath;
     } else if (gpuEnc == "h264_qsv") {
         // Full QSV pipeline: Intel hardware decode → scale_qsv → QSV encode.
+        // Per-source qsv decoder is needed for the same reason as cuvid.
         args << "-hwaccel" << "qsv"
-             << "-hwaccel_output_format" << "qsv"
-             << "-i" << originalPath
+             << "-hwaccel_output_format" << "qsv";
+        if (!qsvDec.isEmpty())
+            args << "-c:v" << qsvDec;
+        args << "-i" << originalPath
              << "-vf" << QString("scale_qsv=%1").arg(scaleSize)
              << "-c:v" << "h264_qsv"
              << "-preset" << "veryfast"
