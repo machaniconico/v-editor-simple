@@ -121,12 +121,12 @@ void VideoPlayer::setupUI()
 
     m_videoDisplay = new QLabel(this);
     m_videoDisplay->setAlignment(Qt::AlignCenter);
-    m_videoDisplay->setMinimumSize(800, 450);
+    m_videoDisplay->setMinimumSize(480, 270);
     m_videoDisplay->setText("Drop a video file or use File > Open");
     m_videoDisplay->setStyleSheet("background-color: #1a1a1a; color: #888; font-size: 16px;");
 
     m_glPreview = new GLPreview(this);
-    m_glPreview->setMinimumSize(640, 360);
+    m_glPreview->setMinimumSize(384, 216);
     connect(m_glPreview, &GLPreview::textRectRequested,
             this, &VideoPlayer::textRectRequested);
     connect(m_glPreview, &GLPreview::textInlineCommitted,
@@ -2001,34 +2001,46 @@ void VideoPlayer::handlePlaybackTick()
         // entry's transform into the canvas via a base layer, and (b)
         // reset GL viewport to identity so it doesn't apply the same
         // transform a second time on top of the already-baked composite.
+        // Build the layer list. The legacy decoder owns whichever entry is
+        // currently m_activeEntry (sorted V1-first, so usually V1 — but in
+        // a V1-gap V2-active section it can be V2). All other active
+        // entries come from the pool via harvestOverlayLayer.
         QVector<DecodedLayer> layers;
-        layers.reserve(activeIdxs.size() + 1);
-        if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
-            const auto &v1e = m_sequence[m_activeEntry];
-            DecodedLayer v1Layer;
-            v1Layer.rgb = m_lastV1RawFrame;
-            v1Layer.opacity = 1.0;
-            v1Layer.videoScale = v1e.videoScale;
-            v1Layer.videoDx = v1e.videoDx;
-            v1Layer.videoDy = v1e.videoDy;
-            v1Layer.sourceTrack = 0;
-            v1Layer.sequenceIdx = m_activeEntry;
-            v1Layer.isFresh = true;
-            layers.append(v1Layer);
-        }
+        layers.reserve(activeIdxs.size());
         bool overlayPresent = false;
         for (int idx : activeIdxs) {
             if (idx < 0 || idx >= m_sequence.size())
                 continue;
             const auto &e = m_sequence[idx];
-            if (e.sourceTrack == 0)
-                continue;  // V1 already added above
             DecodedLayer layer;
-            if (harvestOverlayLayer(e, idx, &layer)) {
-                layers.append(layer);
-                overlayPresent = true;
+            if (idx == m_activeEntry) {
+                if (m_lastV1RawFrame.isNull())
+                    continue;
+                layer.rgb = m_lastV1RawFrame;
+                layer.isFresh = true;
+            } else {
+                if (!harvestOverlayLayer(e, idx, &layer))
+                    continue;
             }
+            layer.opacity = e.opacity;
+            layer.videoScale = e.videoScale;
+            layer.videoDx = e.videoDx;
+            layer.videoDy = e.videoDy;
+            layer.sourceTrack = e.sourceTrack;
+            layer.sequenceIdx = idx;
+            layers.append(layer);
+            if (e.sourceTrack > 0)
+                overlayPresent = true;
         }
+        // V1-wins paint order: higher sourceTrack = back, V1 (sourceTrack 0)
+        // = front. Sort DESCENDING by sourceTrack so V_max paints first into
+        // the canvas and V1 paints last on top — V1 covers V2 wherever V1
+        // has opaque pixels, V2 fills V1's gaps and shows through V1's
+        // per-clip opacity.
+        std::sort(layers.begin(), layers.end(),
+                  [](const DecodedLayer &a, const DecodedLayer &b) {
+                      return a.sourceTrack > b.sourceTrack;
+                  });
         if (overlayPresent) {
             // Reuse a canvas-sized scratch buffer so we don't allocate
             // ~8MB (1080p ARGB) every tick. Re-allocates only when the
@@ -2153,9 +2165,13 @@ void VideoPlayer::handlePlaybackTick()
 
 VideoPlayer::TrackDecoder *VideoPlayer::acquireDecoderForClip(const PlaybackEntry &entry)
 {
-    // V1 stays on the legacy decoder path — never poolable.
-    if (entry.sourceTrack == 0)
-        return nullptr;
+    // The active sequence entry (m_activeEntry) is owned by the legacy
+    // decoder; the layer-construction loop in handlePlaybackTick gates
+    // that case before calling here. Every other active entry — including
+    // V1 entries that aren't the active one (Scenario: V2 starts earlier
+    // than V1 so m_sequence sorts V2 first; m_activeEntry tracks V2 even
+    // while V1 overlaps) — goes through the pool so V1 can still paint
+    // last in V1-wins ordering.
     if (entry.filePath.isEmpty())
         return nullptr;
 

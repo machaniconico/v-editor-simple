@@ -15,7 +15,7 @@ struct PlaybackEntry {
     double timelineStart = 0.0;  // Where this entry begins on the timeline, seconds
     double timelineEnd = 0.0;    // Where this entry ends on the timeline (exclusive), seconds
     double speed = 1.0;          // Playback speed multiplier (>0)
-    int sourceTrack = 0;         // 0 = V1, 1 = V2, ... (higher = front in stacking)
+    int sourceTrack = 0;         // 0 = V1 (front, on top), 1 = V2, ... (higher = back) — V1-wins stacking
     bool audioMuted = false;     // Audio for this entry is muted (corresponding A track muted)
     // US-T35 per-clip video source transform, copied from ClipInfo at
     // Timeline::buildPlaybackEntries time. Applied by VideoPlayer when
