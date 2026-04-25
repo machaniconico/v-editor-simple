@@ -19,19 +19,29 @@
 #include "DecoderSlotManager.h"
 
 // Identifies a per-clip decoder in the V2+ pool. Keyed on
-// (filePath, clipIn, sourceTrack) so the key stays stable across
-// Timeline::sequenceChanged re-emits AND across clip reorders (which would
-// shift sourceClipIndex even when the underlying file/clipIn pair is
-// unchanged). V1 (sourceTrack == 0) is *never* keyed into the pool — it
-// stays on the legacy single-decoder path (m_formatCtx/m_codecCtx).
+// (filePath, clipInMs, sourceTrack, sourceClipIndex) so:
+//   - the key stays stable across Timeline::sequenceChanged re-emits;
+//   - importing the same file with the same trim onto the same track
+//     twice does NOT collide (each ClipInfo carries its own
+//     sourceClipIndex, so two distinct clips own two distinct decoders
+//     instead of stealing each other's slot — MAJ-6);
+//   - clipIn is quantized to 1ms (qint64) so operator== and qHash use
+//     IDENTICAL bucketing (MAJ-1: previous version mixed qFuzzyCompare
+//     with int(clipIn*1000), and the 1.9999999999 / 2.0000000001 case
+//     compared equal but hashed differently, breaking the QHash
+//     contract).
+// V1 (sourceTrack == 0) is *never* keyed into the pool — it stays on
+// the legacy single-decoder path (m_formatCtx/m_codecCtx).
 struct TrackKey {
     QString filePath;
-    double clipIn = 0.0;
+    qint64 clipInMs = 0;        // qRound64(clipIn * 1000.0) — 1ms precision
     int sourceTrack = 0;
+    int sourceClipIndex = -1;   // disambiguates same file+trim+track on different clips
     bool operator==(const TrackKey &other) const noexcept
     {
         return sourceTrack == other.sourceTrack
-            && qFuzzyCompare(clipIn + 1.0, other.clipIn + 1.0)
+            && sourceClipIndex == other.sourceClipIndex
+            && clipInMs == other.clipInMs
             && filePath == other.filePath;
     }
 };
@@ -40,7 +50,8 @@ inline uint qHash(const TrackKey &k, uint seed = 0) noexcept
 {
     return qHash(k.filePath, seed)
          ^ qHash(k.sourceTrack, seed + 0x9e3779b9u)
-         ^ qHash(static_cast<int>(k.clipIn * 1000.0), seed + 0x517cc1b7u);
+         ^ qHash(k.clipInMs, seed + 0x517cc1b7u)
+         ^ qHash(k.sourceClipIndex, seed + 0x85ebca6bu);
 }
 
 class GLPreview;
@@ -361,6 +372,14 @@ private:
     // step in handlePlaybackTick can blend overlays on top before pushing
     // the final image to the GLPreview.
     bool m_deferDisplayThisTick = false;
+    // CRIT-3: remembers whether the previous tick took the compositor
+    // path. When the compositor path runs we force the GL viewport to
+    // identity (1,0,0) so V1's transform isn't applied twice on top of an
+    // already-baked composite. The next non-composite tick has to undo
+    // that — push V1's own scale/dx/dy back into the GL viewport before
+    // displayFrame ships the raw V1 frame, otherwise V1 snaps to identity
+    // the moment the overlay ends.
+    bool m_lastTickWasComposite = false;
     // After preview/seek completes the V2+ pool decoders may still hold
     // stale lastFrameRgb / currentPositionUs values. This flag asks the
     // next handlePlaybackTick to re-seed them by clearing firstFrameDecoded
@@ -401,6 +420,12 @@ private:
     // dedicated field instead so multi-track ticks never paint overlays
     // on top of a previously-composited frame (B7 double-bake fix).
     QImage m_lastV1RawFrame;
+    // MAJ-5: persistent canvas-sized scratch buffer for the compositor.
+    // Re-allocated only on canvas size / format change; refilled with
+    // black every compositor tick. Avoids ~8MB ARGB allocations per tick
+    // at 1080p which under playback cadence (60fps) translated to
+    // hundreds of MB/s of allocator pressure.
+    QImage m_canvasBase;
     // Overlay index to skip during compose (-1 = none), toggled by
     // GLPreview edit-started/ended signals.
     int m_hiddenTextOverlayIndex = -1;
@@ -415,9 +440,15 @@ private:
     int m_proxyDivisor = 1;
 
     // ---- Per-clip decoder pool state (V2+ only) -----------------------------
-    // Active V2+ decoders, keyed on (sourceClipIndex, sourceTrack). V1
-    // never lives here — it stays on m_formatCtx/m_codecCtx.
+    // Active V2+ decoders, keyed on TrackKey. V1 never lives here — it
+    // stays on m_formatCtx/m_codecCtx.
     QHash<TrackKey, TrackDecoder*> m_trackDecoders;
+    // cpp-MEDIUM: reverse lookup from DecoderSlotManager's int slotClipId
+    // back to the TrackKey that originally claimed the slot. Without this,
+    // eviction had to walk m_trackDecoders comparing qHash(it.key()) to
+    // evictedClipId — a hash collision would evict the wrong decoder.
+    // Maintained alongside m_trackDecoders insert/erase.
+    QHash<int, TrackKey> m_slotIdToKey;
     // Bounded grace pool for evicted decoders. Each entry counts down
     // graceTtlTicks per playback tick; when it reaches 0 the decoder
     // is freed. Capped at 4 entries — newer evictions push older ones

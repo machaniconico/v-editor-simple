@@ -453,7 +453,8 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         for (const auto &e : entries) {
             if (e.sourceTrack == 0)
                 continue;  // V1 stays on the legacy decoder, never pooled
-            newKeys.insert(TrackKey{e.filePath, e.clipIn, e.sourceTrack});
+            newKeys.insert(TrackKey{e.filePath, qRound64(e.clipIn * 1000.0),
+                                    e.sourceTrack, e.sourceClipIndex});
         }
         for (auto it = m_trackDecoders.begin(); it != m_trackDecoders.end(); ) {
             const TrackKey &k = it.key();
@@ -464,6 +465,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
             TrackDecoder *d = it.value();
             const int slotClipId = static_cast<int>(qHash(k));
             m_slotManager.releaseSlot(slotClipId);
+            m_slotIdToKey.remove(slotClipId);
             it = m_trackDecoders.erase(it);
             if (d) {
                 d->graceTtlTicks = 4;
@@ -485,6 +487,11 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         // identity instead of inheriting the last clip's scale/offset.
         if (m_glPreview)
             m_glPreview->resetVideoSourceTransform();
+        // CRIT-1: drop the cached compositor base on Timeline-empty too.
+        // Otherwise a re-import after clearing keeps the previous V1 frame
+        // around and the first compositor tick on the new clip flashes
+        // the stale picture (paired with resetDecoder's clear).
+        m_lastV1RawFrame = QImage();
         return;
     }
 
@@ -1422,6 +1429,13 @@ void VideoPlayer::resetDecoder()
         av_buffer_unref(&m_hwDeviceCtx);
     m_hwPixFmt = AV_PIX_FMT_NONE;
 
+    // CRIT-1: drop the cached compositor base too. Otherwise the next
+    // tick after a clip switch (advanceToEntry → loadFile → resetDecoder
+    // → fresh decode) hands the compositor the PREVIOUS clip's V1 frame
+    // as the canvas base, so the user briefly sees the old clip behind
+    // any V2+ overlays.
+    m_lastV1RawFrame = QImage();
+
     updatePlayButton();
     if (!m_suppressUiUpdates)
         m_seekBar->setRange(0, 0);
@@ -1944,6 +1958,19 @@ void VideoPlayer::handlePlaybackTick()
                                && hasOverlayActive(findActiveEntriesAt(m_timelinePositionUs));
     m_deferDisplayThisTick = willComposite;
 
+    // CRIT-3: when leaving the compositor path, restore the V1 entry's
+    // OBS-style transform on the GL viewport. The compositor reset it to
+    // identity (1,0,0) so the canvas-final composite isn't transformed
+    // again on top — but a non-composite tick ships the raw V1 frame
+    // straight to GL, so the viewport has to carry V1's scale/dx/dy or
+    // V1 snaps to identity the instant the overlay ends.
+    if (m_lastTickWasComposite && !willComposite && m_glPreview
+        && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+        const auto &v1e = m_sequence[m_activeEntry];
+        m_glPreview->setVideoSourceTransform(v1e.videoScale, v1e.videoDx, v1e.videoDy);
+    }
+    m_lastTickWasComposite = willComposite;
+
     bool advanced = false;
     if (m_playbackSpeed >= 0.0) {
         // Drift correction runs BEFORE the display decode so the frame the
@@ -2002,25 +2029,47 @@ void VideoPlayer::handlePlaybackTick()
             }
         }
         if (overlayPresent) {
-            // Canvas-sized base. Black background — the V1 layer paints on
-            // top with its own scale/translate, mirroring what GL would do.
-            QImage canvasBase(m_canvasWidth, m_canvasHeight,
-                              QImage::Format_ARGB32_Premultiplied);
-            if (canvasBase.isNull()) {
+            // MAJ-5: keep a canvas-sized scratch buffer on the player so
+            // we don't allocate ~8MB (1080p ARGB) every tick. Re-allocates
+            // only when the canvas size or format changes; otherwise we
+            // just refill it with black. composeMultiTrackFrame still
+            // promotes through convertToFormat, but starting with a
+            // matching format keeps that to a no-op detach.
+            if (m_canvasBase.size() != QSize(m_canvasWidth, m_canvasHeight)
+                || m_canvasBase.format() != QImage::Format_ARGB32_Premultiplied) {
+                m_canvasBase = QImage(m_canvasWidth, m_canvasHeight,
+                                      QImage::Format_ARGB32_Premultiplied);
+            }
+            if (m_canvasBase.isNull()) {
                 // Allocation failed (extreme — e.g. canvas not yet known).
-                // Fall back to legacy V1-only display.
+                // Fall back to legacy V1-only display, including the
+                // viewport restore so V1 keeps its own scale/dx/dy
+                // instead of staying on the compositor's identity reset.
+                if (m_glPreview && m_activeEntry >= 0
+                    && m_activeEntry < m_sequence.size()) {
+                    const auto &v1e = m_sequence[m_activeEntry];
+                    m_glPreview->setVideoSourceTransform(
+                        v1e.videoScale, v1e.videoDx, v1e.videoDy);
+                }
                 displayFrame(m_lastV1RawFrame);
             } else {
-                canvasBase.fill(Qt::black);
-                const QImage composed = composeMultiTrackFrame(canvasBase, layers);
+                m_canvasBase.fill(Qt::black);
+                const QImage composed = composeMultiTrackFrame(m_canvasBase, layers);
                 if (m_glPreview)
                     m_glPreview->setVideoSourceTransform(1.0, 0.0, 0.0);
                 displayFrame(composed);
             }
         } else {
             // Every overlay bailed (decoder open failed, slot exhausted).
-            // Fall back to the V1-only display so GL re-applies V1's
-            // transform on the raw V1 frame.
+            // Fall back to the V1-only display, and restore V1's transform
+            // on the GL viewport — composite branch sets it to identity to
+            // keep the baked transform from being applied twice, but we're
+            // back on the raw V1 frame now so V1 has to carry its own
+            // transform again or it snaps to identity (CRIT-3).
+            if (m_glPreview && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+                const auto &v1e = m_sequence[m_activeEntry];
+                m_glPreview->setVideoSourceTransform(v1e.videoScale, v1e.videoDx, v1e.videoDy);
+            }
             displayFrame(m_lastV1RawFrame);
         }
     }
@@ -2109,7 +2158,8 @@ VideoPlayer::TrackDecoder *VideoPlayer::acquireDecoderForClip(const PlaybackEntr
     if (entry.filePath.isEmpty())
         return nullptr;
 
-    const TrackKey key{entry.filePath, entry.clipIn, entry.sourceTrack};
+    const TrackKey key{entry.filePath, qRound64(entry.clipIn * 1000.0),
+                       entry.sourceTrack, entry.sourceClipIndex};
 
     // DecoderSlotManager indexes by a single int. Hash the TrackKey down to
     // a 32-bit slot id — qHash gives us a path/clipIn-stable identifier
@@ -2133,19 +2183,22 @@ VideoPlayer::TrackDecoder *VideoPlayer::acquireDecoderForClip(const PlaybackEntr
     }
 
     if (evictedClipId != -1) {
-        // Find the TrackDecoder whose qHash(key) maps to evictedClipId and
-        // move it to the grace pool. We re-hash each entry's key to compare
-        // — same packing as the slotClipId computation above.
-        for (auto it = m_trackDecoders.begin(); it != m_trackDecoders.end(); ++it) {
-            const int packed = static_cast<int>(qHash(it.key()));
-            if (packed == evictedClipId) {
-                TrackDecoder *evicted = it.value();
-                m_trackDecoders.erase(it);
+        // cpp-MEDIUM: look the evicted slot up in the reverse map instead
+        // of re-hashing every TrackKey and comparing the hash. The previous
+        // re-hash compare evicted the wrong decoder on hash collisions
+        // (same int packing for two different keys).
+        auto kit = m_slotIdToKey.find(evictedClipId);
+        if (kit != m_slotIdToKey.end()) {
+            const TrackKey evictedKey = kit.value();
+            m_slotIdToKey.erase(kit);
+            auto dit = m_trackDecoders.find(evictedKey);
+            if (dit != m_trackDecoders.end()) {
+                TrackDecoder *evicted = dit.value();
+                m_trackDecoders.erase(dit);
                 if (evicted) {
                     evicted->graceTtlTicks = 4;
                     m_evictionGracePool.append(evicted);
                 }
-                break;
             }
         }
     }
@@ -2164,6 +2217,7 @@ VideoPlayer::TrackDecoder *VideoPlayer::acquireDecoderForClip(const PlaybackEntr
         return nullptr;
     }
     m_trackDecoders.insert(key, fresh);
+    m_slotIdToKey.insert(slotClipId, key);
     return fresh;
 }
 
@@ -2177,6 +2231,7 @@ void VideoPlayer::releaseDecoderForClip(const TrackKey &key)
 
     const int slotClipId = static_cast<int>(qHash(key));
     m_slotManager.releaseSlot(slotClipId);
+    m_slotIdToKey.remove(slotClipId);
 
     // Synchronous teardown is OK here: callers reach this path from
     // setSequence reconciliation or explicit clip removal — never from
@@ -2197,6 +2252,7 @@ void VideoPlayer::clearAllPoolDecoders()
         delete d;
     }
     m_trackDecoders.clear();
+    m_slotIdToKey.clear();
 
     for (TrackDecoder *d : m_evictionGracePool) {
         if (!d)
@@ -2451,8 +2507,13 @@ QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
     // B3 fix: write canvas-relative dst rects directly (no translate/scale
     // around source center) so the geometry matches GLPreview's
     // setVideoSourceTransform exactly. dx/dy are in normalized canvas
-    // units (0..1); positive dy moves the layer UP because the GL viewport
-    // path inverts Y (see paintGL: viewportY = baseCy - offsetPxY - newH/2).
+    // units (0..1); positive dy moves the layer DOWN. QImage Y is
+    // top-down so a larger cy paints further down the canvas. That
+    // matches GL's user-facing dy direction: in paintGL, positive dy
+    // decreases viewportY, which on an OpenGL Y-up framebuffer puts
+    // the rendered region nearer the bottom = lower on screen. The
+    // QImage Y-top-down direction therefore matches the GL
+    // viewportY-down direction for the user-facing dy semantics.
     // We fill the entire canvas rect with the (scaled) layer image so a
     // 100% opaque base layer paints over the canvas just like GL does.
     QImage composed = v1Frame.convertToFormat(QImage::Format_ARGB32_Premultiplied);
@@ -2467,7 +2528,7 @@ QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
         const double w  = canvas.width()  * L.videoScale;
         const double h  = canvas.height() * L.videoScale;
         const double cx = canvas.width()  * 0.5 + L.videoDx * canvas.width();
-        const double cy = canvas.height() * 0.5 - L.videoDy * canvas.height();
+        const double cy = canvas.height() * 0.5 + L.videoDy * canvas.height();
         const QRectF dst(cx - w * 0.5, cy - h * 0.5, w, h);
         p.setOpacity(qBound(0.0, L.opacity, 1.0));
         p.drawImage(dst, L.rgb);
@@ -2628,13 +2689,17 @@ bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, Decode
         out->isFresh = ok;
     } else {
         // Fresh decoder with no successful decode yet — try the eviction
-        // grace pool for the same (filePath, clipIn, track). Not common
-        // but it keeps the overlay visible across reconciliation churn.
+        // grace pool for the same identity. Match the TrackKey contract
+        // exactly: sourceTrack + sourceClipIndex + qRound64(clipIn*1000)
+        // + filePath. Mixing qFuzzyCompare here would re-introduce the
+        // hash/equality skew MAJ-1 fixed at the TrackKey level.
+        const qint64 eClipMs = qRound64(e.clipIn * 1000.0);
         for (TrackDecoder *g : m_evictionGracePool) {
             if (!g)
                 continue;
             if (g->sourceTrack == e.sourceTrack
-                && qFuzzyCompare(g->clipIn + 1.0, e.clipIn + 1.0)
+                && g->sourceClipIndex == e.sourceClipIndex
+                && qRound64(g->clipIn * 1000.0) == eClipMs
                 && g->filePath == e.filePath
                 && !g->lastFrameRgb.isNull()) {
                 out->rgb     = g->lastFrameRgb;
