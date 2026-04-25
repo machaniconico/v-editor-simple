@@ -110,6 +110,13 @@ void ProxyManagementDialog::refreshTable()
             ProxyManager::instance().deleteProxy(origPath);
             refreshTable();
         });
+        // Block deletes while a job is in flight: the ffmpeg finished-lambda
+        // bails out on `m_entries.contains()` and would leave a half-written
+        // file orphaned on disk. Use the cancel dialog to abort instead.
+        if (entry.status == ProxyStatus::Generating) {
+            delBtn->setEnabled(false);
+            delBtn->setToolTip(QStringLiteral("生成中はキャンセルダイアログから停止してください"));
+        }
         m_table->setCellWidget(row, 5, delBtn);
     }
 

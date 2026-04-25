@@ -273,9 +273,13 @@ void ProxyManager::loadIndex()
                 legacy.close();
                 QFile dst(indexPath);
                 if (dst.open(QIODevice::WriteOnly)) {
-                    dst.write(content);
+                    const qint64 written = dst.write(content);
                     dst.close();
-                    QFile::remove(legacyPath);
+                    // Only delete the legacy file once we have proof the
+                    // new copy holds the full payload. A short write (e.g.
+                    // disk full) would otherwise wipe the index entirely.
+                    if (written == content.size())
+                        QFile::remove(legacyPath);
                 }
             }
         }
@@ -841,7 +845,13 @@ QString ProxyManager::chosenGpuH264Encoder()
 
 void ProxyManager::appendEncoderLog(const QString &line)
 {
-    QFile f(proxyDir() + "/encoder_log.txt");
+    // Pin the encoder log next to proxy_index.json (AppLocalDataLocation),
+    // not under proxyDir(). Otherwise switching the user-configurable
+    // storageDir would fragment diagnostic history across folders and
+    // hide older entries from anyone tailing the same file.
+    const QString logPath =
+        QFileInfo(proxyIndexPath()).absolutePath() + "/encoder_log.txt";
+    QFile f(logPath);
     if (!f.open(QIODevice::Append | QIODevice::Text))
         return;
     QTextStream out(&f);
