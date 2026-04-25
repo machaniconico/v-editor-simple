@@ -113,6 +113,15 @@ private:
     // the same source can be re-queued and ffprobe spawn is ~200 ms.
     static qint64 probeDurationUs(const QString &path);
 
+    // Spawn ffprobe to read the source's first video stream codec name
+    // (e.g. "av1", "h264", "hevc", "vp9"). Used by the GPU encoder branches
+    // to inject the matching cuvid/qsv decoder before -i so the input is
+    // hardware-decoded instead of falling back to libdav1d / libx264 etc.
+    // Returns an empty QString on any probe failure or when ffprobe is not
+    // on PATH; callers should treat empty as "skip decoder injection and let
+    // ffmpeg pick the default". Result is cached per path.
+    static QString probeSourceCodec(const QString &path);
+
     // Probe the runtime ffmpeg.exe for the first available GPU H.264 encoder
     // in the order h264_nvenc → h264_qsv → h264_amf (typical throughput
     // ranking on consumer hardware). Returns the encoder name or an empty

@@ -1,4 +1,12 @@
 #include "ProxyManager.h"
+
+namespace {
+// Shared between probeDurationUs and probeSourceCodec — once we learn
+// ffprobe is missing from PATH, every subsequent probe (regardless of which
+// helper) skips its 2 s waitForStarted timeout.
+bool g_ffprobeMissing = false;
+}
+
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -536,10 +544,10 @@ qint64 ProxyManager::probeDurationUs(const QString &path)
     // Cache per source path — same file may be re-queued (settings change,
     // user toggles proxy mode, etc.) and ffprobe spawn is ~200 ms.
     static QHash<QString, qint64> cache;
-    // Mirrors the probeBroken pattern in ffmpegHasEncoder: once we learn
-    // ffprobe is not on PATH, stop burning a 2 s waitForStarted per clip.
-    static bool ffprobeMissing = false;
-    if (ffprobeMissing)
+    // ffprobe-missing flag is shared with probeSourceCodec (file-scope
+    // namespace above) so the second helper doesn't re-pay the 2 s spawn
+    // timeout on the same machine.
+    if (g_ffprobeMissing)
         return 0;
 
     auto it = cache.constFind(path);
@@ -554,7 +562,7 @@ qint64 ProxyManager::probeDurationUs(const QString &path)
          << path;
     probe.start("ffprobe", args);
     if (!probe.waitForStarted(2000)) {
-        ffprobeMissing = true;
+        g_ffprobeMissing = true;
         cache.insert(path, 0);
         return 0;
     }
@@ -579,6 +587,49 @@ qint64 ProxyManager::probeDurationUs(const QString &path)
     const qint64 us = static_cast<qint64>(seconds * 1'000'000.0);
     cache.insert(path, us);
     return us;
+}
+
+QString ProxyManager::probeSourceCodec(const QString &path)
+{
+    // Same caching shape as probeDurationUs — re-queues are common (settings
+    // change, proxy mode toggle, etc.) and an ffprobe spawn is ~200 ms.
+    static QHash<QString, QString> cache;
+    // Share the ffprobe-missing flag with probeDurationUs so we don't
+    // re-burn the 2 s waitForStarted on a machine without ffprobe.
+    if (g_ffprobeMissing)
+        return QString();
+
+    auto it = cache.constFind(path);
+    if (it != cache.constEnd())
+        return it.value();
+
+    QProcess probe;
+    QStringList args;
+    args << "-v" << "error"
+         << "-select_streams" << "v:0"
+         << "-show_entries" << "stream=codec_name"
+         << "-of" << "default=noprint_wrappers=1:nokey=1"
+         << path;
+    probe.start("ffprobe", args);
+    if (!probe.waitForStarted(2000)) {
+        g_ffprobeMissing = true;
+        cache.insert(path, QString());
+        return QString();
+    }
+    if (!probe.waitForFinished(5000)) {
+        probe.kill();
+        cache.insert(path, QString());
+        return QString();
+    }
+    if (probe.exitCode() != 0) {
+        cache.insert(path, QString());
+        return QString();
+    }
+
+    const QString codec = QString::fromUtf8(
+        probe.readAllStandardOutput().trimmed()).toLower();
+    cache.insert(path, codec);
+    return codec;
 }
 
 QString ProxyManager::chosenGpuH264Encoder()
