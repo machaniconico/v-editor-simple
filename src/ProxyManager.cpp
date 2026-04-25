@@ -306,8 +306,9 @@ void ProxyManager::processNextInQueue()
     // can disagree when ffmpeg is on PATH but built independently.
     const bool av1Available = ffmpegHasEncoder("libsvtav1");
     if (av1Available) {
+        // preset 12: near-fastest SVT-AV1 — proxies trade quality for speed.
         args << "-c:v" << "libsvtav1"
-             << "-preset" << "8"
+             << "-preset" << "12"
              << "-crf" << "35"
              << "-g" << "120"
              << "-pix_fmt" << "yuv420p"
