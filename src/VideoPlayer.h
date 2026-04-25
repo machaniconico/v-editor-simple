@@ -190,6 +190,13 @@ private:
     bool sequenceActive() const { return !m_sequence.isEmpty(); }
     bool audioSequenceActive() const { return !m_audioSequence.isEmpty(); }
     int findActiveEntryAt(int64_t timelineUs) const;
+    // Multi-track: every sequence index whose [timelineStart, timelineEnd)
+    // contains timelineUs. Returned in source order (same as m_sequence),
+    // which is sorted (timelineStart asc, sourceTrack asc) — so V1 sits at
+    // the front, V2/V3/... follow. Empty if no entry is active at timelineUs
+    // (no edge-case fallback to first/last; the composite path treats an
+    // empty result as "no frame to draw").
+    QVector<int> findActiveEntriesAt(int64_t timelineUs) const;
     int findActiveAudioEntryAt(int64_t timelineUs) const;
     void applyAudioEntryAtTimeline(int64_t timelineUs, bool forceSourceReload, bool forceReposition);
     int64_t entryLocalPositionUs(int entryIdx, int64_t timelineUs) const;

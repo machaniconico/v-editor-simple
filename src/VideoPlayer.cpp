@@ -642,6 +642,19 @@ int VideoPlayer::findActiveEntryAt(int64_t timelineUs) const
     return -1;
 }
 
+QVector<int> VideoPlayer::findActiveEntriesAt(int64_t timelineUs) const
+{
+    QVector<int> result;
+    if (m_sequence.isEmpty()) return result;
+    const double tSec = static_cast<double>(timelineUs) / AV_TIME_BASE;
+    for (int i = 0; i < m_sequence.size(); ++i) {
+        const auto &e = m_sequence[i];
+        if (tSec >= e.timelineStart && tSec < e.timelineEnd)
+            result.append(i);
+    }
+    return result;
+}
+
 int64_t VideoPlayer::entryLocalPositionUs(int entryIdx, int64_t timelineUs) const
 {
     if (entryIdx < 0 || entryIdx >= m_sequence.size()) return 0;
