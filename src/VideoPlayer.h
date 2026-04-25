@@ -29,8 +29,11 @@
 //     IDENTICAL bucketing — qFuzzyCompare on raw doubles can compare
 //     equal while int(x*1000) hashes to neighbouring buckets, which
 //     would silently break QHash's contract.
-// V1 (sourceTrack == 0) is never keyed into the pool — it stays on
-// the legacy single-decoder path (m_formatCtx/m_codecCtx).
+// The pool holds whatever entry is NOT m_activeEntry. The active entry
+// (typically V1, but V2 in V2-earlier scenarios) stays on the legacy
+// single-decoder path (m_formatCtx/m_codecCtx); every other active
+// entry — V1 included when V2 owns the legacy decoder — comes from
+// the pool so V1-wins paint order can layer it on top.
 struct TrackKey {
     QString filePath;
     qint64 clipInMs = 0;        // qRound64(clipIn * 1000.0) — 1ms precision
@@ -250,13 +253,11 @@ private:
     // playback. Returns the number of extra frames actually skip-decoded.
     int correctVideoDriftAgainstAudioClock();
 
-    // ---- Per-clip decoder pool (Phase 1b infrastructure) ---------------------
-    // V1 (sourceTrack == 0) keeps using the existing single decoder
-    // (m_formatCtx/m_codecCtx/m_frame/...). V2+ entries open their own
-    // TrackDecoder lazily on demand. Per-tick wiring (acquire on active
-    // entries, composite, evict via grace) is added in US-3 — this struct
-    // and its lifecycle helpers are the infrastructure that wiring builds
-    // upon.
+    // ---- Per-clip decoder pool ----------------------------------------------
+    // The legacy single decoder (m_formatCtx/m_codecCtx/m_frame/...) owns
+    // m_activeEntry's frames. Every other active entry opens its own
+    // TrackDecoder lazily on demand — V1 included when V2 starts earlier
+    // on the timeline so the legacy decoder is sitting on V2.
     struct TrackDecoder {
         int sourceClipIndex = -1;
         int sourceTrack = 0;

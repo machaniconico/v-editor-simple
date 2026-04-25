@@ -2149,14 +2149,16 @@ void VideoPlayer::handlePlaybackTick()
     scheduleNextFrame();
 }
 
-// ---- Per-clip decoder pool (V2+ only) ---------------------------------------
+// ---- Per-clip decoder pool ---------------------------------------------------
 //
-// V1 (sourceTrack == 0) is intentionally never routed here: it stays on the
-// legacy single-decoder path (m_formatCtx/m_codecCtx/...). The pool exists so
-// V2+ overlay clips can keep their own AVFormatContext / AVCodecContext open
-// across short cuts without re-opening the file every time the playhead
-// crosses a clip boundary, while DecoderSlotManager bounds the number of
-// concurrent HW-decoder sessions on the GPU.
+// The active sequence entry (m_activeEntry) is owned by the legacy decoder
+// (m_formatCtx/m_codecCtx/...). Every other active entry — V1 included when
+// the legacy decoder is sitting on V2 because V2 starts earlier on the
+// timeline — comes through this pool. The pool keeps overlay clips' own
+// AVFormatContext / AVCodecContext open across short cuts without re-opening
+// the file every time the playhead crosses a clip boundary, while
+// DecoderSlotManager bounds the number of concurrent HW-decoder sessions on
+// the GPU.
 //
 // Lifecycle invariant (US-2 contract):
 //   - Acquire returns a TrackDecoder for the requested entry; refresh path
