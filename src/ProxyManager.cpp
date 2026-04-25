@@ -494,6 +494,43 @@ bool ProxyManager::ffmpegHasEncoder(const QString &encoderName)
     return has;
 }
 
+bool ProxyManager::ffmpegHasDecoder(const QString &decoderName)
+{
+    // Same shape as ffmpegHasEncoder — decoders also can't appear or vanish
+    // mid-process, so a one-shot probe per name is sufficient.
+    static QHash<QString, bool> cache;
+    static bool probeBroken = false;
+
+    auto it = cache.constFind(decoderName);
+    if (it != cache.constEnd())
+        return it.value();
+
+    if (probeBroken)
+        return false;
+
+    QProcess probe;
+    probe.start("ffmpeg", QStringList() << "-hide_banner" << "-decoders");
+    if (!probe.waitForStarted(2000)) {
+        probeBroken = true;
+        return false;
+    }
+    if (!probe.waitForFinished(5000)) {
+        probe.kill();
+        probeBroken = true;
+        return false;
+    }
+
+    // `ffmpeg -decoders` lists one entry per line, e.g.
+    //   V..... av1_cuvid            Nvidia CUVID AV1 decoder (codec av1)
+    // Substring containment on the decoder name is enough: ffmpeg never
+    // emits the decoder identifier outside its own column.
+    const QByteArray out = probe.readAllStandardOutput()
+                         + probe.readAllStandardError();
+    const bool has = out.contains(decoderName.toUtf8());
+    cache.insert(decoderName, has);
+    return has;
+}
+
 qint64 ProxyManager::probeDurationUs(const QString &path)
 {
     // Cache per source path — same file may be re-queued (settings change,

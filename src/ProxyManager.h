@@ -98,6 +98,12 @@ private:
     // runtime).
     static bool ffmpegHasEncoder(const QString &encoderName);
 
+    // Mirror of ffmpegHasEncoder for the decoder side. Parses the output of
+    // `ffmpeg -hide_banner -decoders` so we can verify a hardware decoder
+    // (e.g. av1_cuvid, h264_qsv) is actually registered before we hand it to
+    // the encoder branch. Cached per name for the singleton lifetime.
+    static bool ffmpegHasDecoder(const QString &decoderName);
+
     // Spawn ffprobe to read the source file duration in microseconds. Used
     // to convert ffmpeg's out_time_ms into a percentage for proxyProgress.
     // Returns 0 on any probe failure (start failed, timeout, non-zero exit,
