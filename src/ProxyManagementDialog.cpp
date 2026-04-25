@@ -11,6 +11,7 @@
 #include <QFileInfo>
 #include <QDialogButtonBox>
 #include <QMessageBox>
+#include <QColor>
 
 ProxyManagementDialog::ProxyManagementDialog(QWidget *parent)
     : QDialog(parent)
@@ -21,7 +22,7 @@ ProxyManagementDialog::ProxyManagementDialog(QWidget *parent)
     auto *layout = new QVBoxLayout(this);
 
     m_table = new QTableWidget(this);
-    m_table->setColumnCount(6);
+    m_table->setColumnCount(7);
     m_table->setHorizontalHeaderLabels({
         QStringLiteral("クリップ名"),
         QStringLiteral("元ファイル"),
@@ -29,6 +30,7 @@ ProxyManagementDialog::ProxyManagementDialog(QWidget *parent)
         QStringLiteral("サイズ"),
         QStringLiteral("ステータス"),
         QStringLiteral("削除"),
+        QStringLiteral("再生成"),
     });
     m_table->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
     m_table->horizontalHeader()->setStretchLastSection(false);
@@ -88,7 +90,15 @@ void ProxyManagementDialog::refreshTable()
             case ProxyStatus::Generating: statusStr = QStringLiteral("Generating"); break;
             case ProxyStatus::Ready:      statusStr = QStringLiteral("Ready"); break;
             case ProxyStatus::Error:      statusStr = QStringLiteral("Error"); break;
+            case ProxyStatus::Stale:      statusStr = QStringLiteral("⚠ Stale"); break;
         }
+        // Ready entries can also be stale (fingerprint or mtime mismatch).
+        // Surface the warning in the same column so users have one place to
+        // look for "needs regenerate".
+        const bool stale = (entry.status == ProxyStatus::Ready
+                            && pm.isEntryStale(entry));
+        if (stale)
+            statusStr = QStringLiteral("⚠ Stale");
 
         const qint64 sz = (entry.status == ProxyStatus::Ready && proxyInfo.exists())
                           ? proxyInfo.size() : 0;
@@ -102,7 +112,14 @@ void ProxyManagementDialog::refreshTable()
         m_table->setItem(row, 1, new QTableWidgetItem(origPath));
         m_table->setItem(row, 2, new QTableWidgetItem(entry.proxyPath));
         m_table->setItem(row, 3, new QTableWidgetItem(sizeStr));
-        m_table->setItem(row, 4, new QTableWidgetItem(statusStr));
+        auto *statusItem = new QTableWidgetItem(statusStr);
+        if (statusStr.startsWith(QStringLiteral("⚠"))) {
+            statusItem->setBackground(QColor("#fff8e1"));
+            const QString reason = pm.staleReason(origPath);
+            if (!reason.isEmpty())
+                statusItem->setToolTip(reason);
+        }
+        m_table->setItem(row, 4, statusItem);
 
         auto *delBtn = new QPushButton(QStringLiteral("削除"), m_table);
         // Capture origPath by value so the lambda survives table rebuild.
@@ -118,6 +135,28 @@ void ProxyManagementDialog::refreshTable()
             delBtn->setToolTip(QStringLiteral("生成中はキャンセルダイアログから停止してください"));
         }
         m_table->setCellWidget(row, 5, delBtn);
+
+        auto *regenBtn = new QPushButton(QStringLiteral("再生成"), m_table);
+        const bool regenAllowed = stale || entry.status == ProxyStatus::Stale
+                                  || entry.status == ProxyStatus::Error
+                                  || entry.status == ProxyStatus::None;
+        if (!regenAllowed) {
+            regenBtn->setEnabled(false);
+            regenBtn->setToolTip(QStringLiteral("現状のプロキシは最新です"));
+        } else if (entry.status == ProxyStatus::Generating) {
+            regenBtn->setEnabled(false);
+            regenBtn->setToolTip(QStringLiteral("生成中"));
+        }
+        connect(regenBtn, &QPushButton::clicked, this, [this, origPath]() {
+            // generateProxy is a no-op when status is already Generating or
+            // Ready. We delete the entry first so a Ready-but-stale row
+            // actually re-queues — without this the user would have to hit
+            // 削除 → 再生成 in two steps.
+            ProxyManager::instance().deleteProxy(origPath);
+            ProxyManager::instance().generateProxy(origPath);
+            refreshTable();
+        });
+        m_table->setCellWidget(row, 6, regenBtn);
     }
 
     m_table->resizeColumnsToContents();
