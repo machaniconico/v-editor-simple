@@ -2457,12 +2457,12 @@ QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
 // currentPositionUs / firstFrameDecoded are updated; on failure (EOF) the
 // caller falls back to the previous lastFrameRgb so the overlay stays sticky
 // instead of going black at clip ends.
-bool VideoPlayer::decodePoolFrame(TrackDecoder *d)
+bool VideoPlayer::decodePoolFrame(TrackDecoder *d, bool ensureRgb)
 {
     if (!d || !d->formatCtx || !d->codecCtx || !d->packet || !d->frame)
         return false;
 
-    const auto receiveFrame = [this, d]() -> bool {
+    const auto receiveFrame = [this, d, ensureRgb]() -> bool {
         // avcodec_receive_frame doesn't always reset the frame before
         // writing — leftover side-data buffers from a prior frame can
         // leak the HW-frame ref it overwrites. Explicit unref makes the
@@ -2496,6 +2496,17 @@ bool VideoPlayer::decodePoolFrame(TrackDecoder *d)
         positionUs = qMax<int64_t>(0, positionUs);
         if (d->durationUs > 0)
             positionUs = qMin(positionUs, d->durationUs);
+
+        // Fast path for catch-up intermediates: the caller has told us
+        // this frame won't be displayed, so just advance the position
+        // anchor and skip the HW->SW transfer (~5-8 ms) and sws_scale
+        // (~3-5 ms). The decoder state is now at this PTS; the next
+        // receive_frame produces the next frame as usual.
+        if (!ensureRgb) {
+            d->currentPositionUs = positionUs;
+            d->firstFrameDecoded = true;
+            return true;
+        }
 
         // HW->SW transfer if the decoder is on D3D11VA.
         AVFrame *displayable = d->frame;
@@ -2589,14 +2600,26 @@ bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, Decode
         d->currentPositionUs = targetUs;
     }
 
+    // Catch-up loop. Intermediate frames skip HW transfer + sws_scale
+    // because they're not displayed; only the frame that lands at/past
+    // the target needs RGB. This roughly halves overlay decode wall
+    // time when V2 is more than 1 frame behind the playhead.
     int catchupCap = d->firstFrameDecoded ? 4 : 8;
     bool ok = false;
     while (catchupCap-- > 0) {
-        ok = decodePoolFrame(d);
+        const bool nearTarget = (d->currentPositionUs + halfFrame * 2 >= expectedFileLocalUs);
+        const bool wantRgb = nearTarget || (catchupCap == 0);
+        ok = decodePoolFrame(d, wantRgb);
         if (!ok)
             break;
-        if (d->currentPositionUs + halfFrame >= expectedFileLocalUs)
+        if (d->currentPositionUs + halfFrame >= expectedFileLocalUs) {
+            if (!wantRgb) {
+                // We landed at target with a no-RGB decode; one more
+                // pass to refresh d->lastFrameRgb for display.
+                ok = decodePoolFrame(d, true);
+            }
             break;
+        }
     }
 
     if (!d->lastFrameRgb.isNull()) {

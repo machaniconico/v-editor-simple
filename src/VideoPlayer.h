@@ -308,7 +308,12 @@ private:
     QImage composeMultiTrackFrame(const QImage &v1Frame,
                                   const QVector<DecodedLayer> &overlayLayers) const;
     bool harvestOverlayLayer(const PlaybackEntry &entry, int seqIdx, DecodedLayer *out);
-    bool decodePoolFrame(TrackDecoder *d);
+    // ensureRgb=false skips av_hwframe_transfer_data + sws_scale and only
+    // advances d->currentPositionUs. Used by harvestOverlayLayer's catch-up
+    // loop on intermediate frames the user will never see — saves ~6-12 ms
+    // per skipped frame at 1080p HEVC, which dominated the multi-track
+    // tick budget before this was introduced.
+    bool decodePoolFrame(TrackDecoder *d, bool ensureRgb = true);
     bool hasOverlayActive(const QVector<int> &activeIdxs) const;
     // Tear down every active V2+ decoder + every grace-pool decoder.
     // Called from the destructor and from setSequence() reconciliation
