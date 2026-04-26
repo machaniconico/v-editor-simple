@@ -73,6 +73,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ProxyProgressDialog.cpp
     src/ProxyManagementDialog.cpp
     src/DecoderSlotManager.cpp
+    src/AudioMixer.cpp
     src/LutImporter.cpp
     src/TimelineMarker.cpp
     src/VideoStabilizer.cpp
