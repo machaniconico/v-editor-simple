@@ -380,6 +380,7 @@ private:
     int64_t m_currentPositionUs = 0;
     int64_t m_frameDurationUs = 0;
     double m_displayAspectRatio = 0.0;
+    bool m_loggedCullState = false;
     int m_canvasWidth = 1920;
     int m_canvasHeight = 1080;
     double m_playbackSpeed = 1.0;

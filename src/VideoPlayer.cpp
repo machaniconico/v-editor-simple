@@ -32,19 +32,21 @@ extern "C" void *veditor_avHwDeviceCtxToD3D11Device(AVBufferRef *ref);
 namespace {
 
 // Phase 1e — VEDITOR_PLAYBACK_PROXY divisor for the playback decode path.
-// 1 = full resolution (default). 2 / 4 = half / quarter resolution. The
-// returned divisor scales the sws_scale destination width/height in
-// frameToImage and decodePoolFrame so we cut sws + QImage cost while the
-// compose path scales the smaller QImage up to the full canvas via nearest
-// drawImage. Pause and export stay at full resolution because they bypass
-// these decode wrappers.
+// Default 2 (half-res preview) so playback at 1440p / 4K sources hits the
+// frame budget on systems where HW transfer + sws_scale is the bottleneck.
+// VEDITOR_PLAYBACK_PROXY=1 forces full resolution; =4/=8 push further.
+// Pause and export stay at full resolution because they bypass these
+// decode wrappers — the user only sees aliasing during active playback.
 inline int playbackProxyDivisor()
 {
     static const int kDivisor = []() {
-        int v = qEnvironmentVariableIntValue("VEDITOR_PLAYBACK_PROXY");
-        if (v < 1) v = 1;
+        const QByteArray raw = qgetenv("VEDITOR_PLAYBACK_PROXY");
+        if (raw.isEmpty())
+            return 2; // default half-res preview during playback
+        bool ok = false;
+        int v = raw.toInt(&ok);
+        if (!ok || v < 1) v = 1;
         if (v > 8) v = 8;
-        // Allow only powers of 2 to keep sws/QImage row alignment friendly.
         if (v != 1 && v != 2 && v != 4 && v != 8) v = 1;
         return v;
     }();
@@ -464,6 +466,7 @@ void VideoPlayer::loadFile(const QString &filePath)
 void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 {
     qInfo() << "VideoPlayer::setSequence count=" << entries.size();
+    m_loggedCullState = false; // re-emit [cull] diagnostic for the new project
 
     // Topmost-track-wins via single-decoder pipeline: take Timeline's
     // sequence as-is. Timeline::computePlaybackSequence sorts by
@@ -2118,8 +2121,9 @@ void VideoPlayer::handlePlaybackTick()
         }
         // One-shot diagnostic so user (and log readers) can confirm
         // whether the cull engaged for this project, and if not, why.
-        static bool loggedCullState = false;
-        if (occlusionCull && !loggedCullState && m_activeEntry >= 0
+        // Reset on each project load via setSequence so multi-project
+        // sessions emit one [cull] line per project.
+        if (occlusionCull && !m_loggedCullState && m_activeEntry >= 0
             && m_activeEntry < m_sequence.size()) {
             const auto &v1e = m_sequence[m_activeEntry];
             qInfo() << "[cull] occlusion cull check: v1FullyCovers="
@@ -2130,7 +2134,7 @@ void VideoPlayer::handlePlaybackTick()
                     << "v1Dx=" << v1e.videoDx
                     << "v1Dy=" << v1e.videoDy
                     << "activeIdxs=" << activeIdxs.size();
-            loggedCullState = true;
+            m_loggedCullState = true;
         }
 
         if (threadedPool && nonV1Count >= 2) {
