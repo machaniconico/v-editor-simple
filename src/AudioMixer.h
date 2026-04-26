@@ -8,7 +8,6 @@
 #include <QIODevice>
 #include <QAudioSink>
 #include <QAudioFormat>
-#include <QThread>
 #include <atomic>
 
 #include "PlaybackTypes.h"
@@ -16,17 +15,17 @@
 // AudioMixer — sums up to MAX_AUDIO_TRACKS independent FFmpeg-decoded
 // audio streams into a single 48 kHz s16 stereo output via QAudioSink in
 // push mode. Replaces the old single-source QMediaPlayer side-player. The
-// class header keeps FFmpeg includes private; AudioDecoderEntry and
-// MixerIODevice are forward-declared and defined in AudioMixer.cpp.
+// class header keeps FFmpeg includes private; AudioDecoderEntry,
+// MixerIODevice, and AudioDecodeRunner are forward-declared and defined
+// in AudioMixer.cpp.
 //
 // Thread model:
 //   * GUI thread owns AudioMixer and calls setSequence/seekTo/play/pause.
 //   * QAudioSink invokes MixerIODevice::readData on its internal worker
-//     thread; that path locks m_controlMutex briefly to read the entry
-//     list and per-track gains.
-//   * The decode thread (m_decodeThread) does FFmpeg packet pull /
-//     swresample resampling and pushes samples into each entry's ring
-//     buffer. It is added in US-3.
+//     thread; that path locks m_controlMutex briefly to drain ring data
+//     and read per-track gains.
+//   * AudioDecodeRunner runs on a dedicated QThread, periodically taking
+//     m_controlMutex to refill ring buffers ahead of the audio sink.
 //
 // Master clock contract: m_writeCursorUs is the audible timeline-space
 // position. The audio callback publishes updates with release semantics;
@@ -34,6 +33,7 @@
 // rewinds except on an explicit seekTo.
 struct AudioDecoderEntry;
 class MixerIODevice;
+class AudioDecodeRunner;
 
 struct AudioTrackKey {
     QString filePath;
@@ -62,6 +62,8 @@ public:
     static constexpr int kBytesPerSample = 2;                  // s16
     static constexpr int kBytesPerFrame = kChannels * kBytesPerSample;
     static constexpr int kMaxAudioTracks = 16;
+    static constexpr int kRingTargetBytes = 64 * 1024;         // ~340 ms stereo s16 @ 48k
+    static constexpr int kPrerollLeadUs = 2'000'000;           // pre-warm 2 s before entry start
 
     explicit AudioMixer(QObject *parent = nullptr);
     ~AudioMixer() override;
@@ -72,8 +74,8 @@ public:
     void setSequence(const QVector<PlaybackEntry> &entries);
 
     // Jump the audible playhead. Resyncs FFmpeg seek inside every active
-    // entry and flushes ring buffers so the next sample read is the new
-    // position.
+    // entry (lazily on next refill) and flushes ring buffers so the next
+    // sample read is at the new position.
     void seekTo(int64_t timelineUs);
 
     // Master clock — audible position in timeline microseconds. Drives
@@ -98,6 +100,7 @@ signals:
 
 private:
     friend class MixerIODevice;
+    friend class AudioDecodeRunner;
 
     struct TrackState {
         bool muted = false;
@@ -106,8 +109,15 @@ private:
         double effectiveGain = 1.0;  // gain * mute factor * solo factor
     };
 
-    void recomputeEffectiveGains();
-    void releaseAllEntries();
+    bool ensureSinkLocked();              // m_controlMutex must be held
+    void recomputeEffectiveGainsLocked(); // m_controlMutex must be held
+    void releaseAllEntriesLocked();       // m_controlMutex must be held
+    bool openEntry(AudioDecoderEntry *e);
+    void closeEntry(AudioDecoderEntry *e);
+    void seekEntryToTimeline(AudioDecoderEntry *e, int64_t timelineUs);
+    void refillRingForEntry(AudioDecoderEntry *e, int targetBytes);
+    void resampleAndAppend(AudioDecoderEntry *e);
+    void refillRings();                   // called by AudioDecodeRunner
 
     QAudioFormat m_format;
     QAudioSink *m_sink = nullptr;
@@ -120,5 +130,5 @@ private:
     std::atomic<int64_t> m_writeCursorUs{0};
     std::atomic<bool> m_playing{false};
 
-    QThread m_decodeThread;  // wired in US-3
+    AudioDecodeRunner *m_decodeRunner = nullptr;
 };
