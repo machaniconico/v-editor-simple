@@ -1307,7 +1307,8 @@ void VideoPlayer::scheduleNextFrame()
     const double absSpeed = qMax(0.25, std::abs(m_playbackSpeed));
     const int64_t baseFrameUs = (m_frameDurationUs > 0) ? m_frameDurationUs : (AV_TIME_BASE / 30);
     const int64_t frameIntervalUs = static_cast<int64_t>(baseFrameUs / absSpeed);
-    int intervalMs = qMax(1, static_cast<int>(frameIntervalUs / 1000));
+    const int frameIntervalMs = qMax(1, static_cast<int>(frameIntervalUs / 1000));
+    int intervalMs = frameIntervalMs;
 
     // Audio-paced scheduling: pace the next frame against the AudioMixer's
     // audible clock (master clock minus OS-buffered samples) so video
@@ -1321,10 +1322,14 @@ void VideoPlayer::scheduleNextFrame()
         const int64_t audioTlUs = m_mixer->audibleClockUs();
         const int64_t videoAheadUs = m_timelinePositionUs - audioTlUs;
         const int64_t waitUs = static_cast<int64_t>(videoAheadUs / absSpeed);
-        // waitUs <= 0: video is behind audio — fire next tick ASAP so
-        // correctVideoDriftAgainstAudioClock can catch up. waitUs > 0: video
-        // is ahead — wait so audio can catch up.
-        intervalMs = (waitUs <= 0) ? 1 : qMax(1, static_cast<int>(waitUs / 1000));
+        // Floor the interval at half-frame so catchup mode doesn't peg the
+        // timer at 1 ms — every tick already runs up to 7 frame decodes
+        // (correctVideoDriftAgainstAudioClock + decodeNextFrame), so a 1 ms
+        // tick rate saturates one CPU thread without giving the decoder room
+        // to actually catch up.
+        const int floorMs = qMax(1, frameIntervalMs / 2);
+        intervalMs = (waitUs <= 0) ? floorMs
+                                   : qMax(floorMs, static_cast<int>(waitUs / 1000));
     }
     m_playbackTimer->start(intervalMs);
 }
