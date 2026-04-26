@@ -93,13 +93,14 @@ public:
     // readData again — the actual root cause of "no audio plays" in
     // Phase 2 sum-mix.
     bool isSequential() const override { return true; }
-    // Return the full sink buffer size — enough for the sink to call
-    // readData and pull a full chunk every iteration. Returning a huge
-    // value (INT_MAX, etc.) causes Qt to allocate an impossibly large
-    // internal buffer and freeze the audio worker thread.
+    // Advertise enough on-demand availability to keep Qt's pull-mode
+    // worker from declaring the device starved. Anything >= one sink
+    // period (~10–20 ms typical) keeps it Active; we use 1 s as a safety
+    // margin. Do NOT return INT64_MAX or similar — some Qt backends use
+    // bytesAvailable() to size an internal pre-buffer and a huge value
+    // freezes the audio worker for several seconds.
     qint64 bytesAvailable() const override {
-        return AudioMixer::kSampleRateHz
-               * AudioMixer::kBytesPerFrame; // ~1 second of audio
+        return AudioMixer::kSampleRateHz * AudioMixer::kBytesPerFrame;
     }
 
 protected:
@@ -535,18 +536,29 @@ void AudioMixer::play() {
 
 void AudioMixer::pause() {
     qInfo() << "AudioMixer::pause";
-    QMutexLocker lock(&m_controlMutex);
-    m_playing.store(false, std::memory_order_release);
-    if (m_sink && m_sink->state() == QAudio::ActiveState) {
-        m_sink->suspend();
+    // suspend()/stop() must be called outside m_controlMutex for the same
+    // reason play()/seekTo() do: Qt's QAudioSink synchronously waits for
+    // the in-flight readData callback to finish before transitioning state,
+    // and that callback is parked on m_controlMutex. ABBA deadlock.
+    QAudioSink *sinkSnap = nullptr;
+    {
+        QMutexLocker lock(&m_controlMutex);
+        m_playing.store(false, std::memory_order_release);
+        if (m_sink && m_sink->state() == QAudio::ActiveState)
+            sinkSnap = m_sink;
     }
+    if (sinkSnap) sinkSnap->suspend();
 }
 
 void AudioMixer::stop() {
     qInfo() << "AudioMixer::stop";
-    QMutexLocker lock(&m_controlMutex);
-    m_playing.store(false, std::memory_order_release);
-    if (m_sink) m_sink->stop();
+    QAudioSink *sinkSnap = nullptr;
+    {
+        QMutexLocker lock(&m_controlMutex);
+        m_playing.store(false, std::memory_order_release);
+        sinkSnap = m_sink;
+    }
+    if (sinkSnap) sinkSnap->stop();
 }
 
 void AudioMixer::setTrackMute(int trackIdx, bool muted) {
@@ -639,12 +651,16 @@ bool AudioMixer::ensureSinkLocked() {
                 << "state=" << m_sink->state();
 
         // Surface state transitions and errors so silent sink failures
-        // become visible in the log.
+        // become visible in the log. QueuedConnection prevents the lambda
+        // from running on the audio worker thread between ~AudioMixer's
+        // m_sink->stop() (called before the lock) and m_sink = nullptr
+        // (called inside the lock); without it, a state-change racing
+        // shutdown would dereference a half-destroyed AudioMixer.
         QObject::connect(m_sink, &QAudioSink::stateChanged, this,
             [this](QAudio::State s) {
                 qInfo() << "AudioMixer: sink stateChanged ->" << s
                         << "error=" << (m_sink ? m_sink->error() : QAudio::NoError);
-            });
+            }, Qt::QueuedConnection);
     }
     // start() is intentionally NOT called here — it would deadlock when
     // ensureSinkLocked is invoked under m_controlMutex (the Windows
