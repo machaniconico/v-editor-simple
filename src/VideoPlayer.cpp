@@ -656,8 +656,16 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     const bool ok = seekInternal(localUs, true, precise);
     // Push the seeked-to clip's own transform so cross-clip seeks don't
     // inherit the previously-active clip's OBS-style scale/offset.
-    if (m_glPreview)
+    if (m_glPreview) {
         m_glPreview->setVideoSourceTransform(e.videoScale, e.videoDx, e.videoDy);
+        // Drop composite-baked mode here too: a seek-while-paused that
+        // followed a composite tick (flag = true) would otherwise render
+        // the seek-displayed raw V1 frame at viewport identity even
+        // though it now needs the entry's scale applied. The next
+        // playback tick re-sets the flag based on willComposite, so this
+        // is always safe.
+        m_glPreview->setCompositeBakedMode(false);
+    }
     m_suppressUiUpdates = prevSuppress;
 
     // resetDecoder (called from loadFile when needSwitch) ran updatePlayButton
@@ -701,6 +709,10 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
     // GL preview so each clip keeps its own scale/offset.
     if (m_glPreview) {
         m_glPreview->setVideoSourceTransform(next.videoScale, next.videoDx, next.videoDy);
+        // Match the seek path's defensive un-bake — a paused boundary
+        // crossing followed by a single-clip displayFrame would otherwise
+        // render at viewport identity if the prior tick was composite.
+        m_glPreview->setCompositeBakedMode(false);
     }
     m_timelinePositionUs = static_cast<int64_t>(next.timelineStart * AV_TIME_BASE);
     const int64_t startLocalUs = static_cast<int64_t>(next.clipIn * AV_TIME_BASE);
