@@ -104,7 +104,7 @@ public:
 
     // Read-only accessor used by MainWindow when retargeting the sequence
     // (proxy generation finished, proxy mode toggled). Wrapping the swap in
-    // pause/play stops the audio side-player and the frame timer from
+    // pause/play stops the mixer and the frame timer from
     // running through the loadFile reset, which previously surfaced as a
     // visible rewind + speed-up when the path resolution changed underneath
     // an active playback.
@@ -244,7 +244,7 @@ private:
     bool advanceToEntry(int newEntryIdx);
     void applySequenceSliderRange();
     int sliderTimelinePosition(int64_t timelineUs) const;
-    // A/V drift correction: when the audio side-player is reading the same
+    // A/V drift correction: pace video against the AudioMixer master clock
     // file as the active video entry, treat the audio clock as master and
     // skip-decode extra video frames if the video PTS has fallen behind.
     // No-op for J-cut/L-cut (audio file != video file) and for reverse

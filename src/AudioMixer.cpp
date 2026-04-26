@@ -539,6 +539,13 @@ void AudioMixer::refillRings() {
     QMutexLocker lock(&m_controlMutex);
     if (m_entries.isEmpty()) return;
     const int64_t cursorUs = m_writeCursorUs.load(std::memory_order_acquire);
+    // Bound decode work per refill pass so the 200 ms QAudioSink OS buffer
+    // doesn't underrun while readData waits on m_controlMutex. ~8 KB per
+    // entry decodes in well under a millisecond on modern hardware; the
+    // 5 ms decode loop tops the ring back up to kRingTargetBytes within
+    // ~16 ticks (~80 ms total).
+    constexpr int kPerCallChunkBytes = 8 * 1024;
+    int remainingSeekBudget = 1;  // at most one expensive avformat_seek_file per pass
     for (auto *e : qAsConst(m_entries)) {
         if (!e) continue;
         const int64_t startUs = static_cast<int64_t>(e->entry.timelineStart * 1e6);
@@ -549,12 +556,16 @@ void AudioMixer::refillRings() {
         if (cursorUs >= endUs) continue;
 
         if (e->seekPending) {
+            if (remainingSeekBudget <= 0) continue;
+            --remainingSeekBudget;
             const int64_t target = qMax<int64_t>(cursorUs, startUs);
             seekEntryToTimeline(e, target);
             e->seekPending = false;
         }
         if (e->ring.size() < kRingTargetBytes) {
-            refillRingForEntry(e, kRingTargetBytes);
+            const int chunkTarget = qMin<int>(e->ring.size() + kPerCallChunkBytes,
+                                              kRingTargetBytes);
+            refillRingForEntry(e, chunkTarget);
         }
     }
 }

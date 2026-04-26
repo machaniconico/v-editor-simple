@@ -234,9 +234,9 @@ void VideoPlayer::loadFile(const QString &filePath)
 {
     qInfo() << "VideoPlayer::loadFile BEGIN" << filePath;
     // Audio is now driven by the independent A-track schedule via
-    // setAudioSequence/applyAudioEntryAtTimeline. loadFile only reloads the
-    // FFmpeg video decoder. No audio side-player touching here — that was
-    // needed back when m_audioPlayer was bound to the video file, but since
+    // setAudioSequence -> AudioMixer. loadFile only reloads the FFmpeg
+    // video decoder. No audio touching here — audio is owned by the mixer
+    // and is independent of which video file the FFmpeg decoder is on, since
     // the audio schedule owns the audio channel the old 200ms mute lockout
     // is no longer applicable.
     resetDecoder();
@@ -478,15 +478,14 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     const auto &target = m_sequence[desiredIdx];
     const bool needFileSwitch = (target.filePath != m_loadedFilePath) || !m_formatCtx;
     // Idempotency: if the structurally identical entry is already active and
-    // the file is already loaded, skip the seek/setSource entirely so back-to-
-    // back sequenceChanged emissions (e.g. video track + audio track both
+    // the file is already loaded, skip the seek entirely so back-to-back
+    // sequenceChanged emissions (e.g. video track + audio track both
     // emitting modified() during a single addClip) don't repeatedly disturb
-    // the QMediaPlayer side-player and cause audible double playback.
+    // the mixer and cause audible artifacts.
     const bool entryStructurallyChanged = needFileSwitch || (m_activeEntry != desiredIdx);
 
     // Snapshot playback state BEFORE loadFile+resetDecoder tear down the
-    // playback timer and the audio side-player, so we can resurrect them
-    // after the file swap completes.
+    // playback timer, so we can resurrect it after the file swap completes.
     const bool wasPlaying = m_playing;
     qInfo() << "VideoPlayer::setSequence flow"
             << "wasPlaying=" << wasPlaying
@@ -520,7 +519,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     }
     // Audio-side resume is handled by setAudioSequence (called separately
     // via MainWindow's audioSequenceChanged wiring) and by the per-tick
-    // applyAudioEntryAtTimeline call inside handlePlaybackTick.
+    // Mixer's master clock + decode thread.
 
     // Keep the play/pause button enabled states in sync with m_playing.
     // Without this, the button may show the wrong enabled state after we
@@ -641,7 +640,7 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     m_suppressUiUpdates = needSwitch;
     const bool wasPlayingOuter = m_playing;
     if (needSwitch) {
-        loadFile(e.filePath); // sets m_audioPlayer source as part of init
+        loadFile(e.filePath); // reloads the video decoder; audio routes through the mixer
         if (wasPlayingOuter)
             m_playing = true;
     }
@@ -1240,15 +1239,10 @@ void VideoPlayer::resetDecoder()
     if (m_seekTimer)
         m_seekTimer->stop();
 
-    // Audio lifecycle belongs to the A-track schedule now — do NOT touch
-    // m_audioPlayer here. resetDecoder is called from loadFile() on every
-    // video entry boundary, and wiping the audio source at those boundaries
-    // desynchronises it from m_audioLoadedFilePath: the next
-    // applyAudioEntryAtTimeline sees target.filePath == m_audioLoadedFilePath,
-    // skips setSource, and the player stays on the empty source → silence
-    // inside the shifted A1 range ("A1 の上で音が出ない"). The audio
-    // side-player is cleaned up via setAudioSequence(empty) and in the
-    // destructor when the QObject parent tears it down.
+    // Audio lifecycle belongs to AudioMixer now — do NOT touch the mixer
+    // here. resetDecoder is called from loadFile() on every video entry
+    // boundary; the mixer keeps its own decoder pool keyed by AudioTrackKey
+    // and stays in step via setAudioSequence + the master clock.
 
     m_playing = false;
     m_videoStreamIndex = -1;
@@ -1382,7 +1376,7 @@ void VideoPlayer::performPendingSeek()
     if (seqMode) {
         const int64_t timelineUs = static_cast<int64_t>(requestedMs) * 1000;
         // Preview seeks (non-precise / drag) MUST NOT switch files. Each
-        // file switch tears down the QMediaPlayer side-player and the user
+        // file switch reloads the FFmpeg video decoder and the user
         // hears the old audio briefly overlapping with the new — perceived
         // as "double playback". Refuse cross-file preview seeks; the final
         // committed seek (sliderReleased / valueChanged) handles the switch.
@@ -1419,12 +1413,10 @@ void VideoPlayer::performPendingSeek()
         return;
     }
 
-    // NOTE: audio side is already repositioned by applyAudioEntryAtTimeline
-    // inside seekToTimelineUs (forceReposition=true). The old direct
-    // m_audioPlayer->setPosition(m_currentPositionUs / 1000) call here was a
-    // legacy single-file-mode shim — in sequence mode it used VIDEO
-    // file-local coordinates to set the AUDIO player position, which was
-    // wrong and caused audible drift after seek. Do not reintroduce it.
+    // NOTE: audio is owned by AudioMixer's master clock — seekToTimelineUs
+    // calls m_mixer->seekTo with the timeline position. Do NOT push a
+    // setPosition equivalent here; the previous shim used VIDEO file-local
+    // coordinates as an AUDIO player position which caused drift after seek.
 
     if (seekOk && wasPlaying)
         scheduleNextFrame();
@@ -1929,13 +1921,11 @@ void VideoPlayer::handlePlaybackTick()
         }
     }
 
-    // A/V sync: INDEPENDENT schedules by default (video owns
-    // m_currentPositionUs via the FFmpeg decoder; audio owns the QMediaPlayer
-    // clock via the A-track schedule), coupled to the audio clock as master
-    // when the audio side-player and active video entry resolve to the same
-    // file. The coupling is implemented by correctVideoDriftAgainstAudioClock
-    // above and by audio-paced scheduleNextFrame. J-cut / L-cut falls back
-    // to fully independent clocks so unlinked clip playback keeps working.
+    // A/V sync: video owns m_currentPositionUs via the FFmpeg decoder;
+    // AudioMixer publishes its own master clock. Coupling is audio-as-master
+    // via correctVideoDriftAgainstAudioClock + audio-paced scheduleNextFrame.
+    // The mixer's clock is timeline-unified, so J-cut/L-cut paths no longer
+    // need to fall back to independent clocks.
 
     // Sequence mode: detect when we've crossed the active entry's outPoint or
     // run off the end of the file, and switch to the next entry.
