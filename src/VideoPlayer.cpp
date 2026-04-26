@@ -534,17 +534,22 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 void VideoPlayer::setAudioSequence(const QVector<PlaybackEntry> &entries)
 {
     qInfo() << "VideoPlayer::setAudioSequence count=" << entries.size();
+    const bool hadEntries = !m_audioSequence.isEmpty();
     m_audioSequence = entries;
     if (!m_mixer) return;
     m_mixer->setSequence(entries);
-    // Re-anchor the mixer to the current timeline position. setSequence
-    // alone leaves the master clock where it was; for fresh sequences (or
-    // after a re-emit during a drag) the user expects audio to track the
-    // current playhead.
-    m_mixer->seekTo(m_timelinePositionUs);
     if (entries.isEmpty()) {
         m_mixer->stop();
         return;
+    }
+    // Don't seek on every re-emit: AudioMixer::setSequence already flushes
+    // rings + sets seekPending for any entry whose timeline range moved,
+    // and an unconditional seek here would close+reopen the QAudioSink on
+    // every volume slider drag or mute toggle (audible click). Only seek
+    // when transitioning empty->non-empty so the mixer lands on the
+    // current playhead the first time it gets a schedule.
+    if (!hadEntries) {
+        m_mixer->seekTo(m_timelinePositionUs);
     }
     if (m_playing && m_playbackSpeed >= 0.0) {
         m_mixer->play();
@@ -1301,14 +1306,15 @@ void VideoPlayer::scheduleNextFrame()
     int intervalMs = qMax(1, static_cast<int>(frameIntervalUs / 1000));
 
     // Audio-paced scheduling: pace the next frame against the AudioMixer's
-    // master clock so video tracks the audible playhead. The mixer publishes
-    // its clock in TIMELINE microseconds (independent of which entry it's
+    // audible clock (master clock minus OS-buffered samples) so video
+    // tracks the playhead the user actually hears. The mixer publishes its
+    // clock in TIMELINE microseconds (independent of which entry it's
     // currently sourcing from), so the J-cut/L-cut filePath-guard the old
     // QMediaPlayer path needed is gone — every active video entry can pace
     // off the same single audio clock.
     if (m_mixer && m_mixer->isPlaying() && m_playbackSpeed >= 0.0
         && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
-        const int64_t audioTlUs = m_mixer->masterClockUs();
+        const int64_t audioTlUs = m_mixer->audibleClockUs();
         const int64_t videoAheadUs = m_timelinePositionUs - audioTlUs;
         const int64_t waitUs = static_cast<int64_t>(videoAheadUs / absSpeed);
         // waitUs <= 0: video is behind audio — fire next tick ASAP so
@@ -1333,7 +1339,7 @@ int VideoPlayer::correctVideoDriftAgainstAudioClock()
     if (m_activeEntry < 0 || m_activeEntry >= m_sequence.size())
         return 0;
 
-    const int64_t audioTlUs = m_mixer->masterClockUs();
+    const int64_t audioTlUs = m_mixer->audibleClockUs();
     const int64_t frameUs = (m_frameDurationUs > 0) ? m_frameDurationUs : (AV_TIME_BASE / 30);
     // Threshold > 1.5 frames avoids skipping on natural scheduler jitter.
     const int64_t catchupThresholdUs = (frameUs * 3) / 2;

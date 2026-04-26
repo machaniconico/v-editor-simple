@@ -48,10 +48,14 @@ struct AudioTrackKey {
     }
 };
 inline uint qHash(const AudioTrackKey &k, uint seed = 0) noexcept {
-    return qHash(k.filePath, seed)
-         ^ qHash(k.clipInMs, seed)
-         ^ qHash(k.sourceTrack, seed)
-         ^ qHash(k.sourceClipIndex, seed);
+    // Boost-style hash combine. XOR-of-equal-seed collides whenever fields
+    // pairwise produce identical hashes (e.g. sourceTrack == sourceClipIndex);
+    // with hash_combine the bits diffuse properly.
+    uint h = qHash(k.filePath, seed);
+    h ^= qHash(k.clipInMs, seed) + 0x9e3779b9u + (h << 6) + (h >> 2);
+    h ^= qHash(k.sourceTrack, seed) + 0x9e3779b9u + (h << 6) + (h >> 2);
+    h ^= qHash(k.sourceClipIndex, seed) + 0x9e3779b9u + (h << 6) + (h >> 2);
+    return h;
 }
 
 class AudioMixer : public QObject {
@@ -78,11 +82,16 @@ public:
     // sample read is at the new position.
     void seekTo(int64_t timelineUs);
 
-    // Master clock — audible position in timeline microseconds. Drives
-    // VideoPlayer scheduleNextFrame / correctVideoDriftAgainstAudioClock.
+    // Master clock — position the mixer has DELIVERED samples to the OS
+    // audio buffer through. Note this runs ahead of what the user actually
+    // hears by sink->bufferSize() (≈200 ms): the difference is samples sat
+    // in the hardware buffer, not yet played. VideoPlayer pace/drift code
+    // can use audibleClockUs() to compensate when sub-frame accuracy
+    // matters.
     int64_t masterClockUs() const {
         return m_writeCursorUs.load(std::memory_order_acquire);
     }
+    int64_t audibleClockUs() const;
 
     // Transport
     void play();
@@ -126,7 +135,7 @@ private:
     QHash<AudioTrackKey, AudioDecoderEntry *> m_entries;
     QVector<TrackState> m_trackStates;
 
-    QMutex m_controlMutex;
+    mutable QMutex m_controlMutex;
     std::atomic<int64_t> m_writeCursorUs{0};
     std::atomic<bool> m_playing{false};
 

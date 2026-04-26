@@ -5,6 +5,8 @@
 #include <QtMath>
 #include <QThread>
 #include <QVarLengthArray>
+#include <QSet>
+#include <QStringList>
 #include <cstring>
 #include <algorithm>
 
@@ -26,6 +28,13 @@ struct AudioDecoderEntry {
     SwrContext *swrCtx = nullptr;
     int audioStreamIdx = -1;
     QByteArray ring;                 // resampled s16 stereo, FIFO
+    // Timeline microseconds of the FIRST sample currently in the ring.
+    // Used by readData to skip past samples behind the master clock when a
+    // ring underrun + decoder catch-up has produced samples that should
+    // have been mixed earlier. Without this tracker, late-arriving samples
+    // would play out of phase with other tracks (see CRITICAL #2 from the
+    // Phase 2 review).
+    int64_t ringStartTlUs = 0;
     bool eof = false;
     bool seekPending = true;         // first-time seek to entry's start when approached
     AVPacket *pkt = nullptr;
@@ -82,12 +91,13 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
     const int64_t cursorUs = m_mixer->m_writeCursorUs.load(std::memory_order_acquire);
     const int frameCount = static_cast<int>(maxlen / AudioMixer::kBytesPerFrame);
     const int sampleCount = frameCount * AudioMixer::kChannels;
+    const int64_t maxlenUs = static_cast<int64_t>(frameCount) * 1'000'000
+                             / AudioMixer::kSampleRateHz;
 
-    // Accumulator for the sum-mix. int32 lets us add up to 65535 unit-gain
-    // s16 sources before saturating; we cap inputs at MAX_AUDIO_TRACKS=16
-    // and the per-track effective gain is bounded at 4.0, so headroom is
-    // ample.
-    QVarLengthArray<int32_t, 8192> accum(sampleCount);
+    // Accumulator for the sum-mix. int32 lets us add many s16 sources before
+    // saturating; gains are clamped per entry below so the headroom math
+    // holds even if PlaybackEntry::volume bypassed the Timeline 0..2 clamp.
+    QVarLengthArray<int32_t, 16384> accum(sampleCount);
     std::memset(accum.data(), 0, sampleCount * sizeof(int32_t));
 
     bool anyMixed = false;
@@ -99,7 +109,27 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         if (cursorUs < startUs || cursorUs >= endUs) continue;
         if (e->ring.isEmpty()) continue;
 
-        double gain = e->entry.volume;
+        // Drop samples that landed in the ring late — i.e. their timeline
+        // position is already behind the master cursor. Without this, a
+        // ring underrun + decoder catch-up sequence permanently shifts the
+        // entry's audio relative to the rest of the mix.
+        if (e->ringStartTlUs < cursorUs) {
+            const int64_t lateUs = cursorUs - e->ringStartTlUs;
+            const qint64 lateBytes = lateUs * AudioMixer::kSampleRateHz
+                                     * AudioMixer::kBytesPerFrame / 1'000'000LL;
+            const qint64 dropBytes = qMin<qint64>(lateBytes, e->ring.size());
+            if (dropBytes > 0) {
+                e->ring.remove(0, static_cast<int>(dropBytes));
+                e->ringStartTlUs += dropBytes * 1'000'000LL
+                                    / (AudioMixer::kSampleRateHz
+                                       * AudioMixer::kBytesPerFrame);
+            }
+            if (e->ring.isEmpty()) continue;
+        }
+        // If samples sit in the future the entry shouldn't be mixed yet.
+        if (e->ringStartTlUs > cursorUs + maxlenUs / 2) continue;
+
+        double gain = qBound(0.0, e->entry.volume, 4.0);
         if (e->entry.audioMuted) gain = 0.0;
         const int trackIdx = e->entry.sourceTrack;
         if (trackIdx >= 0 && trackIdx < m_mixer->m_trackStates.size())
@@ -110,6 +140,9 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             // a stale position.
             const int dropBytes = static_cast<int>(qMin<qint64>(maxlen, e->ring.size()));
             e->ring.remove(0, dropBytes);
+            e->ringStartTlUs += static_cast<int64_t>(dropBytes) * 1'000'000LL
+                                / (AudioMixer::kSampleRateHz
+                                   * AudioMixer::kBytesPerFrame);
             continue;
         }
 
@@ -124,6 +157,9 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                 accum[i] += static_cast<int32_t>(src[i] * gain);
         }
         e->ring.remove(0, copyBytes);
+        e->ringStartTlUs += static_cast<int64_t>(copyBytes) * 1'000'000LL
+                            / (AudioMixer::kSampleRateHz
+                               * AudioMixer::kBytesPerFrame);
         anyMixed = true;
     }
 
@@ -154,104 +190,141 @@ AudioMixer::AudioMixer(QObject *parent) : QObject(parent) {
 }
 
 AudioMixer::~AudioMixer() {
+    // Stop the decode thread first so it can't queue more refills.
     if (m_decodeRunner) {
         m_decodeRunner->requestStop();
-        m_decodeRunner->wait(2000);
+        m_decodeRunner->wait();   // bounded by stop flag — refillRings exits at the top of its loop
         delete m_decodeRunner;
         m_decodeRunner = nullptr;
     }
-    {
-        QMutexLocker lock(&m_controlMutex);
-        m_playing.store(false, std::memory_order_release);
-        if (m_sink) m_sink->stop();
-        releaseAllEntriesLocked();
-        if (m_io) {
-            m_io->close();
-            delete m_io;
-            m_io = nullptr;
-        }
-        if (m_sink) {
-            delete m_sink;
-            m_sink = nullptr;
-        }
+    // Mark not playing and stop the audio sink BEFORE locking. QAudioSink
+    // delivers readData callbacks on its own worker thread; if we hold the
+    // mutex during stop(), an in-flight callback that's already parked on
+    // the mutex will resume against a half-destroyed object after we
+    // release the lock. Stopping the sink first lets that callback finish
+    // (it sees m_playing=false and returns silence) so the lock contention
+    // is gone by the time we tear m_io / m_sink / m_entries down.
+    m_playing.store(false, std::memory_order_release);
+    if (m_sink) m_sink->stop();
+
+    QMutexLocker lock(&m_controlMutex);
+    releaseAllEntriesLocked();
+    if (m_io) {
+        m_io->close();
+        delete m_io;
+        m_io = nullptr;
+    }
+    if (m_sink) {
+        delete m_sink;
+        m_sink = nullptr;
     }
 }
 
 void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
-    QMutexLocker lock(&m_controlMutex);
+    QStringList pendingErrors;
+    {
+        QMutexLocker lock(&m_controlMutex);
 
-    QHash<AudioTrackKey, AudioDecoderEntry *> retained;
-    int maxTrack = -1;
-    int openedCount = 0;
+        QHash<AudioTrackKey, AudioDecoderEntry *> retained;
+        int maxTrack = -1;
+        QSet<int> uniqueTracks;
 
-    for (const auto &e : entries) {
-        ++openedCount;
-        if (openedCount > kMaxAudioTracks) {
-            emit decoderError(QStringLiteral("AudioMixer: exceeded MAX_AUDIO_TRACKS=%1, dropping extra entry %2")
-                              .arg(kMaxAudioTracks).arg(e.filePath));
-            continue;
-        }
-        AudioTrackKey key{
-            e.filePath,
-            qRound64(e.clipIn * 1000.0),
-            e.sourceTrack,
-            e.sourceClipIndex
-        };
-        if (e.sourceTrack > maxTrack) maxTrack = e.sourceTrack;
-
-        AudioDecoderEntry *de = m_entries.take(key);
-        if (de) {
-            // Same key reappears — update mutable timeline metadata only.
-            const auto oldStart = de->entry.timelineStart;
-            const auto oldEnd = de->entry.timelineEnd;
-            de->entry = e;
-            if (!qFuzzyCompare(oldStart, e.timelineStart)
-                || !qFuzzyCompare(oldEnd, e.timelineEnd)) {
-                de->seekPending = true;
-                de->ring.clear();
-            }
-            retained.insert(key, de);
-        } else {
-            de = new AudioDecoderEntry;
-            de->entry = e;
-            if (!openEntry(de)) {
-                emit decoderError(QStringLiteral("Failed to open audio: %1").arg(e.filePath));
-                closeEntry(de);
+        for (const auto &e : entries) {
+            // Cap on UNIQUE source tracks, not total entry count, so a
+            // single track with many clips doesn't get its trailing entries
+            // silently dropped.
+            uniqueTracks.insert(e.sourceTrack);
+            if (uniqueTracks.size() > kMaxAudioTracks
+                && !uniqueTracks.contains(e.sourceTrack)) {
+                pendingErrors << QStringLiteral("AudioMixer: exceeded MAX_AUDIO_TRACKS=%1, dropping track %2 entry %3")
+                                  .arg(kMaxAudioTracks).arg(e.sourceTrack).arg(e.filePath);
                 continue;
             }
-            retained.insert(key, de);
+            AudioTrackKey key{
+                e.filePath,
+                qRound64(e.clipIn * 1000.0),
+                e.sourceTrack,
+                e.sourceClipIndex
+            };
+            if (e.sourceTrack > maxTrack) maxTrack = e.sourceTrack;
+
+            // Defensive: if the same key appears twice in one batch the
+            // earlier-opened entry would otherwise be overwritten and leak.
+            if (retained.contains(key)) {
+                pendingErrors << QStringLiteral("AudioMixer: duplicate AudioTrackKey for %1 (clipIn=%2 track=%3 clipIdx=%4); keeping the first")
+                                  .arg(e.filePath).arg(key.clipInMs).arg(key.sourceTrack).arg(key.sourceClipIndex);
+                continue;
+            }
+
+            AudioDecoderEntry *de = m_entries.take(key);
+            if (de) {
+                // Same key reappears — update mutable timeline metadata only.
+                const auto oldStart = de->entry.timelineStart;
+                const auto oldEnd = de->entry.timelineEnd;
+                de->entry = e;
+                if (!qFuzzyCompare(oldStart, e.timelineStart)
+                    || !qFuzzyCompare(oldEnd, e.timelineEnd)) {
+                    de->seekPending = true;
+                    de->ring.clear();
+                }
+                retained.insert(key, de);
+            } else {
+                de = new AudioDecoderEntry;
+                de->entry = e;
+                if (!openEntry(de)) {
+                    pendingErrors << QStringLiteral("AudioMixer: failed to open audio: %1").arg(e.filePath);
+                    closeEntry(de);
+                    continue;
+                }
+                retained.insert(key, de);
+            }
         }
+
+        // Anything still in m_entries is no longer in the new sequence.
+        for (auto *de : qAsConst(m_entries)) {
+            closeEntry(de);
+        }
+        m_entries = retained;
+
+        if (m_trackStates.size() < maxTrack + 1)
+            m_trackStates.resize(maxTrack + 1);
+
+        recomputeEffectiveGainsLocked();
+        ensureSinkLocked();
     }
-
-    // Anything still in m_entries is no longer in the new sequence.
-    for (auto *de : qAsConst(m_entries)) {
-        closeEntry(de);
-    }
-    m_entries = retained;
-
-    if (m_trackStates.size() < maxTrack + 1)
-        m_trackStates.resize(maxTrack + 1);
-
-    recomputeEffectiveGainsLocked();
-    ensureSinkLocked();
+    // Emit AFTER releasing the mutex so any future re-entrant slot (e.g. a
+    // listener that calls back into setSequence) does not deadlock.
+    for (const auto &msg : qAsConst(pendingErrors))
+        emit decoderError(msg);
 }
 
 void AudioMixer::seekTo(int64_t timelineUs) {
-    QMutexLocker lock(&m_controlMutex);
-    m_writeCursorUs.store(timelineUs, std::memory_order_release);
-    for (auto *e : qAsConst(m_entries)) {
-        if (!e) continue;
-        e->seekPending = true;
-        e->ring.clear();
-        e->eof = false;
+    // Hoist QAudioSink state changes outside the lock — start/reset can
+    // synchronously dispatch into MixerIODevice::readData on the audio
+    // worker thread, which would deadlock if it tries to take this same
+    // mutex.
+    QAudioSink *sinkSnap = nullptr;
+    MixerIODevice *ioSnap = nullptr;
+    bool restartAfterReset = false;
+    {
+        QMutexLocker lock(&m_controlMutex);
+        m_writeCursorUs.store(timelineUs, std::memory_order_release);
+        for (auto *e : qAsConst(m_entries)) {
+            if (!e) continue;
+            e->seekPending = true;
+            e->ring.clear();
+            e->ringStartTlUs = timelineUs;
+            e->eof = false;
+        }
+        sinkSnap = m_sink;
+        ioSnap = m_io;
+        restartAfterReset = (m_io && m_playing.load(std::memory_order_acquire));
     }
-    if (m_sink) {
-        // Drop any samples already in the OS audio buffer so post-seek audio
-        // starts cleanly. Without this the listener hears ~hardware-buffer
-        // worth of stale pre-seek audio after a long seek.
-        m_sink->reset();
-        if (m_io && m_playing.load(std::memory_order_acquire)) {
-            m_sink->start(m_io);
+    if (sinkSnap) {
+        // Drop OS-buffered samples so post-seek audio starts cleanly.
+        sinkSnap->reset();
+        if (restartAfterReset && ioSnap) {
+            sinkSnap->start(ioSnap);
         }
     }
 }
@@ -401,6 +474,9 @@ void AudioMixer::seekEntryToTimeline(AudioDecoderEntry *e, int64_t timelineUs) {
     av_seek_frame(e->fmtCtx, e->audioStreamIdx, ts, AVSEEK_FLAG_BACKWARD);
     avcodec_flush_buffers(e->codecCtx);
     e->ring.clear();
+    // The next sample appended to the ring corresponds to the timeline
+    // position we just seeked the file to.
+    e->ringStartTlUs = timelineUs;
     e->eof = false;
 }
 
@@ -408,14 +484,21 @@ void AudioMixer::resampleAndAppend(AudioDecoderEntry *e) {
     if (!e || !e->frame || !e->swrCtx) return;
     const int outSamples = swr_get_out_samples(e->swrCtx, e->frame->nb_samples);
     if (outSamples <= 0) return;
-    QByteArray buf;
-    buf.resize(outSamples * AudioMixer::kBytesPerFrame);
-    uint8_t *out[1] = { reinterpret_cast<uint8_t *>(buf.data()) };
+    const int prevSize = e->ring.size();
+    e->ring.resize(prevSize + outSamples * AudioMixer::kBytesPerFrame);
+    uint8_t *out[1] = {
+        reinterpret_cast<uint8_t *>(e->ring.data()) + prevSize
+    };
     const int got = swr_convert(e->swrCtx, out, outSamples,
                                 const_cast<const uint8_t **>(e->frame->data),
                                 e->frame->nb_samples);
+    // Truncate to actual output count. Note: ringStartTlUs is unchanged
+    // because we only appended to the back — readData advances ringStartTlUs
+    // on drain.
     if (got > 0) {
-        e->ring.append(buf.left(got * AudioMixer::kBytesPerFrame));
+        e->ring.resize(prevSize + got * AudioMixer::kBytesPerFrame);
+    } else {
+        e->ring.resize(prevSize);
     }
 }
 
@@ -466,11 +549,23 @@ void AudioMixer::refillRings() {
         if (cursorUs >= endUs) continue;
 
         if (e->seekPending) {
-            seekEntryToTimeline(e, qMax<int64_t>(cursorUs, startUs));
+            const int64_t target = qMax<int64_t>(cursorUs, startUs);
+            seekEntryToTimeline(e, target);
             e->seekPending = false;
         }
         if (e->ring.size() < kRingTargetBytes) {
             refillRingForEntry(e, kRingTargetBytes);
         }
     }
+}
+
+int64_t AudioMixer::audibleClockUs() const {
+    QMutexLocker lock(&m_controlMutex);
+    const int64_t cursor = m_writeCursorUs.load(std::memory_order_acquire);
+    if (!m_sink) return cursor;
+    const qint64 buffered = m_sink->bufferSize() - m_sink->bytesFree();
+    if (buffered <= 0) return cursor;
+    const int64_t bufferedUs = static_cast<int64_t>(buffered) * 1'000'000LL
+                               / (kBytesPerFrame * kSampleRateHz);
+    return qMax<int64_t>(0, cursor - bufferedUs);
 }
