@@ -56,43 +56,9 @@ VideoPlayer::VideoPlayer(QWidget *parent)
     m_seekTimer->setInterval(15);
     connect(m_seekTimer, &QTimer::timeout, this, &VideoPlayer::performPendingSeek);
 
-    m_audioPlayer = new QMediaPlayer(this);
-    m_audioOut = new QAudioOutput(this);
-    m_audioOut->setVolume(1.0);
-    m_audioPlayer->setAudioOutput(m_audioOut);
-    connect(m_audioPlayer, &QMediaPlayer::errorOccurred, this,
-            [](QMediaPlayer::Error err, const QString &msg) {
-                if (err != QMediaPlayer::NoError)
-                    qWarning() << "QMediaPlayer error:" << err << msg;
-            });
-    // Qt MediaFoundation setSource is async — apply deferred position/play
-    // when the new source finishes loading. Without this the audio side-player
-    // swallows the setPosition+play() issued immediately after setSource and
-    // the user hears silence after a file-switching seek or tick boundary.
-    connect(m_audioPlayer, &QMediaPlayer::mediaStatusChanged, this,
-            [this](QMediaPlayer::MediaStatus status) {
-                // Drop pending state if the load failed or the source was
-                // cleared — otherwise a broken file would leave the yield
-                // guard in applyAudioEntryAtTimeline permanently stuck.
-                if (status == QMediaPlayer::InvalidMedia
-                    || status == QMediaPlayer::NoMedia) {
-                    m_pendingAudioPositionMs = -1;
-                    m_pendingAudioPlay = false;
-                    return;
-                }
-                if (status != QMediaPlayer::LoadedMedia
-                    && status != QMediaPlayer::BufferedMedia) {
-                    return;
-                }
-                if (m_pendingAudioPositionMs >= 0) {
-                    m_audioPlayer->setPosition(m_pendingAudioPositionMs);
-                    m_pendingAudioPositionMs = -1;
-                }
-                if (m_pendingAudioPlay && m_playing && m_playbackSpeed >= 0.0) {
-                    m_audioPlayer->play();
-                }
-                m_pendingAudioPlay = false;
-            });
+    m_mixer = new AudioMixer(this);
+    connect(m_mixer, &AudioMixer::decoderError, this,
+            [](const QString &msg) { qWarning() << "AudioMixer:" << msg; });
 }
 
 VideoPlayer::~VideoPlayer()
@@ -402,13 +368,9 @@ void VideoPlayer::loadFile(const QString &filePath)
     }
     qInfo() << "  seekInternal(0) ok";
 
-    // NOTE: The audio side-player is now driven by setAudioSequence /
-    // applyAudioEntryAtTimeline from the A-track schedule, NOT by the video
-    // file currently decoded by this VideoPlayer. We deliberately do not
-    // bind m_audioPlayer to filePath here — audio and video are independent
-    // timelines so unlinked clips can play a J-cut / L-cut.
-    if (m_audioOut)
-        m_audioOut->setMuted(false);
+    // NOTE: AudioMixer owns the audio path now. loadFile only touches the
+    // video decoder; audio entry switching, mute, and seek are all driven
+    // by setAudioSequence -> m_mixer.
 
     // If a sequence is active, restore its slider range so the seekbar shows
     // the full timeline rather than just this file's duration.
@@ -546,9 +508,6 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         const int64_t localUs = entryLocalPositionUs(desiredIdx, clamped);
         seekInternal(localUs, true, true);
     }
-    // Audio mute may have changed even when the entry is otherwise unchanged
-    // (e.g. user toggled the M button on the active track) — always reapply.
-    applyActiveEntryAudioMute();
 
     // If a sequenceChanged arrived mid-playback (e.g. a linked-clip drag was
     // released while playing), loadFile+resetDecoder halted the playback
@@ -576,102 +535,21 @@ void VideoPlayer::setAudioSequence(const QVector<PlaybackEntry> &entries)
 {
     qInfo() << "VideoPlayer::setAudioSequence count=" << entries.size();
     m_audioSequence = entries;
+    if (!m_mixer) return;
+    m_mixer->setSequence(entries);
+    // Re-anchor the mixer to the current timeline position. setSequence
+    // alone leaves the master clock where it was; for fresh sequences (or
+    // after a re-emit during a drag) the user expects audio to track the
+    // current playhead.
+    m_mixer->seekTo(m_timelinePositionUs);
     if (entries.isEmpty()) {
-        if (m_audioPlayer) {
-            m_audioPlayer->stop();
-            m_audioPlayer->setSource(QUrl());
-        }
-        m_activeAudioEntry = -1;
-        m_audioLoadedFilePath.clear();
+        m_mixer->stop();
         return;
     }
-    // Pick the entry for the current timeline position and let the
-    // filePath comparison decide whether setSource is actually needed.
-    // Forcing setSource unconditionally races with Qt MediaFoundation's async
-    // source load on Windows: the player accepts setPosition/play() before the
-    // new source is ready and the audio ends up silent ("同期を切って配置を
-    // ずらすと音が消える"). The filePath check still picks up real file swaps
-    // (e.g. A2 fills A1's dragged gap) because the entry at the current time
-    // will have a different filePath in that case.
-    applyAudioEntryAtTimeline(m_timelinePositionUs, /*forceSourceReload=*/false, /*forceReposition=*/true);
-    applyActiveEntryAudioMute();
-}
-
-int VideoPlayer::findActiveAudioEntryAt(int64_t timelineUs) const
-{
-    if (m_audioSequence.isEmpty()) return -1;
-    const double tSec = static_cast<double>(timelineUs) / AV_TIME_BASE;
-    for (int i = 0; i < m_audioSequence.size(); ++i) {
-        const auto &e = m_audioSequence[i];
-        if (tSec >= e.timelineStart && tSec < e.timelineEnd)
-            return i;
-    }
-    return -1;
-}
-
-void VideoPlayer::applyAudioEntryAtTimeline(int64_t timelineUs, bool forceSourceReload, bool forceReposition)
-{
-    if (!m_audioPlayer) return;
-    if (m_audioSequence.isEmpty()) {
-        if (!m_audioLoadedFilePath.isEmpty()) {
-            m_audioPlayer->stop();
-            m_audioPlayer->setSource(QUrl());
-            m_audioLoadedFilePath.clear();
-        }
-        m_activeAudioEntry = -1;
-        return;
-    }
-    int idx = findActiveAudioEntryAt(timelineUs);
-    if (idx < 0) {
-        // In a gap — pause without clearing the source. Do NOT force a
-        // setSource on the next re-entry: Qt Media Foundation's setSource
-        // is async and ignores the immediately-following setPosition, which
-        // causes the audio to replay from 0 ("先頭からの音が流れる"). Let
-        // setPosition handle re-entry cleanly. Since the audio schedule now
-        // covers A1+A2+... with V1-wins resolution, full A-side gaps are
-        // rare — they only occur where no audio track has any clip.
-        if (m_audioPlayer->playbackState() == QMediaPlayer::PlayingState)
-            m_audioPlayer->pause();
-        m_activeAudioEntry = -1;
-        return;
-    }
-    const auto &target = m_audioSequence[idx];
-    // INVARIANT: m_audioLoadedFilePath MUST always reflect the player's
-    // current source. Never clear the source without also clearing this
-    // cache, and vice versa — otherwise needSwitch short-circuits and the
-    // player sits on a stale/empty source.
-    const bool needSwitch = forceSourceReload || (target.filePath != m_audioLoadedFilePath);
-    const double tSec = static_cast<double>(timelineUs) / AV_TIME_BASE;
-    const double entryLocalSec = target.clipIn + (tSec - target.timelineStart);
-    const qint64 posMs = qMax<qint64>(0, static_cast<qint64>(entryLocalSec * 1000.0));
-    if (needSwitch) {
-        // Source switch — stash position/play and let mediaStatusChanged
-        // apply them after Qt MF finishes the async load. Issuing setPosition
-        // + play() immediately here races with the async loader and leaves
-        // the side-player silent on Windows.
-        m_pendingAudioPositionMs = posMs;
-        m_pendingAudioPlay = (m_playing && m_playbackSpeed >= 0.0);
-        m_audioPlayer->setSource(QUrl::fromLocalFile(target.filePath));
-        m_audioLoadedFilePath = target.filePath;
-        m_activeAudioEntry = idx;
-        return;
-    }
-    // forceReposition is set from seek / boundary-jump call sites so a seek
-    // landing inside the SAME audio entry still updates the player position.
-    // Without it, seek-within-entry silently left the QMediaPlayer clock at
-    // its old position — which caused the "audio drops out after seek" report.
-    if (idx != m_activeAudioEntry || forceReposition) {
-        m_audioPlayer->setPosition(posMs);
-    }
-    m_activeAudioEntry = idx;
-    // Don't fight the pending-load path — if a setSource is still in flight
-    // the mediaStatusChanged handler owns the play() call.
-    if (m_pendingAudioPositionMs >= 0 || m_pendingAudioPlay) {
-        return;
-    }
-    if (m_playing && m_playbackSpeed >= 0.0
-        && m_audioPlayer->playbackState() != QMediaPlayer::PlayingState) {
-        m_audioPlayer->play();
+    if (m_playing && m_playbackSpeed >= 0.0) {
+        m_mixer->play();
+    } else {
+        m_mixer->pause();
     }
 }
 
@@ -741,27 +619,6 @@ int VideoPlayer::sliderTimelinePosition(int64_t timelineUs) const
     return static_cast<int>(qMin<int64_t>(ms, std::numeric_limits<int>::max()));
 }
 
-void VideoPlayer::applyActiveEntryAudioMute()
-{
-    // With the audio schedule owning the audio channel, mute state is
-    // derived from the active AUDIO entry (m_audioSequence[m_activeAudioEntry]),
-    // not the video entry. A track mute toggle flows through audioMuted on
-    // the PlaybackEntry and lands here.
-    if (!m_audioOut) return;
-    bool muted = false;
-    if (audioSequenceActive() && m_activeAudioEntry >= 0
-        && m_activeAudioEntry < m_audioSequence.size()) {
-        muted = m_audioSequence[m_activeAudioEntry].audioMuted;
-    } else if (!audioSequenceActive()) {
-        // No audio schedule at all — silence the side-player.
-        muted = true;
-    }
-    // Reverse playback already mutes audio elsewhere; don't fight that here.
-    if (m_playbackSpeed < 0.0)
-        muted = true;
-    m_audioOut->setMuted(muted);
-}
-
 bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
 {
     if (m_sequence.isEmpty()) return false;
@@ -792,7 +649,6 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     // inherit the previously-active clip's OBS-style scale/offset.
     if (m_glPreview)
         m_glPreview->setVideoSourceTransform(e.videoScale, e.videoDx, e.videoDy);
-    applyActiveEntryAudioMute();
     m_suppressUiUpdates = prevSuppress;
 
     // resetDecoder (called from loadFile when needSwitch) ran updatePlayButton
@@ -800,10 +656,9 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     if (wasPlayingOuter && needSwitch) {
         scheduleNextFrame();
     }
-    // Audio stays in step via the audio schedule path. forceReposition=true
-    // because this is a user-initiated seek — we WANT to update the audio
-    // player position even when the entry index didn't change.
-    applyAudioEntryAtTimeline(timelineUs, /*forceSourceReload=*/false, /*forceReposition=*/true);
+    // Audio side stays in step via the mixer's master clock — a seek
+    // updates m_writeCursorUs and lazily re-seeks every active entry.
+    if (m_mixer) m_mixer->seekTo(timelineUs);
     updatePlayButton();
 
     updatePositionUi();
@@ -845,15 +700,10 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
         return false;
     }
 
-    // Audio is driven by the independent A-track schedule — no direct
-    // m_audioPlayer ops here any more. Re-apply the audio schedule entry for
-    // the new timeline position so the A-side stays in step.
+    // Audio is driven by the AudioMixer's master clock now — re-anchor it
+    // so the new entry's local position is reached on the next refill tick.
     m_timelinePositionUs = static_cast<int64_t>(next.timelineStart * AV_TIME_BASE);
-    // Hard entry jump — always reposition the audio player so it starts at
-    // the new entry's local position even if the audio schedule stayed on
-    // the same entry index.
-    applyAudioEntryAtTimeline(m_timelinePositionUs, /*forceSourceReload=*/false, /*forceReposition=*/true);
-    applyActiveEntryAudioMute();
+    if (m_mixer) m_mixer->seekTo(m_timelinePositionUs);
 
     if (wasPlaying)
         m_playing = true;
@@ -898,17 +748,12 @@ void VideoPlayer::play()
     emit stateChanged(true);
     scheduleNextFrame();
 
-    // Kick the audio side-player via the independent audio schedule. If no
-    // audio schedule is set (legacy single-file mode or the user has no A
-    // clips), applyAudioEntryAtTimeline short-circuits and we stay silent —
-    // which is the correct new behaviour now that audio is owned by A-track.
-    // forceReposition=true so audio is aligned with the current playhead
-    // before resuming (otherwise a previous pause-then-seek can leave the
-    // player reading from a stale QMediaPlayer position).
-    applyAudioEntryAtTimeline(m_timelinePositionUs, /*forceSourceReload=*/false, /*forceReposition=*/true);
-    if (m_audioOut)
-        m_audioOut->setMuted(false);
-    applyActiveEntryAudioMute();
+    // Kick the AudioMixer into play. If the audio schedule is empty the
+    // mixer already stopped itself; otherwise this resumes from the
+    // current master-clock position. Reverse playback mutes audio in
+    // setPlaybackSpeed.
+    if (m_mixer && m_playbackSpeed >= 0.0)
+        m_mixer->play();
 }
 
 void VideoPlayer::pause()
@@ -920,8 +765,8 @@ void VideoPlayer::pause()
     updatePlayButton();
     emit stateChanged(false);
 
-    if (m_audioPlayer)
-        m_audioPlayer->pause();
+    if (m_mixer)
+        m_mixer->pause();
 }
 
 void VideoPlayer::stepForward()
@@ -945,9 +790,9 @@ void VideoPlayer::stop()
 {
     pause();
     seekInternal(0, true, true);
-    if (m_audioPlayer) {
-        m_audioPlayer->stop();
-        m_audioPlayer->setPosition(0);
+    if (m_mixer) {
+        m_mixer->stop();
+        m_mixer->seekTo(0);
     }
 }
 
@@ -993,17 +838,13 @@ void VideoPlayer::setPlaybackSpeed(double speed)
     if (m_playing)
         scheduleNextFrame();
 
-    if (m_audioPlayer) {
+    if (m_mixer) {
         if (m_playbackSpeed < 0.0) {
-            if (m_audioOut)
-                m_audioOut->setMuted(true);
-            m_audioPlayer->pause();
-        } else {
-            if (m_audioOut)
-                m_audioOut->setMuted(false);
-            m_audioPlayer->setPlaybackRate(absSpeed);
-            if (m_playing && m_audioPlayer->source().isValid())
-                m_audioPlayer->play();
+            // Reverse playback: silence the mixer. We don't yet support
+            // reverse audio — pause until forward playback resumes.
+            m_mixer->pause();
+        } else if (m_playing) {
+            m_mixer->play();
         }
     }
 }
@@ -1459,21 +1300,16 @@ void VideoPlayer::scheduleNextFrame()
     const int64_t frameIntervalUs = static_cast<int64_t>(baseFrameUs / absSpeed);
     int intervalMs = qMax(1, static_cast<int>(frameIntervalUs / 1000));
 
-    // Audio-paced scheduling: pace the next frame against the audio clock
-    // when the audio side-player is reading the same file as the active
-    // video entry. The naive "frameIntervalUs from now" interval accumulates
-    // decode latency into progressive drift on long clips, and also lets
-    // video run ahead of audio when QMediaPlayer's async setSource starts
-    // late. J-cut / L-cut falls through to the naive interval via the
-    // filePath guard so unlinked-clip playback is untouched.
-    if (m_audioPlayer && m_playbackSpeed >= 0.0
-        && m_audioPlayer->playbackState() == QMediaPlayer::PlayingState
-        && m_pendingAudioPositionMs < 0 && !m_pendingAudioPlay
-        && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()
-        && m_activeAudioEntry >= 0 && m_activeAudioEntry < m_audioSequence.size()
-        && m_sequence[m_activeEntry].filePath == m_audioSequence[m_activeAudioEntry].filePath) {
-        const int64_t audioPosUs = static_cast<int64_t>(m_audioPlayer->position()) * 1000;
-        const int64_t videoAheadUs = m_currentPositionUs - audioPosUs;
+    // Audio-paced scheduling: pace the next frame against the AudioMixer's
+    // master clock so video tracks the audible playhead. The mixer publishes
+    // its clock in TIMELINE microseconds (independent of which entry it's
+    // currently sourcing from), so the J-cut/L-cut filePath-guard the old
+    // QMediaPlayer path needed is gone — every active video entry can pace
+    // off the same single audio clock.
+    if (m_mixer && m_mixer->isPlaying() && m_playbackSpeed >= 0.0
+        && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+        const int64_t audioTlUs = m_mixer->masterClockUs();
+        const int64_t videoAheadUs = m_timelinePositionUs - audioTlUs;
         const int64_t waitUs = static_cast<int64_t>(videoAheadUs / absSpeed);
         // waitUs <= 0: video is behind audio — fire next tick ASAP so
         // correctVideoDriftAgainstAudioClock can catch up. waitUs > 0: video
@@ -1485,24 +1321,19 @@ void VideoPlayer::scheduleNextFrame()
 
 int VideoPlayer::correctVideoDriftAgainstAudioClock()
 {
-    // Same guards as the audio-paced branch in scheduleNextFrame — the two
-    // layers activate/deactivate in lockstep. Reverse playback, a pending
-    // async setSource, a J-cut/L-cut pair, or missing entries all short-
-    // circuit so unlinked-clip playback is untouched.
-    if (!m_audioPlayer || m_playbackSpeed < 0.0)
+    // Match the AudioMixer master clock against the video timeline cursor.
+    // Reverse playback or a missing video entry short-circuits to keep the
+    // legacy single-file path untouched. With the mixer publishing
+    // timeline-unified microseconds, J-cut/L-cut no longer needs a filePath
+    // guard — every active entry shares one clock source.
+    if (!m_mixer || m_playbackSpeed < 0.0)
         return 0;
-    if (m_audioPlayer->playbackState() != QMediaPlayer::PlayingState)
-        return 0;
-    if (m_pendingAudioPositionMs >= 0 || m_pendingAudioPlay)
+    if (!m_mixer->isPlaying())
         return 0;
     if (m_activeEntry < 0 || m_activeEntry >= m_sequence.size())
         return 0;
-    if (m_activeAudioEntry < 0 || m_activeAudioEntry >= m_audioSequence.size())
-        return 0;
-    if (m_sequence[m_activeEntry].filePath != m_audioSequence[m_activeAudioEntry].filePath)
-        return 0;
 
-    const int64_t audioPosUs = static_cast<int64_t>(m_audioPlayer->position()) * 1000;
+    const int64_t audioTlUs = m_mixer->masterClockUs();
     const int64_t frameUs = (m_frameDurationUs > 0) ? m_frameDurationUs : (AV_TIME_BASE / 30);
     // Threshold > 1.5 frames avoids skipping on natural scheduler jitter.
     const int64_t catchupThresholdUs = (frameUs * 3) / 2;
@@ -1510,7 +1341,7 @@ int VideoPlayer::correctVideoDriftAgainstAudioClock()
 
     int skipped = 0;
     while (skipped < maxSkips) {
-        if (audioPosUs - m_currentPositionUs <= catchupThresholdUs)
+        if (audioTlUs - m_timelinePositionUs <= catchupThresholdUs)
             break;
         // Skip-decode WITHOUT displaying — handlePlaybackTick calls
         // decodeNextFrame(true) right after this returns, so the frame the
@@ -2123,7 +1954,7 @@ void VideoPlayer::handlePlaybackTick()
                 m_currentPositionUs = entryEndLocalUs;
                 updatePositionUi();
                 pause();
-                if (m_audioPlayer) m_audioPlayer->stop();
+                if (m_mixer) m_mixer->stop();
                 return;
             }
         }
@@ -2135,16 +1966,15 @@ void VideoPlayer::handlePlaybackTick()
             updatePositionUi();
         }
         pause();
-        if (m_audioPlayer)
-            m_audioPlayer->stop();
+        if (m_mixer)
+            m_mixer->stop();
         return;
     }
 
-    // Keep the audio side aligned with the current timeline position —
-    // cheap when nothing changed, switches source when we've crossed an
-    // audio entry boundary. forceReposition=false: natural tick flow, don't
-    // spam setPosition every frame.
-    applyAudioEntryAtTimeline(m_timelinePositionUs, /*forceSourceReload=*/false, /*forceReposition=*/false);
+    // Audio is paced internally by AudioMixer's master clock — no per-tick
+    // reposition is needed during natural playback. Cross-entry boundaries
+    // and seeks are handled separately via m_mixer->seekTo from the
+    // seekToTimelineUs / advanceToEntry call sites.
 
     scheduleNextFrame();
 }

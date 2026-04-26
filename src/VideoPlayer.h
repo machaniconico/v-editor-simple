@@ -8,8 +8,7 @@
 #include <QTimer>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
-#include <QMediaPlayer>
-#include <QAudioOutput>
+#include "AudioMixer.h"
 #include <QVector>
 #include <QHash>
 #include <QRectF>
@@ -86,10 +85,12 @@ public:
     // switched automatically at clip boundaries. Empty argument falls back to
     // single-file mode (current loaded file is left intact).
     void setSequence(const QVector<PlaybackEntry> &entries);
-    // Audio-side schedule (A1 only for MVP). Drives m_audioPlayer independently
-    // from the video schedule — this is what makes unlinked J-cut / L-cut
-    // clips actually emit audio at their post-drag timing.
+    // Audio-side schedule routed to AudioMixer. The mixer owns its own
+    // FFmpeg decoder pool + ring buffers and mixes every active entry into
+    // a single QAudioSink output, so unlinked J-cut/L-cut clips and stacked
+    // A2/A3/... tracks all sound simultaneously.
     void setAudioSequence(const QVector<PlaybackEntry> &entries);
+    AudioMixer *audioMixer() { return m_mixer; }
     void setCanvasSize(int width, int height);
     void setColorCorrection(const ColorCorrection &cc);
     // Transient effect stack applied on top of every composed frame (live dialog preview).
@@ -237,15 +238,12 @@ private:
     // (no edge-case fallback to first/last; the composite path treats an
     // empty result as "no frame to draw").
     QVector<int> findActiveEntriesAt(int64_t timelineUs) const;
-    int findActiveAudioEntryAt(int64_t timelineUs) const;
-    void applyAudioEntryAtTimeline(int64_t timelineUs, bool forceSourceReload, bool forceReposition);
     int64_t entryLocalPositionUs(int entryIdx, int64_t timelineUs) const;
     int64_t fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) const;
     bool seekToTimelineUs(int64_t timelineUs, bool precise);
     bool advanceToEntry(int newEntryIdx);
     void applySequenceSliderRange();
     int sliderTimelinePosition(int64_t timelineUs) const;
-    void applyActiveEntryAudioMute();
     // A/V drift correction: when the audio side-player is reading the same
     // file as the active video entry, treat the audio clock as master and
     // skip-decode extra video frames if the video PTS has fallen behind.
@@ -341,8 +339,7 @@ private:
     QLabel *m_timeLabel;
     QTimer *m_playbackTimer = nullptr;
     QTimer *m_seekTimer = nullptr;
-    QMediaPlayer *m_audioPlayer = nullptr;
-    QAudioOutput *m_audioOut = nullptr;
+    AudioMixer *m_mixer = nullptr;
 
     AVFormatContext *m_formatCtx = nullptr;
     AVCodecContext *m_codecCtx = nullptr;
@@ -396,15 +393,6 @@ private:
     QVector<PlaybackEntry> m_sequence;
     int m_activeEntry = -1;
     QVector<PlaybackEntry> m_audioSequence;
-    int m_activeAudioEntry = -1;
-    QString m_audioLoadedFilePath;  // current m_audioPlayer source, tracked separately from m_loadedFilePath
-    // Qt MediaFoundation setSource() is asynchronous on Windows — setPosition
-    // and play() calls issued before LoadedMedia fires are silently dropped,
-    // leaving the audio side-player muted after a file switch. We stash the
-    // desired position and play-intent here and re-apply them when the
-    // QMediaPlayer::mediaStatusChanged signal reports LoadedMedia.
-    qint64 m_pendingAudioPositionMs = -1;
-    bool m_pendingAudioPlay = false;
     int64_t m_timelinePositionUs = 0;
     int64_t m_sequenceDurationUs = 0;
     QString m_loadedFilePath;
