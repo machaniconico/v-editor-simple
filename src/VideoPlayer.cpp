@@ -2066,6 +2066,26 @@ void VideoPlayer::handlePlaybackTick()
             }
         }
 
+        // Phase 1e occlusion culling: V1 is drawn last (on top) under the
+        // V_max -> V1 sort, so when V1 is fully opaque AND fills the canvas
+        // (scale=1, dx=dy=0) every V2+ overlay underneath it is invisible.
+        // Skip the V2+ decode loop entirely in that case — it dominates the
+        // multi-track stutter cost (decodeMs ~1685ms / 30 ticks).
+        // Default off so we don't change behavior on existing projects;
+        // VEDITOR_OCCLUSION_CULL=1 opt-in until the user signs off.
+        static const bool occlusionCull =
+            qEnvironmentVariableIntValue("VEDITOR_OCCLUSION_CULL") != 0;
+        bool v1FullyCoversCanvas = false;
+        if (occlusionCull && m_activeEntry >= 0
+            && m_activeEntry < m_sequence.size()) {
+            const auto &v1e = m_sequence[m_activeEntry];
+            v1FullyCoversCanvas = qFuzzyCompare(v1e.opacity, 1.0)
+                && qFuzzyCompare(v1e.videoScale, 1.0)
+                && qFuzzyIsNull(v1e.videoDx)
+                && qFuzzyIsNull(v1e.videoDy)
+                && v1e.sourceTrack == 0;
+        }
+
         if (threadedPool && nonV1Count >= 2) {
             struct OverlayJob {
                 TrackDecoder *d = nullptr;
@@ -2091,6 +2111,8 @@ void VideoPlayer::handlePlaybackTick()
             for (int idx : activeIdxs) {
                 if (idx < 0 || idx >= m_sequence.size())
                     continue;
+                if (v1FullyCoversCanvas && idx != m_activeEntry)
+                    continue; // V1 hides V2+ entirely — skip overlay decode
                 const auto &e = m_sequence[idx];
                 if (idx == m_activeEntry) {
                     if (m_lastV1RawFrame.isNull())
@@ -2150,6 +2172,8 @@ void VideoPlayer::handlePlaybackTick()
             for (int idx : activeIdxs) {
                 if (idx < 0 || idx >= m_sequence.size())
                     continue;
+                if (v1FullyCoversCanvas && idx != m_activeEntry)
+                    continue; // V1 hides V2+ entirely — skip overlay decode
                 const auto &e = m_sequence[idx];
                 DecodedLayer layer;
                 if (idx == m_activeEntry) {
