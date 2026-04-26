@@ -49,6 +49,11 @@ VideoPlayer::VideoPlayer(QWidget *parent)
     setupUI();
     m_playbackTimer = new QTimer(this);
     m_playbackTimer->setSingleShot(true);
+    // PreciseTimer keeps the actual fire interval close to the requested
+    // value; default CoarseTimer on Windows snaps to 16 ms steps which
+    // capped multi-track playback at ~30 fps even when each tick fits
+    // inside an 8 ms budget.
+    m_playbackTimer->setTimerType(Qt::PreciseTimer);
     connect(m_playbackTimer, &QTimer::timeout, this, &VideoPlayer::handlePlaybackTick);
 
     m_seekTimer = new QTimer(this);
@@ -2398,7 +2403,12 @@ QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
     // 100% opaque base layer paints over the canvas just like GL does.
     QImage composed = v1Frame.convertToFormat(QImage::Format_ARGB32_Premultiplied);
     QPainter p(&composed);
-    p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+    // Nearest-neighbor sampling. Software bilinear (the prior default) is
+    // ~5-10x more expensive at 1080p+ and was the dominant contributor to
+    // the multi-track "video heavy" regression. The user-visible aliasing
+    // for live preview is acceptable; the export path can re-enable smooth
+    // sampling if higher quality is needed there.
+    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
     p.setCompositionMode(QPainter::CompositionMode_SourceOver);
 
     const QSize canvas(composed.width(), composed.height());
