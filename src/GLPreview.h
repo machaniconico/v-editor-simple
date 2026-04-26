@@ -86,6 +86,15 @@ public:
     double videoSourceDx()    const { return m_videoSourceDx; }
     double videoSourceDy()    const { return m_videoSourceDy; }
     void resetVideoSourceTransform();
+    // When true, paintGL ignores m_videoSourceScale/Dx/Dy on the GL
+    // viewport. The multi-track compositor pre-bakes per-clip transforms
+    // into the canvas image, so the GL viewport must render identity to
+    // avoid double-scaling. The drag-handle UI keeps reading the live
+    // transform from m_videoSourceScale so user gestures aren't fought
+    // by the per-tick composite pass that previously called
+    // setVideoSourceTransform(1, 0, 0) and clobbered the drag state.
+    void setCompositeBakedMode(bool enabled);
+    bool compositeBakedMode() const { return m_compositeBakedMode; }
     // US-T39 Snap strength adjustment — 0 disables snap, larger values make
     // it pull from farther away. MainWindow persists via QSettings.
     void setSnapStrength(double pixels) { m_snapStrength = qMax(0.0, pixels); }
@@ -188,6 +197,7 @@ private:
     double m_videoSourceScale = 1.0;
     double m_videoSourceDx = 0.0;
     double m_videoSourceDy = 0.0;
+    bool m_compositeBakedMode = false;
     double m_snapStrength = 12.0;
     bool m_videoTransformSelected = false;
     enum VideoDragMode { VideoDragNone, VideoDragMoving, VideoDragResizing };

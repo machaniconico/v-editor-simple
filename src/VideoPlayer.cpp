@@ -1823,16 +1823,17 @@ void VideoPlayer::handlePlaybackTick()
     m_deferDisplayThisTick = willComposite;
 
     // When leaving the compositor path, restore the active entry's
-    // OBS-style transform on the GL viewport. The compositor resets the
-    // viewport to identity (1,0,0) so the canvas-final composite isn't
-    // transformed again — but a non-composite tick ships the raw frame
-    // straight to GL, so the viewport has to carry the entry's
-    // scale/dx/dy or the user's pan/zoom snaps off the moment the
-    // overlay ends.
+    // OBS-style transform on the GL viewport. The compositor switches the
+    // GL viewport to "composite-baked" mode (skipping its own scale apply)
+    // so the canvas-final composite isn't transformed again — but a
+    // non-composite tick ships the raw frame straight to GL, so the
+    // viewport has to carry the entry's scale/dx/dy or the user's pan /
+    // zoom snaps off the moment the overlay ends.
     if (m_lastTickWasComposite && !willComposite && m_glPreview
         && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
         const auto &v1e = m_sequence[m_activeEntry];
         m_glPreview->setVideoSourceTransform(v1e.videoScale, v1e.videoDx, v1e.videoDy);
+        m_glPreview->setCompositeBakedMode(false);
     }
     m_lastTickWasComposite = willComposite;
 
@@ -1927,25 +1928,35 @@ void VideoPlayer::handlePlaybackTick()
                     const auto &v1e = m_sequence[m_activeEntry];
                     m_glPreview->setVideoSourceTransform(
                         v1e.videoScale, v1e.videoDx, v1e.videoDy);
+                    m_glPreview->setCompositeBakedMode(false);
                 }
                 displayFrame(m_lastV1RawFrame);
             } else {
                 m_canvasBase.fill(Qt::black);
                 const QImage composed = composeMultiTrackFrame(m_canvasBase, layers);
+                // Switch the GL viewport into baked mode so paintGL skips
+                // applying m_videoSourceScale on top of the canvas (which
+                // already has every layer's transform baked in). This
+                // intentionally does NOT touch m_videoSourceScale itself
+                // — that field is the active drag state for the OBS-style
+                // resize handles, and clobbering it 30 times a second
+                // (the prior behavior) made resize/move drags impossible
+                // during multi-track playback.
                 if (m_glPreview)
-                    m_glPreview->setVideoSourceTransform(1.0, 0.0, 0.0);
+                    m_glPreview->setCompositeBakedMode(true);
                 displayFrame(composed);
             }
         } else {
             // Every overlay bailed (decoder open failed, slot exhausted).
             // Fall back to the V1-only display, and restore V1's transform
-            // on the GL viewport — composite branch sets it to identity to
-            // keep the baked transform from being applied twice, but we're
+            // on the GL viewport — composite branch puts it in baked mode
+            // to keep the transform from being applied twice, but we're
             // back on the raw V1 frame now so V1 has to carry its own
             // transform again or it snaps to identity.
             if (m_glPreview && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
                 const auto &v1e = m_sequence[m_activeEntry];
                 m_glPreview->setVideoSourceTransform(v1e.videoScale, v1e.videoDx, v1e.videoDy);
+                m_glPreview->setCompositeBakedMode(false);
             }
             displayFrame(m_lastV1RawFrame);
         }

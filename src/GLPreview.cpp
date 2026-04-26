@@ -556,7 +556,13 @@ void GLPreview::paintGL()
     // US-T34 OBS-style source transform — shrink/move the viewport so the
     // same texture renders inside a translated+scaled sub-rect of the
     // letterbox. OpenGL's Y axis is bottom-up, so dy is inverted.
-    if (m_videoSourceScale != 1.0 || m_videoSourceDx != 0.0 || m_videoSourceDy != 0.0) {
+    // Skip the viewport transform when the multi-track compositor has
+    // already baked per-clip scale/dx/dy into the canvas image. Without
+    // this guard, the per-tick composite pass would either clobber the
+    // user's drag state (if it called setVideoSourceTransform(1, 0, 0))
+    // or apply the transform twice on top of the baked canvas.
+    if (!m_compositeBakedMode
+        && (m_videoSourceScale != 1.0 || m_videoSourceDx != 0.0 || m_videoSourceDy != 0.0)) {
         const int baseW = viewportW;
         const int baseH = viewportH;
         const int newW = qMax(1, qRound(baseW * m_videoSourceScale));
@@ -903,6 +909,13 @@ void GLPreview::resetVideoSourceTransform()
     m_videoDragMode = VideoDragNone;
     m_videoDragHandle = HandleNone;
     emit videoSourceTransformChanged(m_videoSourceScale, m_videoSourceDx, m_videoSourceDy);
+    update();
+}
+
+void GLPreview::setCompositeBakedMode(bool enabled)
+{
+    if (m_compositeBakedMode == enabled) return;
+    m_compositeBakedMode = enabled;
     update();
 }
 
