@@ -741,8 +741,14 @@ void VideoPlayer::setCanvasSize(int width, int height)
 
 void VideoPlayer::play()
 {
-    if (!m_formatCtx || !m_codecCtx)
+    qInfo() << "VideoPlayer::play() entry m_playing=" << m_playing
+            << "speed=" << m_playbackSpeed
+            << "tlPos=" << m_timelinePositionUs
+            << "activeEntry=" << m_activeEntry;
+    if (!m_formatCtx || !m_codecCtx) {
+        qWarning() << "VideoPlayer::play() no decoder, abort";
         return;
+    }
 
     if (m_playing)
         return;

@@ -8,8 +8,11 @@
 #include <QSet>
 #include <QStringList>
 #include <QWaitCondition>
+#include <QMediaDevices>
+#include <QAudioDevice>
 #include <cstring>
 #include <algorithm>
+#include <limits>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -78,6 +81,27 @@ class MixerIODevice : public QIODevice {
 public:
     explicit MixerIODevice(AudioMixer *mixer) : m_mixer(mixer) {}
     ~MixerIODevice() override = default;
+
+    // QAudioSink in Qt 6 pull mode (start(QIODevice*)) checks
+    // bytesAvailable() before calling readData — if it returns 0 the
+    // sink transitions to IdleState and STOPS pulling. Our mixer
+    // generates data on demand from FFmpeg decoders + a silence
+    // fallback, so we always have data to give. Returning a large
+    // value here keeps the sink in ActiveState and the readData
+    // callback firing. Without this override, the sink went Active
+    // for ~8 ms after start() then went Idle and never called
+    // readData again — the actual root cause of "no audio plays" in
+    // Phase 2 sum-mix.
+    bool isSequential() const override { return true; }
+    // Return the full sink buffer size — enough for the sink to call
+    // readData and pull a full chunk every iteration. Returning a huge
+    // value (INT_MAX, etc.) causes Qt to allocate an impossibly large
+    // internal buffer and freeze the audio worker thread.
+    qint64 bytesAvailable() const override {
+        return AudioMixer::kSampleRateHz
+               * AudioMixer::kBytesPerFrame; // ~1 second of audio
+    }
+
 protected:
     qint64 readData(char *data, qint64 maxlen) override;
     qint64 writeData(const char *, qint64) override { return -1; }
@@ -309,8 +333,14 @@ AudioMixer::AudioMixer(QObject *parent) : QObject(parent) {
     m_format.setChannelCount(kChannels);
     m_format.setSampleFormat(QAudioFormat::Int16);
 
+    qInfo() << "AudioMixer::ctor format SR=" << m_format.sampleRate()
+            << "Ch=" << m_format.channelCount()
+            << "Fmt=" << m_format.sampleFormat();
+
     m_decodeRunner = new AudioDecodeRunner(this);
     m_decodeRunner->start();
+    qInfo() << "AudioMixer::ctor decode thread started running="
+            << m_decodeRunner->isRunning();
 }
 
 AudioMixer::~AudioMixer() {
@@ -345,6 +375,8 @@ AudioMixer::~AudioMixer() {
 }
 
 void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
+    qInfo() << "AudioMixer::setSequence in=" << entries.size()
+            << "existing=" << m_entries.size();
     QStringList pendingErrors;
     {
         QMutexLocker lock(&m_controlMutex);
@@ -416,6 +448,9 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
 
         recomputeEffectiveGainsLocked();
         ensureSinkLocked();
+        qInfo() << "AudioMixer::setSequence reconciled entries=" << m_entries.size()
+                << "trackStates=" << m_trackStates.size()
+                << "sink=" << (m_sink ? m_sink->state() : QAudio::StoppedState);
     }
     // Emit AFTER releasing the mutex so any future re-entrant slot (e.g. a
     // listener that calls back into setSequence) does not deadlock.
@@ -425,6 +460,8 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
 }
 
 void AudioMixer::seekTo(int64_t timelineUs) {
+    qInfo() << "AudioMixer::seekTo us=" << timelineUs
+            << "playing=" << m_playing.load(std::memory_order_acquire);
     // Hoist QAudioSink state changes outside the lock — start/reset can
     // synchronously dispatch into MixerIODevice::readData on the audio
     // worker thread, which would deadlock if it tries to take this same
@@ -465,23 +502,39 @@ void AudioMixer::seekTo(int64_t timelineUs) {
 }
 
 void AudioMixer::play() {
+    qInfo() << "AudioMixer::play entries=" << m_entries.size();
+    QAudioSink *sinkSnap = nullptr;
+    QIODevice *ioSnap = nullptr;
     {
         QMutexLocker lock(&m_controlMutex);
         m_playing.store(true, std::memory_order_release);
         ensureSinkLocked();
-        if (m_sink) {
-            if (m_sink->state() == QAudio::SuspendedState
-                || m_sink->state() == QAudio::IdleState) {
-                m_sink->resume();
-            } else if (m_sink->state() == QAudio::StoppedState && m_io) {
-                m_sink->start(m_io);
-            }
+        sinkSnap = m_sink;
+        ioSnap = m_io;
+    }
+    // sink->start() / resume() must run OUTSIDE the lock — Qt's audio
+    // sink can synchronously dispatch into MixerIODevice::readData on
+    // its worker thread, which would deadlock if we still held
+    // m_controlMutex.
+    if (sinkSnap) {
+        const auto preState = sinkSnap->state();
+        if (preState == QAudio::SuspendedState
+            || preState == QAudio::IdleState) {
+            sinkSnap->resume();
+        } else if (preState == QAudio::StoppedState && ioSnap) {
+            sinkSnap->start(ioSnap);
         }
+        qInfo() << "AudioMixer::play sink pre=" << preState
+                << "post=" << sinkSnap->state()
+                << "error=" << sinkSnap->error();
+    } else {
+        qWarning() << "AudioMixer::play m_sink is null after ensureSinkLocked!";
     }
     if (m_decodeRunner) m_decodeRunner->wake();
 }
 
 void AudioMixer::pause() {
+    qInfo() << "AudioMixer::pause";
     QMutexLocker lock(&m_controlMutex);
     m_playing.store(false, std::memory_order_release);
     if (m_sink && m_sink->state() == QAudio::ActiveState) {
@@ -490,6 +543,7 @@ void AudioMixer::pause() {
 }
 
 void AudioMixer::stop() {
+    qInfo() << "AudioMixer::stop";
     QMutexLocker lock(&m_controlMutex);
     m_playing.store(false, std::memory_order_release);
     if (m_sink) m_sink->stop();
@@ -523,22 +577,80 @@ void AudioMixer::setTrackGain(int trackIdx, double gain) {
 }
 
 bool AudioMixer::ensureSinkLocked() {
+    // NOTE: callers may hold m_controlMutex. We must not call
+    // m_sink->start() here because Qt's audio sink (especially the
+    // Windows backend) can synchronously dispatch into MixerIODevice::readData
+    // on the audio worker thread, and readData takes m_controlMutex —
+    // so a start() call from inside the lock deadlocks the audio worker
+    // and freezes the GUI thread for the duration of Qt's internal
+    // timeout. Sink construction is fine (no callbacks fire); the actual
+    // start() is hoisted to startSinkUnlocked() called from outside the
+    // mutex.
     if (m_sink && m_io) return true;
     if (!m_io) {
         m_io = new MixerIODevice(this);
         m_io->open(QIODevice::ReadOnly);
+        qInfo() << "AudioMixer: MixerIODevice opened";
     }
     if (!m_sink) {
-        m_sink = new QAudioSink(m_format, this);
+        // Probe the default audio device + verify format support before
+        // constructing the sink. Without this, an unsupported sample
+        // rate / channel layout silently produces a sink that's "started"
+        // but emits no sound — the regression Phase 2 introduced.
+        QAudioDevice device = QMediaDevices::defaultAudioOutput();
+        if (device.isNull()) {
+            qWarning() << "AudioMixer: no default audio output device — sink will be silent";
+        } else {
+            qInfo() << "AudioMixer: default audio output =" << device.description();
+            const bool supported = device.isFormatSupported(m_format);
+            qInfo() << "AudioMixer: requested format supported by device =" << supported;
+            if (!supported) {
+                const QAudioFormat preferred = device.preferredFormat();
+                qWarning() << "AudioMixer: format not supported, falling back to preferred"
+                           << "SR=" << preferred.sampleRate()
+                           << "Ch=" << preferred.channelCount()
+                           << "Fmt=" << preferred.sampleFormat();
+                // Keep our internal mix at 48k/s16/stereo (swr already
+                // resamples decoded streams to that). If the device
+                // really can't accept 48k/s16/stereo, hand it the
+                // preferred format — but this means swr's output won't
+                // match the sink's expectation. The mismatch is a known
+                // hazard; the warning is the minimum so we know if it
+                // ever fires on the user's rig.
+                if (preferred.sampleRate() == kSampleRateHz
+                    && preferred.channelCount() == kChannels
+                    && preferred.sampleFormat() == QAudioFormat::Int16) {
+                    qInfo() << "AudioMixer: preferred matches mix format — using preferred";
+                    m_format = preferred;
+                } else {
+                    qWarning() << "AudioMixer: preferred format diverges from internal mix — keeping requested format and hoping for the best";
+                }
+            }
+            m_sink = new QAudioSink(device, m_format, this);
+        }
+        if (!m_sink) {
+            // Fallback: construct without explicit device.
+            m_sink = new QAudioSink(m_format, this);
+        }
         // Keep the OS buffer modest so seek latency stays low while leaving
         // enough headroom that decoder hiccups don't underrun.
         m_sink->setBufferSize(static_cast<qsizetype>(kSampleRateHz) * kBytesPerFrame / 5); // ~200 ms
+        qInfo() << "AudioMixer: QAudioSink created bufferSize=" << m_sink->bufferSize()
+                << "state=" << m_sink->state();
+
+        // Surface state transitions and errors so silent sink failures
+        // become visible in the log.
+        QObject::connect(m_sink, &QAudioSink::stateChanged, this,
+            [this](QAudio::State s) {
+                qInfo() << "AudioMixer: sink stateChanged ->" << s
+                        << "error=" << (m_sink ? m_sink->error() : QAudio::NoError);
+            });
     }
-    if (m_sink->state() == QAudio::StoppedState) {
-        m_sink->start(m_io);
-        if (!m_playing.load(std::memory_order_acquire))
-            m_sink->suspend();
-    }
+    // start() is intentionally NOT called here — it would deadlock when
+    // ensureSinkLocked is invoked under m_controlMutex (the Windows
+    // QAudioSink synchronously dispatches into readData during start,
+    // and readData takes the same mutex). Callers (play/seekTo) start
+    // the sink outside the lock.
     return true;
 }
 
@@ -560,35 +672,54 @@ void AudioMixer::releaseAllEntriesLocked() {
 
 bool AudioMixer::openEntry(AudioDecoderEntry *e) {
     if (!e) return false;
-    if (avformat_open_input(&e->fmtCtx, e->entry.filePath.toUtf8().constData(), nullptr, nullptr) < 0)
+    qInfo() << "AudioMixer::openEntry path=" << e->entry.filePath
+            << "track=" << e->entry.sourceTrack;
+    if (avformat_open_input(&e->fmtCtx, e->entry.filePath.toUtf8().constData(), nullptr, nullptr) < 0) {
+        qWarning() << "AudioMixer::openEntry avformat_open_input FAILED" << e->entry.filePath;
         return false;
-    if (avformat_find_stream_info(e->fmtCtx, nullptr) < 0)
+    }
+    if (avformat_find_stream_info(e->fmtCtx, nullptr) < 0) {
+        qWarning() << "AudioMixer::openEntry avformat_find_stream_info FAILED";
         return false;
+    }
     int idx = av_find_best_stream(e->fmtCtx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-    if (idx < 0) return false;
+    if (idx < 0) {
+        qWarning() << "AudioMixer::openEntry no audio stream found";
+        return false;
+    }
     e->audioStreamIdx = idx;
     AVCodecParameters *par = e->fmtCtx->streams[idx]->codecpar;
     const AVCodec *codec = avcodec_find_decoder(par->codec_id);
-    if (!codec) return false;
+    if (!codec) { qWarning() << "AudioMixer::openEntry no decoder for codec_id" << par->codec_id; return false; }
     e->codecCtx = avcodec_alloc_context3(codec);
-    if (!e->codecCtx) return false;
-    if (avcodec_parameters_to_context(e->codecCtx, par) < 0) return false;
-    if (avcodec_open2(e->codecCtx, codec, nullptr) < 0) return false;
+    if (!e->codecCtx) { qWarning() << "AudioMixer::openEntry alloc_context3 failed"; return false; }
+    if (avcodec_parameters_to_context(e->codecCtx, par) < 0) { qWarning() << "AudioMixer::openEntry params_to_context failed"; return false; }
+    if (avcodec_open2(e->codecCtx, codec, nullptr) < 0) { qWarning() << "AudioMixer::openEntry avcodec_open2 failed"; return false; }
+    qInfo() << "AudioMixer::openEntry codec=" << codec->name
+            << "src SR=" << e->codecCtx->sample_rate
+            << "ch=" << e->codecCtx->ch_layout.nb_channels
+            << "fmt=" << e->codecCtx->sample_fmt;
 
     AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
     if (swr_alloc_set_opts2(&e->swrCtx,
             &outLayout, AV_SAMPLE_FMT_S16, AudioMixer::kSampleRateHz,
             &e->codecCtx->ch_layout, e->codecCtx->sample_fmt, e->codecCtx->sample_rate,
             0, nullptr) < 0) {
+        qWarning() << "AudioMixer::openEntry swr_alloc_set_opts2 failed";
         return false;
     }
-    if (!e->swrCtx || swr_init(e->swrCtx) < 0) return false;
+    if (!e->swrCtx || swr_init(e->swrCtx) < 0) {
+        qWarning() << "AudioMixer::openEntry swr_init failed swrCtx="
+                   << static_cast<void *>(e->swrCtx);
+        return false;
+    }
 
     e->pkt = av_packet_alloc();
     e->frame = av_frame_alloc();
-    if (!e->pkt || !e->frame) return false;
+    if (!e->pkt || !e->frame) { qWarning() << "AudioMixer::openEntry packet/frame alloc failed"; return false; }
     e->seekPending = true;
     e->eof = false;
+    qInfo() << "AudioMixer::openEntry SUCCESS path=" << e->entry.filePath;
     return true;
 }
 
