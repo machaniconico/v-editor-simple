@@ -6,6 +6,7 @@
 #include <QPushButton>
 #include <QSlider>
 #include <QTimer>
+#include <QElapsedTimer>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include "AudioMixer.h"
@@ -381,6 +382,7 @@ private:
     int64_t m_frameDurationUs = 0;
     double m_displayAspectRatio = 0.0;
     bool m_loggedCullState = false;
+    QElapsedTimer m_tickWallStart;
     int m_canvasWidth = 1920;
     int m_canvasHeight = 1080;
     double m_playbackSpeed = 1.0;

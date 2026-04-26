@@ -1470,6 +1470,18 @@ void VideoPlayer::scheduleNextFrame()
             : static_cast<int>(qBound<int64_t>(floorMs, waitUs / 1000,
                                                static_cast<int64_t>(frameIntervalMs)));
     }
+    // Body-time correction only when the cap actually fired. In the
+    // synced case the audio-paced wait already equals frameInterval -
+    // body_time (audible advances by body_time during the tick body),
+    // so subtracting body_time again would over-pace the video and
+    // desync against audio. When the cap fired (audio buffer lag pushed
+    // waitUs > frameInterval), the wait was clamped to frameInterval
+    // and body_time wasn't subtracted; subtract it here so the cycle
+    // matches frameInterval rather than body+frameInterval.
+    if (m_tickWallStart.isValid() && intervalMs == frameIntervalMs) {
+        const qint64 bodyMs = m_tickWallStart.elapsed();
+        intervalMs = qMax(1, intervalMs - static_cast<int>(bodyMs));
+    }
     m_playbackTimer->start(intervalMs);
 }
 
@@ -1979,6 +1991,12 @@ void VideoPlayer::handlePlaybackTick()
 {
     if (!m_playing)
         return;
+
+    // Anchor the tick body so scheduleNextFrame can fire the next tick at
+    // tickWallStart + frameInterval (constant cadence) rather than
+    // bodyEnd + frameInterval (sliding cadence that drifts ~body_time
+    // slower than real time).
+    m_tickWallStart.start();
 
     QElapsedTimer tickTimer;
     const bool traceTick = tickTraceEnabled();
