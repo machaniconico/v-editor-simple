@@ -2515,6 +2515,12 @@ void VideoPlayer::handlePlaybackTick()
                         m_glPreview->setCompositeBakedMode(true);
                     displayFrame(m_canvasBase);
                 } else {
+                    // Legacy path (VEDITOR_INPLACE_COMPOSE_DISABLE=1): allocates
+                    // a separate `composed` via composeMultiTrackFrame's
+                    // convertToFormat shallow share + QPainter detach. Same
+                    // baked-mode rationale as the in-place branch above —
+                    // setCompositeBakedMode(true) keeps paintGL from applying
+                    // m_videoSourceScale on top of the already-baked canvas.
                     const QImage composed = composeMultiTrackFrame(m_canvasBase, layers);
                     if (traceTick)
                         m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
