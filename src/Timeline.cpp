@@ -2386,6 +2386,10 @@ void Timeline::onTrackClipClicked(int index)
 {
     m_audioTrack->setSelectedClip(index);
     emit clipSelected(index);
+    // V3 sprint — track-aware overload. m_videoTrack is m_videoTracks[0]
+    // (V1) by construction, so this legacy single-track entry point always
+    // refers to V1.
+    emit clipSelectedOnTrack(index < 0 ? -1 : 0, index);
 }
 
 bool Timeline::eventFilter(QObject *watched, QEvent *event)
@@ -2440,6 +2444,11 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
 
         m_inLinkedSelectionSync = false;
         emit clipSelected(index);
+        // V3 sprint — track-aware overload. Resolve which video-track row
+        // the click landed on; audio-track clicks emit trackIdx=-1 so the
+        // edit target falls back to follow-active.
+        int videoTrackIdx = m_videoTracks.indexOf(track);
+        emit clipSelectedOnTrack(index < 0 ? -1 : videoTrackIdx, index);
     });
     connect(track, &TimelineTrack::emptyAreaClicked, this, [this]() {
         clearAllSelections();
@@ -2609,7 +2618,11 @@ void Timeline::clearAllSelections()
     };
     for (auto *t : m_videoTracks) clearOne(t);
     for (auto *t : m_audioTracks) clearOne(t);
-    if (changed) emit clipSelected(-1);
+    if (changed) {
+        emit clipSelected(-1);
+        // V3 sprint — track-aware overload, deselect path.
+        emit clipSelectedOnTrack(-1, -1);
+    }
 }
 
 void Timeline::onTrackModified()
@@ -2891,6 +2904,11 @@ void Timeline::restoreState(const TimelineState &state)
     m_playheadPos = state.playheadPos;
     syncPlayheadOverlay();
     emit clipSelected(state.selectedClip);
+    // V3 sprint — track-aware overload. restoreState only touches V1
+    // (m_videoTrack alias) so the resolved track is always V1, or -1
+    // for the deselect case.
+    emit clipSelectedOnTrack(state.selectedClip < 0 ? -1 : 0,
+                             state.selectedClip);
     // setClips bypasses the modified() signal path; trigger explicitly so the
     // VideoPlayer rebuilds its sequence after undo/redo.
     emit sequenceChanged(computePlaybackSequence());

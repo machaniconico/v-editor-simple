@@ -336,6 +336,10 @@ public:
 
 signals:
     void clipSelected(int index);
+    // V3 sprint — track-aware overload. emitted alongside the int-only
+    // signal so MainWindow can drop its playhead heuristic and resolve
+    // the (sourceTrack, sourceClipIndex) directly.
+    void clipSelectedOnTrack(int trackIdx, int clipIdx);
     void scrubPositionChanged(double seconds);
     void positionChanged(double seconds);
     void sequenceChanged(const QVector<PlaybackEntry> &entries);
