@@ -193,6 +193,16 @@ void VideoPlayer::setupUI()
                 if (targetIdx < 0 || targetIdx >= m_sequence.size())
                     return;
                 const auto &entry = m_sequence[targetIdx];
+                static bool loggedFirstDragEmit = false;
+                if (!loggedFirstDragEmit) {
+                    qInfo() << "[drag-emit] first emit since startup — m_editTargetEntry="
+                            << m_editTargetEntry
+                            << "m_activeEntry=" << m_activeEntry
+                            << "targetIdx=" << targetIdx
+                            << "entry.sourceTrack=" << (targetIdx >= 0 ? m_sequence[targetIdx].sourceTrack : -1)
+                            << "entry.sourceClipIndex=" << (targetIdx >= 0 ? m_sequence[targetIdx].sourceClipIndex : -1);
+                    loggedFirstDragEmit = true;
+                }
                 emit videoSourceTransformChanged(entry.sourceTrack, entry.sourceClipIndex,
                                                  scale, dx, dy);
             });
