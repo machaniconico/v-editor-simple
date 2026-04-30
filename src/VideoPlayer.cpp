@@ -53,6 +53,40 @@ inline int playbackProxyDivisor()
     return kDivisor;
 }
 
+// Phase 1e Win #9 — canvas proxy divisor for the multi-track compose path.
+// playbackProxyDivisor() shrinks the *source* layer images via sws_scale dst
+// dims; that already cuts decode bandwidth, but the compositor canvas
+// (m_canvasBase) was still allocated at full m_canvasWidth/m_canvasHeight.
+// The result: every multi-track tick paid for an 8 MB ARGB32 fill, a 4x
+// pixel-write upscale during QPainter::drawImage (540p layer -> 1080p
+// canvas), and a 4x larger texture upload. By matching the canvas size to
+// the decoded layer resolution we collapse the upscale to a 1:1 blit and
+// quarter the fill / upload bandwidth — GLPreview's fragment shader still
+// stretches the smaller texture to the widget viewport with bilinear
+// sampling, so the visible output is the same as PLAYBACK_PROXY=2 already
+// produces for the V1-only fast path.
+//
+// Default: divisor follows playbackProxyDivisor() so the canvas always
+// matches the decoded layer res (PLAYBACK_PROXY=1 keeps the canvas
+// full-res, preserving legacy behaviour for users who opt out of decode
+// proxy). VEDITOR_CANVAS_PROXY_DISABLE=1 forces full-res canvas
+// regardless, in case the proxy interaction surfaces a regression.
+//
+// Caller-side guard (handlePlaybackTick): when m_textOverlays is non-empty
+// we revert to full-res because composeFrameWithOverlays paints text at
+// pixel coordinates over m_canvasBase — shrinking the canvas would reposition
+// the text after GL upscale. Multi-track + text overlays therefore stays
+// on the legacy full-res path; no regression for that minority case.
+inline int canvasProxyDivisor()
+{
+    static const bool kDisabled = []() {
+        return qEnvironmentVariableIntValue("VEDITOR_CANVAS_PROXY_DISABLE") != 0;
+    }();
+    if (kDisabled)
+        return 1;
+    return qMax(1, playbackProxyDivisor());
+}
+
 // Phase 1e — opaque reference into FFmpeg's D3D11 frame pool. Only valid
 // while the originating AVFrame is held; we hand it to GLPreview which
 // registers it once via WGL_NV_DX_interop2 and caches by (texture, subres).
@@ -317,8 +351,7 @@ void VideoPlayer::setProxyDivisor(int divisor)
         m_proxyButton->setText(text);
     }
     QSettings("VSimpleEditor", "Preferences").setValue("proxyDivisor", m_proxyDivisor);
-    if (!m_lastSourceFrame.isNull())
-        displayFrame(m_lastSourceFrame);
+    refreshDisplayedFrame();
 }
 
 void VideoPlayer::loadFile(const QString &filePath)
@@ -1343,8 +1376,7 @@ void VideoPlayer::setHiddenTextOverlayIndex(int index)
 {
     if (m_hiddenTextOverlayIndex == index) return;
     m_hiddenTextOverlayIndex = index;
-    if (!m_lastSourceFrame.isNull())
-        displayFrame(m_lastSourceFrame);
+    refreshDisplayedFrame();
 }
 
 void VideoPlayer::setColorCorrection(const ColorCorrection &cc)
@@ -1379,8 +1411,7 @@ void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool li
     if (m_glPreview)
         m_glPreview->setVideoEffects(gpu);
 
-    if (!m_lastSourceFrame.isNull())
-        displayFrame(m_lastSourceFrame);
+    refreshDisplayedFrame();
 }
 
 void VideoPlayer::setGLAcceleration(bool enabled)
@@ -2034,6 +2065,28 @@ void VideoPlayer::refreshDisplayedFrame()
     // an existing overlay is selected and setTextOverlays re-pushes).
     if (m_lastSourceFrame.isNull())
         return;
+    // Phase 1e Win #9 — m_lastSourceFrame may hold a canvas-proxy
+    // smaller image cached during multi-track playback (when
+    // m_textOverlays was empty at compose time, the canvas was sized
+    // to the decoded layer res). composeFrameWithOverlays paints text
+    // at pixel coordinates on the source — a smaller cached image
+    // would shift those positions after GL bilinear upscale to the
+    // widget viewport. When text overlays are now present and the
+    // cache is undersized, scale it up to full canvas dims so text
+    // lands where the user expects (the prior multi-track tick's
+    // composited pixels survive the upscale; only resolution drops).
+    // Skipped for size-matched frames: single-track playback,
+    // PLAYBACK_PROXY=1, or text-overlay-active multi-track which
+    // already forced full-res via the gate at handlePlaybackTick.
+    if (!m_textOverlays.isEmpty()
+        && m_canvasWidth  > 0
+        && m_canvasHeight > 0
+        && (m_lastSourceFrame.width()  != m_canvasWidth
+            || m_lastSourceFrame.height() != m_canvasHeight)) {
+        m_lastSourceFrame = m_lastSourceFrame.scaled(
+            m_canvasWidth, m_canvasHeight,
+            Qt::IgnoreAspectRatio, Qt::FastTransformation);
+    }
     displayFrame(m_lastSourceFrame);
 }
 
@@ -2456,9 +2509,17 @@ void VideoPlayer::handlePlaybackTick()
             // with black. composeMultiTrackFrame still promotes through
             // convertToFormat, but starting with a matching format keeps
             // that to a no-op detach.
-            if (m_canvasBase.size() != QSize(m_canvasWidth, m_canvasHeight)
+            // Phase 1e Win #9 — canvas proxy (rationale + invariants
+            // in canvasProxyDivisor() at top of file). m_textOverlays
+            // runtime gate keeps text overlays on the full-res path so
+            // composeFrameWithOverlays paints text at correct coords.
+            const int canvasProxy = m_textOverlays.isEmpty()
+                                    ? canvasProxyDivisor() : 1;
+            const int canvasW = qMax(2, m_canvasWidth  / canvasProxy);
+            const int canvasH = qMax(2, m_canvasHeight / canvasProxy);
+            if (m_canvasBase.size() != QSize(canvasW, canvasH)
                 || m_canvasBase.format() != QImage::Format_ARGB32_Premultiplied) {
-                m_canvasBase = QImage(m_canvasWidth, m_canvasHeight,
+                m_canvasBase = QImage(canvasW, canvasH,
                                       QImage::Format_ARGB32_Premultiplied);
             }
             if (m_canvasBase.isNull()) {
