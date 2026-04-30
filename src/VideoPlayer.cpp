@@ -2112,8 +2112,17 @@ void VideoPlayer::handlePlaybackTick()
     if (m_lastTickWasComposite && !willComposite && m_glPreview
         && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
         const auto &v1e = m_sequence[m_activeEntry];
-        m_glPreview->setVideoSourceTransform(v1e.videoScale, v1e.videoDx, v1e.videoDy);
+        // V3 sprint fix — push the EDIT TARGET's transform when one is set so
+        // the preview drag handle reflects (and edits) the user-selected layer.
+        // Falls back to m_activeEntry (V1) when no explicit edit target is held.
+        const int displayIdx = (m_editTargetEntry >= 0
+                                && m_editTargetEntry < m_sequence.size())
+                               ? m_editTargetEntry
+                               : m_activeEntry;
+        const auto &targetE = m_sequence[displayIdx];
+        m_glPreview->setVideoSourceTransform(targetE.videoScale, targetE.videoDx, targetE.videoDy);
         m_glPreview->setCompositeBakedMode(false);
+        (void)v1e; // retained for adjacent compose path; intentionally unused here
     }
     m_lastTickWasComposite = willComposite;
 
@@ -2446,9 +2455,18 @@ void VideoPlayer::handlePlaybackTick()
                 if (m_glPreview && m_activeEntry >= 0
                     && m_activeEntry < m_sequence.size()) {
                     const auto &v1e = m_sequence[m_activeEntry];
+                    // V3 sprint fix — push the EDIT TARGET's transform when set
+                    // so V2/V3 drag-handles edit the right layer. Falls back to
+                    // V1 (m_activeEntry) when no explicit edit target is held.
+                    const int displayIdx = (m_editTargetEntry >= 0
+                                            && m_editTargetEntry < m_sequence.size())
+                                           ? m_editTargetEntry
+                                           : m_activeEntry;
+                    const auto &targetE = m_sequence[displayIdx];
                     m_glPreview->setVideoSourceTransform(
-                        v1e.videoScale, v1e.videoDx, v1e.videoDy);
+                        targetE.videoScale, targetE.videoDx, targetE.videoDy);
                     m_glPreview->setCompositeBakedMode(false);
+                    (void)v1e;
                 }
                 if (traceTick)
                     m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
@@ -2483,8 +2501,17 @@ void VideoPlayer::handlePlaybackTick()
             // transform again or it snaps to identity.
             if (m_glPreview && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
                 const auto &v1e = m_sequence[m_activeEntry];
-                m_glPreview->setVideoSourceTransform(v1e.videoScale, v1e.videoDx, v1e.videoDy);
+                // V3 sprint fix — push the EDIT TARGET's transform when set
+                // so V2/V3 drag-handles edit the right layer. Falls back to
+                // V1 (m_activeEntry) when no explicit edit target is held.
+                const int displayIdx = (m_editTargetEntry >= 0
+                                        && m_editTargetEntry < m_sequence.size())
+                                       ? m_editTargetEntry
+                                       : m_activeEntry;
+                const auto &targetE = m_sequence[displayIdx];
+                m_glPreview->setVideoSourceTransform(targetE.videoScale, targetE.videoDx, targetE.videoDy);
                 m_glPreview->setCompositeBakedMode(false);
+                (void)v1e;
             }
             if (traceTick)
                 m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
