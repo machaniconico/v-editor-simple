@@ -472,7 +472,20 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 {
     qInfo() << "VideoPlayer::setSequence count=" << entries.size();
     m_loggedCullState = false; // re-emit [cull] diagnostic for the new project
-    m_editTargetEntry = -1;    // V3 sprint — clear edit target on project / sequence change
+
+    // V3 sprint — preserve drag-edit target across sequenceChanged round-trips.
+    // Timeline::setClipVideoTransform fires sequenceChanged on every drag event,
+    // which lands here. If we just clear m_editTargetEntry, the second-and-later
+    // emits of a drag gesture silently retarget to m_activeEntry (V1) and the
+    // drag scales the wrong clip.
+    int prevEditTrack = -1;
+    int prevEditClip = -1;
+    if (m_editTargetEntry >= 0 && m_editTargetEntry < m_sequence.size()) {
+        const auto &prev = m_sequence[m_editTargetEntry];
+        prevEditTrack = prev.sourceTrack;
+        prevEditClip = prev.sourceClipIndex;
+    }
+    m_editTargetEntry = -1;    // cleared now; re-resolved on the new sequence below
 
     // Topmost-track-wins via single-decoder pipeline: take Timeline's
     // sequence as-is. Timeline::computePlaybackSequence sorts by
@@ -613,6 +626,12 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     // restore m_playing post-loadFile — and the user experiences a "dead"
     // pause button even though the click is wired.
     updatePlayButton();
+
+    // Re-resolve edit target on the new sequence. setEditTargetByClip falls
+    // back to -1 if no matching clip exists (project change / clip deleted).
+    if (prevEditTrack >= 0 && prevEditClip >= 0) {
+        setEditTargetByClip(prevEditTrack, prevEditClip);
+    }
 
     updatePositionUi();
 }
