@@ -3,6 +3,7 @@
 #include <cstring>
 #include <functional>
 #include <unordered_map>
+#include <QElapsedTimer>
 #include <QtGlobal>
 #include <QDateTime>
 #include <QVector2D>
@@ -69,6 +70,19 @@ bool veditorGlInteropEnabled()
     static const bool kEnabled = qEnvironmentVariableIntValue("VEDITOR_GL_INTEROP") != 0;
     return kEnabled;
 }
+
+// Phase 1e Win #11 — VEDITOR_STALL_TRACE=1 reuses the same envvar as
+// VideoPlayer/AudioMixer so a single switch covers all instrumented
+// stall sites. paintGL is on the Qt GL render thread; renderPendingD3D11Frame's
+// wglDXLockObjectsNV is the only documented multi-frame GPU-CPU sync barrier
+// in this translation unit and was not covered by Win #10's decode-thread
+// probes. Default off.
+bool stallTraceEnabled()
+{
+    static const bool kEnabled = qEnvironmentVariableIntValue("VEDITOR_STALL_TRACE") != 0;
+    return kEnabled;
+}
+constexpr qint64 kStallThresholdInteropLockMs = 50;
 } // namespace
 
 // Vertex shader — simple fullscreen quad
@@ -979,6 +993,14 @@ void GLPreview::renderPendingD3D11Frame()
     NV12RegisteredTex &r = it->second;
 
     HANDLE handles[2] = { r.hY, r.hUV };
+    // Phase 1e Win #11 stall trace — wglDXLockObjectsNV is a CPU↔GPU
+    // sync barrier; under multi-track AV1 1440p decode + screen capture
+    // adapter contention this can block the GL render thread for 1–2 s
+    // without triggering any decode-side probe. Default off.
+    const bool traceStall = stallTraceEnabled();
+    QElapsedTimer interopLockTimer;
+    if (traceStall)
+        interopLockTimer.start();
     if (!gWglDXLockObjectsNV(static_cast<HANDLE>(m_interopDevice), 2, handles)) {
         static bool warnedLock = false;
         if (!warnedLock) {
@@ -986,6 +1008,15 @@ void GLPreview::renderPendingD3D11Frame()
             warnedLock = true;
         }
         return;
+    }
+    if (traceStall && interopLockTimer.isValid()) {
+        const qint64 elapsedMs = interopLockTimer.elapsed();
+        if (elapsedMs >= kStallThresholdInteropLockMs) {
+            qWarning().noquote()
+                << QStringLiteral("[stall>=%1ms] wglDXLockObjectsNV %2ms")
+                       .arg(kStallThresholdInteropLockMs)
+                       .arg(elapsedMs);
+        }
     }
 
     // Letterbox the NV12 fast path the same way the legacy path does so

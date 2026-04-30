@@ -1,4 +1,5 @@
 #include "Timeline.h"
+#include "ProxyManager.h"
 #include "UndoManager.h"
 
 // Small strip drawn above the V/A tracks that visualizes each text
@@ -279,6 +280,7 @@ private:
 #include <QHash>
 
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 }
 
@@ -1630,10 +1632,62 @@ void Timeline::addClip(const QString &filePath)
 {
     AVFormatContext *fmt = nullptr;
     double duration = 0.0;
+    // Phase 1e Win #11 — auto-proxy for heavy video sources. AV1 SW/HW
+    // decode runs 4–10x heavier than H.264 (no SIMD-friendly inverse
+    // transforms in libdav1d; the D3D11VA path still pays full-res
+    // av_hwframe_transfer_data per tick), and 1440p+ sources stress
+    // GPU↔CPU bandwidth in multi-track playback regardless of codec.
+    // The architect/tracer/critic audit traced user-reported multi-second
+    // freezes to AV1 1440p × 2 multi-track with no proxy entries
+    // registered — getProxyPath returned the original path so V2/V3
+    // pool decoders opened the full-res AV1 source directly. ProxyManager
+    // already supports background h264 proxy generation; the gap was that
+    // Timeline::addClip never enqueued it. Trigger generation here on
+    // import so the existing sequenceChanged → getProxyPath wiring picks
+    // up the proxy as soon as it lands. Kept opt-out via
+    // VEDITOR_AUTO_PROXY_DISABLE=1 in case a user wants to skip the
+    // first-import encode wait, and gated on resolution/codec to avoid
+    // generating proxies for clips that already play smoothly.
+    bool wantsAutoProxy = false;
     if (avformat_open_input(&fmt, filePath.toUtf8().constData(), nullptr, nullptr) == 0) {
         if (avformat_find_stream_info(fmt, nullptr) >= 0 && fmt->duration > 0)
             duration = static_cast<double>(fmt->duration) / AV_TIME_BASE;
+        for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+            const AVStream *st = fmt->streams[i];
+            if (!st || !st->codecpar
+                || st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+                continue;
+            const int w = st->codecpar->width;
+            const int h = st->codecpar->height;
+            const bool isAv1  = st->codecpar->codec_id == AV_CODEC_ID_AV1;
+            const bool isQhdPlus = (w >= 2560) || (h >= 1440);
+            if (isAv1 || isQhdPlus)
+                wantsAutoProxy = true;
+            break;
+        }
         avformat_close_input(&fmt);
+    }
+    if (wantsAutoProxy) {
+        static const bool autoProxyDisabled =
+            qEnvironmentVariableIntValue("VEDITOR_AUTO_PROXY_DISABLE") != 0;
+        if (!autoProxyDisabled) {
+            ProxyManager &pm = ProxyManager::instance();
+            // Intentionally do NOT gate on pm.isProxyMode() here:
+            // proxy mode controls whether *playback* substitutes the
+            // proxy path, but generating a proxy for a heavy source on
+            // import is cheap (idempotent, background QProcess) and
+            // pays off the moment the user toggles proxy mode on. The
+            // observed stall pattern is users with proxy mode off and
+            // no proxy registered — gating on proxy mode would leave
+            // those users stuck at the AV1 1440p direct-decode path.
+            // VEDITOR_AUTO_PROXY_DISABLE=1 fully suppresses the encode
+            // cost for users who never want a proxy.
+            if (pm.config().enabled && !pm.hasProxy(filePath)) {
+                qDebug() << "[auto-proxy] queuing proxy for heavy source"
+                         << "file=" << filePath;
+                pm.generateProxy(filePath);
+            }
+        }
     }
     ClipInfo clip;
     clip.filePath = filePath;
