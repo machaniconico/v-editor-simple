@@ -2067,8 +2067,11 @@ void VideoPlayer::handlePlaybackTick()
     // path will fan out the same V2 jobs via blockingMap. Without the gate,
     // 2+ overlays would be decoded twice per tick (worker prefetch + Pass 2
     // blockingMap), consuming an extra frame from each pool decoder.
+    // V3 sprint — opt-out default-ON: V2+V3 等 2+ overlay の blockingMap
+    // N-way fan-out を default で発火させる。VEDITOR_THREADED_POOL_DISABLE=1
+    // で legacy serial path (非並列) に戻れる。
     static const bool s_prefetchGateThreadedPoolEnabled =
-        qEnvironmentVariableIntValue("VEDITOR_THREADED_POOL") != 0;
+        qEnvironmentVariableIntValue("VEDITOR_THREADED_POOL_DISABLE") == 0;
     struct V2PrefetchJob {
         TrackDecoder *d = nullptr;
         qint64 expectedFileLocalUs = 0;
@@ -2181,8 +2184,12 @@ void VideoPlayer::handlePlaybackTick()
         // QtConcurrent worker threads so they run in parallel instead of
         // serializing on the main thread. Default off — single-overlay
         // ticks short-circuit straight back to the legacy serial path.
+        // V3 sprint — opt-out default-ON. See gate at top of handlePlaybackTick
+        // for envvar rationale. Both statics read the same VEDITOR_THREADED_POOL_DISABLE
+        // so the prefetch path and the compositor path agree on whether
+        // threadedPool will fire.
         static const bool threadedPool =
-            qEnvironmentVariableIntValue("VEDITOR_THREADED_POOL") != 0;
+            qEnvironmentVariableIntValue("VEDITOR_THREADED_POOL_DISABLE") == 0;
         int nonV1Count = 0;
         if (threadedPool) {
             for (int idx : activeIdxs) {
