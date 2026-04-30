@@ -2062,7 +2062,7 @@ void VideoPlayer::handlePlaybackTick()
     // runOverlayDecodeForDecoder already permits.
     static const bool prefetchV2Enabled =
         qEnvironmentVariableIntValue("VEDITOR_PREFETCH_V2_DISABLE") == 0;
-    // MAJOR-1 mutual-exclusion gate: read VEDITOR_THREADED_POOL here too so
+    // MAJOR-1 mutual-exclusion gate: read VEDITOR_THREADED_POOL_DISABLE here too so
     // we can suppress this prefetch when the compositor branch's threadedPool
     // path will fan out the same V2 jobs via blockingMap. Without the gate,
     // 2+ overlays would be decoded twice per tick (worker prefetch + Pass 2
@@ -2070,6 +2070,9 @@ void VideoPlayer::handlePlaybackTick()
     // V3 sprint — opt-out default-ON: V2+V3 等 2+ overlay の blockingMap
     // N-way fan-out を default で発火させる。VEDITOR_THREADED_POOL_DISABLE=1
     // で legacy serial path (非並列) に戻れる。
+    // BREAKING: legacy `VEDITOR_THREADED_POOL=0` (旧 default-OFF と同等を
+    // 望んでいた user) は今後無視される。代わりに VEDITOR_THREADED_POOL_DISABLE=1
+    // を設定する必要あり。
     static const bool s_prefetchGateThreadedPoolEnabled =
         qEnvironmentVariableIntValue("VEDITOR_THREADED_POOL_DISABLE") == 0;
     struct V2PrefetchJob {
@@ -2100,8 +2103,8 @@ void VideoPlayer::handlePlaybackTick()
             job.clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
             v2PrefetchJobs.append(job);
         }
-        // MAJOR-1: when 2+ V2 overlays are active AND VEDITOR_THREADED_POOL is
-        // on, the compositor branch's threadedPool path (Pass 2 blockingMap)
+        // MAJOR-1: when 2+ V2 overlays are active AND threadedPool gate is on
+        // (default), the compositor branch's threadedPool path (Pass 2 blockingMap)
         // will N-way fan-out the same decoders. Skip prefetch in that case to
         // avoid double-decoding. Win #6 prefetch is the "1 V2 overlay"
         // complement to that legacy parallel fan-out.
@@ -2179,11 +2182,12 @@ void VideoPlayer::handlePlaybackTick()
         layers.reserve(activeIdxs.size());
         bool overlayPresent = false;
 
-        // VEDITOR_THREADED_POOL=1 (Phase 1e Sprint US-3): when 2+ non-V1
-        // overlays are active this tick, fan out their decode steps onto
-        // QtConcurrent worker threads so they run in parallel instead of
-        // serializing on the main thread. Default off — single-overlay
-        // ticks short-circuit straight back to the legacy serial path.
+        // VEDITOR_THREADED_POOL_DISABLE (Phase 1e Sprint US-3, default-on per
+        // V3 sprint flip): when 2+ non-V1 overlays are active this tick, fan
+        // out their decode steps onto QtConcurrent worker threads so they run
+        // in parallel instead of serializing on the main thread. Single-
+        // overlay ticks short-circuit to Win #6's prefetch path or the legacy
+        // serial path when prefetch is disabled.
         // V3 sprint — opt-out default-ON. See gate at top of handlePlaybackTick
         // for envvar rationale. Both statics read the same VEDITOR_THREADED_POOL_DISABLE
         // so the prefetch path and the compositor path agree on whether
@@ -3052,7 +3056,7 @@ bool VideoPlayer::decodePoolFrame(TrackDecoder *d, bool ensureRgb)
 
 // Parallelizable decode-only step (Phase 1e Sprint US-3). Touches ONLY the
 // per-decoder TrackDecoder state, so multiple instances may run on QtConcurrent
-// worker threads when VEDITOR_THREADED_POOL=1 + 2+ overlays are active.
+// worker threads when threadedPool gate is on (default) + 2+ overlays are active.
 //
 // Threading contract for callers:
 //   - FFmpeg per-context calls (av_seek_frame, avcodec_send_packet/receive_frame,
