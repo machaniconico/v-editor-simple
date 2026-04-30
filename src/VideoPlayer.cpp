@@ -545,8 +545,11 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         // Timeline emptied (all clips deleted). Pause and clear the slider so
         // the player doesn't keep ticking against a stale file. We don't tear
         // down the decoder — preview path may still be using it.
+        // V3 sprint visibility-toggle fix: keep m_timelinePositionUs intact so
+        // toggling the only visible video track OFF (which produces an empty
+        // sequence) doesn't reset the playhead to 0; toggling back ON resumes
+        // at the previous position.
         m_activeEntry = -1;
-        m_timelinePositionUs = 0;
         if (m_playing) pause();
         m_seekBar->setRange(0, 0);
         emit durationChanged(0.0);
@@ -571,8 +574,34 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     int64_t clamped = qBound<int64_t>(0, m_timelinePositionUs, m_sequenceDurationUs);
     int desiredIdx = findActiveEntryAt(clamped);
     if (desiredIdx < 0) {
-        desiredIdx = 0;
-        clamped = static_cast<int64_t>(m_sequence.first().timelineStart * AV_TIME_BASE);
+        // V3 sprint visibility-toggle fix: don't snap to first entry's head
+        // (which would reset to 0 when first entry starts at timeline 0).
+        // Try to find an entry whose range encompasses or is closest to the
+        // current playhead, preserving user position across visibility toggles.
+        int bestIdx = 0;
+        qint64 bestDistance = std::numeric_limits<qint64>::max();
+        for (int i = 0; i < m_sequence.size(); ++i) {
+            const auto &e = m_sequence[i];
+            const qint64 startUs = static_cast<qint64>(e.timelineStart * AV_TIME_BASE);
+            const qint64 endUs   = static_cast<qint64>(e.timelineEnd   * AV_TIME_BASE);
+            if (clamped >= startUs && clamped <= endUs) {
+                bestIdx = i;
+                bestDistance = 0;
+                break;
+            }
+            const qint64 d = qMin(qAbs(clamped - startUs), qAbs(clamped - endUs));
+            if (d < bestDistance) {
+                bestDistance = d;
+                bestIdx = i;
+            }
+        }
+        desiredIdx = bestIdx;
+        // Clamp into the chosen entry's range so the playhead stays inside a
+        // valid clip segment.
+        const auto &chosen = m_sequence[bestIdx];
+        const qint64 cStart = static_cast<qint64>(chosen.timelineStart * AV_TIME_BASE);
+        const qint64 cEnd   = static_cast<qint64>(chosen.timelineEnd   * AV_TIME_BASE);
+        clamped = qBound(cStart, clamped, cEnd);
     }
 
     const auto &target = m_sequence[desiredIdx];
