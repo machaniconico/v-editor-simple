@@ -322,6 +322,16 @@ private:
 
     QImage composeMultiTrackFrame(const QImage &v1Frame,
                                   const QVector<DecodedLayer> &overlayLayers) const;
+    // Phase 1e Win #7 — in-place variant. Caller pre-fills `canvas` (typically
+    // m_canvasBase with Qt::black) and we paint overlays into it without going
+    // through convertToFormat shallow-share + QPainter detach. Saves the
+    // ~8MB alloc + memcpy that the legacy composeMultiTrackFrame triggers
+    // every tick at 1080p. Caller MUST guarantee:
+    //   - canvas.format() == ARGB32_Premultiplied
+    //   - canvas owned solely by caller at entry (refcount == 1 ideally; if
+    //     >1 QPainter still detaches but the ROI lift goes back to legacy)
+    void composeMultiTrackFrameInto(QImage &canvas,
+                                    const QVector<DecodedLayer> &overlayLayers) const;
     bool harvestOverlayLayer(const PlaybackEntry &entry, int seqIdx, DecodedLayer *out);
     // Phase 1e Sprint US-3: parallelizable decode-only step. ONLY touches
     // the per-decoder TrackDecoder state — no pool / sequence / Qt object

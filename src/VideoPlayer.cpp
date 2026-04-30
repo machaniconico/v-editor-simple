@@ -2491,20 +2491,37 @@ void VideoPlayer::handlePlaybackTick()
                     sectionMark = tickTimer.nsecsElapsed();
                 }
                 m_canvasBase.fill(Qt::black);
-                const QImage composed = composeMultiTrackFrame(m_canvasBase, layers);
-                if (traceTick)
-                    m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
-                // Switch the GL viewport into baked mode so paintGL skips
-                // applying m_videoSourceScale on top of the canvas (which
-                // already has every layer's transform baked in). This
-                // intentionally does NOT touch m_videoSourceScale itself
-                // — that field is the active drag state for the OBS-style
-                // resize handles, and clobbering it 30 times a second
-                // (the prior behavior) made resize/move drags impossible
-                // during multi-track playback.
-                if (m_glPreview)
-                    m_glPreview->setCompositeBakedMode(true);
-                displayFrame(composed);
+                // Phase 1e Win #7 — in-place compose. Default ON; opt out
+                // via VEDITOR_INPLACE_COMPOSE_DISABLE=1 to fall back to the
+                // legacy composeMultiTrackFrame path that allocates a
+                // separate composed buffer through convertToFormat shallow
+                // share + QPainter detach (~8MB alloc + memcpy / 1080p
+                // tick).
+                static const bool inplaceComposeEnabled =
+                    qEnvironmentVariableIntValue("VEDITOR_INPLACE_COMPOSE_DISABLE") == 0;
+                if (inplaceComposeEnabled) {
+                    composeMultiTrackFrameInto(m_canvasBase, layers);
+                    if (traceTick)
+                        m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
+                    // Switch the GL viewport into baked mode so paintGL skips
+                    // applying m_videoSourceScale on top of the canvas (which
+                    // already has every layer's transform baked in). This
+                    // intentionally does NOT touch m_videoSourceScale itself
+                    // — that field is the active drag state for the OBS-style
+                    // resize handles, and clobbering it 30 times a second
+                    // (the prior behavior) made resize/move drags impossible
+                    // during multi-track playback.
+                    if (m_glPreview)
+                        m_glPreview->setCompositeBakedMode(true);
+                    displayFrame(m_canvasBase);
+                } else {
+                    const QImage composed = composeMultiTrackFrame(m_canvasBase, layers);
+                    if (traceTick)
+                        m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
+                    if (m_glPreview)
+                        m_glPreview->setCompositeBakedMode(true);
+                    displayFrame(composed);
+                }
             }
         } else {
             // Every overlay bailed (decoder open failed, slot exhausted).
@@ -3040,6 +3057,45 @@ QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
     }
     p.end();
     return composed;
+}
+
+// Phase 1e Win #7 — in-place variant. Same paint logic as
+// composeMultiTrackFrame but avoids the convertToFormat indirection that
+// shallow-shares with v1Frame and forces QPainter to detach (~0.5-1 ms /
+// 1080p tick for the alloc + memcpy of the implicit copy). Caller passes
+// a pre-filled canvas (typically m_canvasBase set to Qt::black) that is
+// already in ARGB32_Premultiplied. The QPainter binds the caller's
+// buffer directly, so when refcount == 1 there is no detach. Geometry
+// rules and SourceOver/SmoothPixmapTransform settings match the legacy
+// path 1:1 to keep visual output identical.
+void VideoPlayer::composeMultiTrackFrameInto(QImage &canvas,
+                                              const QVector<DecodedLayer> &overlayLayers) const
+{
+    if (canvas.isNull() || overlayLayers.isEmpty())
+        return;
+    // Caller's contract: canvas is ARGB32_Premultiplied. Painting into
+    // any other format would silently degrade overlay alpha behaviour,
+    // so guard with a debug assert and fast-bail in release.
+    Q_ASSERT(canvas.format() == QImage::Format_ARGB32_Premultiplied);
+    if (canvas.format() != QImage::Format_ARGB32_Premultiplied)
+        return;
+    QPainter p(&canvas);
+    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+
+    const QSize cs(canvas.width(), canvas.height());
+    for (const DecodedLayer &L : overlayLayers) {
+        if (L.rgb.isNull() || L.opacity <= 0.001)
+            continue;
+        const double w  = cs.width()  * L.videoScale;
+        const double h  = cs.height() * L.videoScale;
+        const double cx = cs.width()  * 0.5 + L.videoDx * cs.width();
+        const double cy = cs.height() * 0.5 + L.videoDy * cs.height();
+        const QRectF dst(cx - w * 0.5, cy - h * 0.5, w, h);
+        p.setOpacity(qBound(0.0, L.opacity, 1.0));
+        p.drawImage(dst, L.rgb);
+    }
+    p.end();
 }
 
 // decodePoolFrame is decodeNextFrame's V2+ twin: same FFmpeg loop logic but
