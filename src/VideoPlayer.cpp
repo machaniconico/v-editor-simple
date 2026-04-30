@@ -3265,19 +3265,31 @@ bool VideoPlayer::hasOverlayActive(const QVector<int> &activeIdxs) const
 // 編集する layer を切り替える。再生 source の m_activeEntry には触れない。
 void VideoPlayer::setEditTargetByClip(int sourceTrack, int sourceClipIndex)
 {
-    qInfo() << "[edit-target] setEditTargetByClip called track=" << sourceTrack
-            << "clip=" << sourceClipIndex;
+    const int oldTarget = m_editTargetEntry;
     if (sourceTrack < 0 || sourceClipIndex < 0) {
         m_editTargetEntry = -1;
+        if (oldTarget != m_editTargetEntry) {
+            qInfo() << "[edit-target] cleared (was seq=" << oldTarget << ")";
+        }
         return;
     }
     for (int i = 0; i < m_sequence.size(); ++i) {
         const auto &e = m_sequence[i];
         if (e.sourceTrack == sourceTrack && e.sourceClipIndex == sourceClipIndex) {
             m_editTargetEntry = i;
+            if (oldTarget != m_editTargetEntry) {
+                qInfo() << "[edit-target] set seq=" << i
+                        << "track=" << sourceTrack
+                        << "clip=" << sourceClipIndex
+                        << "(was seq=" << oldTarget << ")";
+            }
             return;
         }
     }
     // No matching entry — fall back to follow active.
     m_editTargetEntry = -1;
+    if (oldTarget != m_editTargetEntry) {
+        qInfo() << "[edit-target] no match for track=" << sourceTrack
+                << "clip=" << sourceClipIndex << "(was seq=" << oldTarget << ")";
+    }
 }
