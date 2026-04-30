@@ -1442,6 +1442,14 @@ void GLPreview::resetVideoSourceTransform()
     update();
 }
 
+void GLPreview::setVideoTransformSelected(bool selected)
+{
+    if (m_videoTransformSelected == selected)
+        return;
+    m_videoTransformSelected = selected;
+    update();
+}
+
 void GLPreview::setCompositeBakedMode(bool enabled)
 {
     if (m_compositeBakedMode == enabled) return;

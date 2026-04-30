@@ -103,6 +103,11 @@ public:
     double videoSourceDx()    const { return m_videoSourceDx; }
     double videoSourceDy()    const { return m_videoSourceDy; }
     void resetVideoSourceTransform();
+    // V3 sprint — Timeline-driven selection arms the handle-draw gate
+    // (m_videoTransformSelected) without requiring a separate preview click.
+    // Call with `true` when an edit target is set on a non-identity clip,
+    // `false` when the edit target is cleared.
+    void setVideoTransformSelected(bool selected);
     // When true, paintGL ignores m_videoSourceScale/Dx/Dy on the GL
     // viewport. The multi-track compositor pre-bakes per-clip transforms
     // into the canvas image, so the GL viewport must render identity to

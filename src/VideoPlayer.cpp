@@ -3330,6 +3330,13 @@ void VideoPlayer::setEditTargetByClip(int sourceTrack, int sourceClipIndex)
             m_glPreview->setVideoSourceTransform(targetE.videoScale,
                                                   targetE.videoDx,
                                                   targetE.videoDy);
+            // V3 sprint — arm handle-draw gate so V3 selection produces
+            // visible handles even before the user clicks the preview canvas.
+            m_glPreview->setVideoTransformSelected(true);
+        } else if (m_glPreview) {
+            // Edit target cleared and no fallback active entry — clear the
+            // handle gate so stale handles don't linger over a blank preview.
+            m_glPreview->setVideoTransformSelected(false);
         }
     };
 
