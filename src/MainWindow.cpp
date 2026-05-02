@@ -186,6 +186,17 @@ void MainWindow::setupUI()
     m_mainSplitter->addWidget(m_timeline);
     m_mainSplitter->setStretchFactor(0, 3);
     m_mainSplitter->setStretchFactor(1, 1);
+    // Iteration 14 — both children non-collapsible. User report:
+    // 「プレビューの最小表示サイズはそのままに拡大出来る幅を少し増やせる？
+    // (今の仕様だと一定以上大きくした後一気に最大サイズになる)」. With
+    // QSplitter's default collapsible behavior, dragging the divider past
+    // the timeline's collapse threshold snapped the timeline to 0 and the
+    // preview to full height — the "一気に最大サイズ" jump. Non-collapsible
+    // children stop the divider at each child's natural minimum, so the
+    // preview's smooth scaling range extends up to window_height -
+    // timeline_min instead of clamping at the snap point.
+    m_mainSplitter->setCollapsible(0, false);
+    m_mainSplitter->setCollapsible(1, false);
 
     connect(m_player, &VideoPlayer::textRectRequested,
             this, &MainWindow::onTextRectRequested);
