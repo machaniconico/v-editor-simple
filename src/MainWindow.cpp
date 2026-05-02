@@ -340,6 +340,20 @@ void MainWindow::setupUI()
 
     m_player->setMinimumHeight(280); // lowered so the timeline can grow taller
     m_mainSplitter->setSizes({680, 320});
+
+    // Iteration 15 — preview maximize toggle. The button lives in the
+    // VideoPlayer's bottom-right; clicking it (or Esc when active) hides
+    // the timeline so the preview can occupy the full main splitter.
+    connect(m_player, &VideoPlayer::previewMaximizeChanged, this,
+            [this](bool maximized) {
+                if (m_timeline) m_timeline->setVisible(!maximized);
+            });
+    auto *escKey = new QShortcut(QKeySequence(Qt::Key_Escape), this);
+    connect(escKey, &QShortcut::activated, this, [this]() {
+        if (m_player && m_player->isPreviewMaximized()) {
+            m_player->setPreviewMaximized(false);
+        }
+    });
 }
 
 void MainWindow::setupMenuBar()

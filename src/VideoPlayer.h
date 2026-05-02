@@ -111,6 +111,10 @@ public:
     // an active playback.
     bool isPlaying() const { return m_playing; }
 
+    // Iteration 15 — preview-maximize state. MainWindow listens for
+    // previewMaximizeChanged and hides/shows the timeline accordingly.
+    bool isPreviewMaximized() const { return m_previewMaximized; }
+
     // Current playhead in timeline microseconds. MainWindow calls this
     // before refreshPlaybackSequence so it can re-seek the player to the
     // same position once the path resolution settles, instead of relying
@@ -183,6 +187,9 @@ public slots:
     // Step one frame while paused (no-op during playback).
     void stepForward();
     void stepBackward();
+    // Iteration 15 — preview-maximize toggle. Forwarded to MainWindow via
+    // previewMaximizeChanged so the timeline can hide/show accordingly.
+    void setPreviewMaximized(bool maximized);
     // V3 sprint — Timeline 上で V2/V3 clip を選択したときに preview の drag
     // handle が選択 layer を target にするための edit target setter。
     // sourceTrack, sourceClipIndex から m_sequence を逆引きして該当 seqIdx
@@ -208,6 +215,9 @@ signals:
     // the source ClipInfo so MainWindow can persist to the timeline.
     void videoSourceTransformChanged(int trackIdx, int clipIdx,
                                      double scale, double dx, double dy);
+    // Iteration 15 — emitted when the user clicks the maximize button or
+    // when MainWindow's Esc shortcut calls setPreviewMaximized(false).
+    void previewMaximizeChanged(bool maximized);
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
@@ -387,8 +397,10 @@ private:
     // m_playing.
     QPushButton *m_playButton;
     QPushButton *m_stopButton;
+    QPushButton *m_maximizeButton = nullptr; // Iteration 15
     QSlider *m_seekBar;
     QLabel *m_timeLabel;
+    bool m_previewMaximized = false; // Iteration 15
     QTimer *m_playbackTimer = nullptr;
     QTimer *m_seekTimer = nullptr;
     AudioMixer *m_mixer = nullptr;

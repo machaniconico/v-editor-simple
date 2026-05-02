@@ -336,6 +336,18 @@ void VideoPlayer::setupUI()
     m_seekBar->setRange(0, 0);
     m_seekBar->setTracking(false);
 
+    // Iteration 15 — preview maximize toggle button. Sits at the right end
+    // of the controls row (the bottom-right of the preview area). Toggling
+    // emits previewMaximizeChanged; MainWindow hides/shows the timeline
+    // and its Esc shortcut routes back into setPreviewMaximized(false).
+    m_maximizeButton = new QPushButton(QString::fromUtf8("\xE2\x9B\xB6"), this); // ⛶
+    m_maximizeButton->setCheckable(true);
+    m_maximizeButton->setFixedSize(40, 32);
+    m_maximizeButton->setStyleSheet(mediaBtnStyle);
+    m_maximizeButton->setToolTip(QStringLiteral("プレビュー最大化 (Esc で解除)"));
+    connect(m_maximizeButton, &QPushButton::toggled,
+            this, &VideoPlayer::setPreviewMaximized);
+
     controls->addWidget(m_proxyButton);
     controls->addWidget(m_stepBackButton);
     controls->addWidget(m_playButton);
@@ -343,6 +355,7 @@ void VideoPlayer::setupUI()
     controls->addWidget(m_stepFwdButton);
     controls->addWidget(m_seekBar);
     controls->addWidget(m_timeLabel);
+    controls->addWidget(m_maximizeButton);
 
     layout->addLayout(controls);
 
@@ -1490,6 +1503,25 @@ void VideoPlayer::togglePlay()
         setPlaybackSpeed(1.0);
         play();
     }
+}
+
+void VideoPlayer::setPreviewMaximized(bool maximized)
+{
+    if (m_previewMaximized == maximized) return;
+    m_previewMaximized = maximized;
+    if (m_maximizeButton) {
+        QSignalBlocker block(m_maximizeButton);
+        m_maximizeButton->setChecked(maximized);
+        // Glyph swap: ⛶ (4 corners outward) when normal, ⤡ (4 corners
+        // inward) when maximized — mirrors common video-player UX.
+        m_maximizeButton->setText(maximized
+            ? QString::fromUtf8("\xE2\xA4\xA1")    // ⤡
+            : QString::fromUtf8("\xE2\x9B\xB6")); // ⛶
+        m_maximizeButton->setToolTip(maximized
+            ? QStringLiteral("プレビュー最大化解除 (Esc)")
+            : QStringLiteral("プレビュー最大化 (Esc で解除)"));
+    }
+    emit previewMaximizeChanged(maximized);
 }
 
 void VideoPlayer::updatePlayButton()
