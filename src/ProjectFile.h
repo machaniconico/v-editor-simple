@@ -7,6 +7,7 @@
 #include "Timeline.h"
 #include "VideoEffect.h"
 #include "Keyframe.h"
+#include "Overlay.h"
 
 // Full project state for serialization
 struct ProjectData {
@@ -49,6 +50,9 @@ private:
 
     static QJsonObject keyframeManagerToJson(const KeyframeManager &km);
     static KeyframeManager keyframeManagerFromJson(const QJsonObject &obj);
+
+    static QJsonObject transitionToJson(const Transition &t);
+    static Transition transitionFromJson(const QJsonObject &obj);
 
     static QJsonArray tracksToJson(const QVector<QVector<ClipInfo>> &tracks);
     static QVector<QVector<ClipInfo>> tracksFromJson(const QJsonArray &arr);

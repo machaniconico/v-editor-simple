@@ -15,6 +15,7 @@
 #include "WaveformGenerator.h"
 #include "TextManager.h"
 #include "PlaybackTypes.h"
+#include "Overlay.h"
 
 // Where Timeline::addClip drops a freshly-imported clip. Persisted via
 // QSettings('VSimpleEditor','Preferences')/importPlacement; the MainWindow
@@ -77,6 +78,13 @@ struct ClipInfo {
 
     // Phase 5: Waveform
     WaveformData waveform;
+
+    // Edge-attached transitions. leadIn renders at the start of this clip
+    // (e.g., FadeIn from black, or CrossDissolve from the previous clip);
+    // trailOut renders at the end (FadeOut to black, or CrossDissolve to
+    // the next clip). type=None means no transition on that edge.
+    Transition leadIn;
+    Transition trailOut;
 
     // Phase 6: Enhanced text overlays
     TextManager textManager;
@@ -283,6 +291,10 @@ public:
 
     // Phase 3: Color correction, effects, keyframes
     void setClipColorCorrection(const ColorCorrection &cc);
+    // Attach a transition to the currently selected clip. FadeIn writes to
+    // the clip's leadIn slot (start-of-clip); every other type writes to
+    // trailOut (end-of-clip / boundary to next clip).
+    void applyTransitionToSelected(const Transition &t);
     void setClipEffects(const QVector<VideoEffect> &effects);
     void setClipKeyframes(const KeyframeManager &km);
     ColorCorrection clipColorCorrection() const;
@@ -370,6 +382,7 @@ protected:
 private slots:
     void onTrackClipClicked(int index);
     void onTrackModified();
+    void onPlayheadAutoScrollTick();
 
 private:
     void setupUI();
@@ -409,6 +422,7 @@ private:
     class TimeRuler *m_timeRuler = nullptr;
     TextStripWidget *m_textStrip = nullptr;
     QWidget *m_textStripHeader = nullptr;
+    QWidget *m_magnetArea = nullptr;
     QWidget *m_vaSeparator = nullptr;
     QWidget *m_vaSeparatorHeader = nullptr;
     int m_textStripCustomHeight = 0;  // 0 = follows m_trackHeight
@@ -423,6 +437,15 @@ private:
     // set (>= 0), setZoomLevel pins the playhead to this viewport column so
     // the user zooms into the frame they were looking at, not the left edge.
     int m_zoomAnchorViewportX = -1;
+
+    // Playhead drag auto-scroll: while the user drags the playhead bar past
+    // the central 70% of the visible viewport (i.e., into the outer 15% on
+    // either side), the bar visually pins at the boundary and the timeline
+    // auto-scrolls under it instead of letting the bar travel offscreen.
+    QTimer *m_playheadAutoScrollTimer = nullptr;
+    int m_playheadDragViewportX = 0;
+    bool m_playheadDragging = false;
+    bool m_playheadDragMoved = false;
 
     UndoManager *m_undoManager;
     std::optional<ClipInfo> m_clipboard;

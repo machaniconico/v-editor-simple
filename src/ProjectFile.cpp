@@ -134,6 +134,11 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     if (clip.keyframes.hasAnyKeyframes())
         obj["keyframes"] = keyframeManagerToJson(clip.keyframes);
 
+    if (clip.leadIn.type != TransitionType::None)
+        obj["leadIn"] = transitionToJson(clip.leadIn);
+    if (clip.trailOut.type != TransitionType::None)
+        obj["trailOut"] = transitionToJson(clip.trailOut);
+
     return obj;
 }
 
@@ -162,6 +167,11 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
 
     if (obj.contains("keyframes"))
         clip.keyframes = keyframeManagerFromJson(obj["keyframes"].toObject());
+
+    if (obj.contains("leadIn"))
+        clip.leadIn = transitionFromJson(obj["leadIn"].toObject());
+    if (obj.contains("trailOut"))
+        clip.trailOut = transitionFromJson(obj["trailOut"].toObject());
 
     return clip;
 }
@@ -277,6 +287,25 @@ KeyframeManager ProjectFile::keyframeManagerFromJson(const QJsonObject &obj)
     for (const auto &v : obj["tracks"].toArray())
         km.addTrack(keyframeTrackFromJson(v.toObject()));
     return km;
+}
+
+// --- Transition ---
+
+QJsonObject ProjectFile::transitionToJson(const Transition &t)
+{
+    QJsonObject obj;
+    obj["type"] = static_cast<int>(t.type);
+    obj["duration"] = t.duration;
+    return obj;
+}
+
+Transition ProjectFile::transitionFromJson(const QJsonObject &obj)
+{
+    Transition t;
+    t.type = static_cast<TransitionType>(
+        obj["type"].toInt(static_cast<int>(TransitionType::None)));
+    t.duration = obj["duration"].toDouble(0.5);
+    return t;
 }
 
 // --- Tracks ---

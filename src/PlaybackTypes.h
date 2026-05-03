@@ -3,6 +3,7 @@
 #include <QString>
 #include <QMetaType>
 #include <QVector>
+#include "Overlay.h"
 
 // Resolved playback descriptor used to communicate the timeline schedule from
 // Timeline to VideoPlayer. Independent from ClipInfo (which carries editor-side
@@ -26,6 +27,13 @@ struct PlaybackEntry {
     double opacity = 1.0;        // PiP alpha, propagated from ClipInfo::opacity
     double volume = 1.0;         // Per-clip audio gain (0.0-2.0), propagated from ClipInfo::volume
     int sourceClipIndex = -1;    // Index into TimelineTrack::m_clips
+    // Edge-attached transitions (FadeIn/FadeOut/CrossDissolve/...). Copied
+    // from ClipInfo::leadIn / trailOut so VideoPlayer can window the alpha
+    // (and AudioMixer the gain) over the duration without reading Timeline.
+    TransitionType leadInType = TransitionType::None;
+    double leadInDuration = 0.0;
+    TransitionType trailOutType = TransitionType::None;
+    double trailOutDuration = 0.0;
 };
 
 Q_DECLARE_METATYPE(PlaybackEntry)

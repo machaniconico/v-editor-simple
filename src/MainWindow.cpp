@@ -2039,6 +2039,7 @@ void MainWindow::addTransition()
     TransitionDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
         auto transition = dialog.result();
+        m_timeline->applyTransitionToSelected(transition);
         statusBar()->showMessage(QString("Added transition: %1 (%2s)")
             .arg(Transition::typeName(transition.type)).arg(transition.duration));
     }

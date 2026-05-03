@@ -760,7 +760,12 @@ void TimelineTrack::updateMinimumWidth()
     // viewport so the user normally never hits this hard cap.
     constexpr qint64 kMaxWidth = 2000000;
     totalWidth = qMin(totalWidth, kMaxWidth);
-    setMinimumWidth(static_cast<int>(totalWidth) + 100);
+    // Trailing pad past the last clip's end: large enough to comfortably
+    // place the playhead a few seconds past the longest clip end at typical
+    // zoom levels (~12 s at default 50 pps). Old value (+100 px) was just
+    // ~2 s and made post-clip scrubbing feel cramped.
+    constexpr int kTrailingPadPx = 600;
+    setMinimumWidth(static_cast<int>(totalWidth) + kTrailingPadPx);
 }
 
 void TimelineTrack::paintEvent(QPaintEvent *event)
@@ -787,7 +792,17 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
             qMin<double>(2000000.0,
                          m_clips[i].effectiveDuration() * m_pixelsPerSecond)));
         QRect clipRect(x, 0, clipWidth, m_rowHeight);
-        QColor color = (i % 2 == 0) ? QColor(0x44, 0x88, 0xCC) : QColor(0x44, 0xAA, 0x88);
+        // Clip body colour reflects edit STATE, not list position: a clip
+        // that's just moved must keep the same colour as before the move.
+        // Plain clips are blue; clips with a color correction or any video
+        // effect applied switch to green so the user can see at a glance
+        // which clips are processed. The previous index-parity colouring
+        // (i % 2) made every move flip the colour, which read as "the clip
+        // mutated" even though only its position changed.
+        const bool hasEffects = !m_clips[i].colorCorrection.isDefault()
+                             || !m_clips[i].effects.isEmpty();
+        QColor color = hasEffects ? QColor(0x44, 0xAA, 0x88)
+                                  : QColor(0x44, 0x88, 0xCC);
         const bool isSelected = m_selectedClips.contains(i);
         if (isSelected) color = color.lighter(140);
         if (m_dragMode == DragMode::MoveClip && i == m_dropTargetIndex) {
@@ -799,8 +814,6 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
         // edge of any clip with a non-default color correction OR any video
         // effect applied. The bar spans the full clip width so the user can
         // immediately see the affected time range.
-        const bool hasEffects = !m_clips[i].colorCorrection.isDefault()
-                             || !m_clips[i].effects.isEmpty();
         if (hasEffects) {
             const QRect fxBar(x, 0, clipWidth, 3);
             painter.fillRect(fxBar, QColor(170, 100, 230, 230));
@@ -855,6 +868,60 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
         label += QString(" %1:%2").arg(mins, 2, 10, QChar('0')).arg(secs, 2, 10, QChar('0'));
         painter.drawText(textRect, Qt::AlignLeft | Qt::AlignVCenter,
             painter.fontMetrics().elidedText(label, Qt::ElideRight, textRect.width()));
+
+        // Transition badges. Amber gradient band at the bottom of the clip,
+        // width = transition duration in pixels (capped at half the clip
+        // width so a long transition on a short clip doesn't paint over the
+        // entire body). Gradient fades toward the clip interior so the user
+        // can read at-a-glance which edge is fading and over how long.
+        const int bandH = qMin(8, qMax(4, m_rowHeight / 6));
+        const int bandY = m_rowHeight - bandH - 2; // 2 px gap above resize handle
+        auto transitionAbbrev = [](TransitionType type) -> QString {
+            switch (type) {
+                case TransitionType::None:          return "";
+                case TransitionType::FadeIn:        return "Fi";
+                case TransitionType::FadeOut:       return "Fo";
+                case TransitionType::CrossDissolve: return "X";
+                case TransitionType::WipeLeft:      return "WL";
+                case TransitionType::WipeRight:     return "WR";
+                case TransitionType::WipeUp:        return "WU";
+                case TransitionType::WipeDown:      return "WD";
+                case TransitionType::SlideLeft:     return "SL";
+                case TransitionType::SlideRight:    return "SR";
+            }
+            return "";
+        };
+        if (m_clips[i].leadIn.type != TransitionType::None) {
+            int durPx = qMax(6, static_cast<int>(
+                m_clips[i].leadIn.duration * m_pixelsPerSecond));
+            int badgeW = qMin(durPx, qMax(20, clipWidth / 2));
+            QRect band(x, bandY, badgeW, bandH);
+            QLinearGradient g(band.topLeft(), band.topRight());
+            g.setColorAt(0.0, QColor(255, 200, 80, 230));
+            g.setColorAt(1.0, QColor(255, 200, 80, 30));
+            painter.fillRect(band, g);
+            painter.setPen(QPen(QColor(40, 30, 0), 1));
+            painter.setFont(QFont("Arial", 7, QFont::Bold));
+            painter.drawText(QRect(x + 2, bandY - 1, badgeW - 4, bandH + 2),
+                             Qt::AlignLeft | Qt::AlignVCenter,
+                             transitionAbbrev(m_clips[i].leadIn.type));
+        }
+        if (m_clips[i].trailOut.type != TransitionType::None) {
+            int durPx = qMax(6, static_cast<int>(
+                m_clips[i].trailOut.duration * m_pixelsPerSecond));
+            int badgeW = qMin(durPx, qMax(20, clipWidth / 2));
+            int bx = x + clipWidth - badgeW;
+            QRect band(bx, bandY, badgeW, bandH);
+            QLinearGradient g(band.topLeft(), band.topRight());
+            g.setColorAt(0.0, QColor(255, 200, 80, 30));
+            g.setColorAt(1.0, QColor(255, 200, 80, 230));
+            painter.fillRect(band, g);
+            painter.setPen(QPen(QColor(40, 30, 0), 1));
+            painter.setFont(QFont("Arial", 7, QFont::Bold));
+            painter.drawText(QRect(bx + 2, bandY - 1, badgeW - 4, bandH + 2),
+                             Qt::AlignRight | Qt::AlignVCenter,
+                             transitionAbbrev(m_clips[i].trailOut.type));
+        }
         x += clipWidth;
     }
 
@@ -1334,10 +1401,15 @@ void Timeline::setupUI()
     m_headerLayout->setContentsMargins(0, 0, 0, 0);
     m_headerLayout->setSpacing(2);
     // Magnet (snap) toggle in the header column's top area. Fixed height
-    // matches the time ruler (22) + playhead overlay (15) so V1's header
-    // aligns with the first track widget below.
+    // pairs with the right side's [time-ruler 22 + playhead-overlay 15]
+    // strip. The header column's QVBoxLayout spacing (2 px) sits AFTER
+    // this row, while the right side's tracksOuterLayout has spacing=0
+    // — shave 2 px here so the V/A separator on the left lines up with
+    // the V/A separator on the right (otherwise the header column drifts
+    // 2 px below the track column at the V/A boundary).
     auto *magnetArea = new QWidget(m_headerColumn);
-    magnetArea->setFixedHeight(22 + 15);
+    m_magnetArea = magnetArea;
+    magnetArea->setFixedHeight(22 + 15 - 2);
     magnetArea->setStyleSheet("background-color: #1f1f1f;");
     auto *magnetRow = new QHBoxLayout(magnetArea);
     magnetRow->setContentsMargins(6, 2, 6, 2);
@@ -1386,14 +1458,88 @@ void Timeline::setupUI()
     m_playheadOverlay = new PlayheadOverlay(tracksContainer);
     m_playheadOverlay->setFixedHeight(15);
     m_playheadOverlay->setStyleSheet("background-color: #222;");
-    connect(m_playheadOverlay, &PlayheadOverlay::playheadMoved, this, [this](int x) {
-        m_playheadPos = m_videoTrack->xToSeconds(x);
+    // Helper that clamps a candidate playhead content-x into the central 70%
+    // of the visible viewport. Returns the bar position to draw and updates
+    // m_playheadDragViewportX as a side effect (used by the auto-scroll timer).
+    auto resolvePlayheadDragX = [this](int contentX) -> int {
+        int barX = contentX;
+        if (m_scrollArea && m_scrollArea->viewport()) {
+            QScrollBar *hbar = m_scrollArea->horizontalScrollBar();
+            if (hbar) {
+                const int viewportW = m_scrollArea->viewport()->width();
+                const int scrollX = hbar->value();
+                const int viewportX = contentX - scrollX;
+                const int leftZone = static_cast<int>(viewportW * 0.15);
+                const int rightZone = static_cast<int>(viewportW * 0.85);
+                if (viewportW > 0) {
+                    // Only pin the bar at the 15% / 85% boundary if the
+                    // timeline can actually keep scrolling in that direction.
+                    // When the scrollbar is already at its rail (timeline
+                    // start at min, last-clip-end + trailing pad at max),
+                    // pinning would leave the start (content x = 0) and the
+                    // end-of-content unreachable — the user could never drag
+                    // the bar to position 0 or past the last clip.
+                    if (viewportX < leftZone && scrollX > hbar->minimum())
+                        barX = scrollX + leftZone;
+                    else if (viewportX > rightZone && scrollX < hbar->maximum())
+                        barX = scrollX + rightZone;
+                }
+                m_playheadDragViewportX = viewportX;
+            }
+        }
+        return barX;
+    };
+
+    connect(m_playheadOverlay, &PlayheadOverlay::playheadMoved, this, [this, resolvePlayheadDragX](int x) {
+        // First event of a press-drag cycle: place the bar exactly where the
+        // user clicked (no clamp, no scroll) so a plain click on a position
+        // in the outer 15% still lands the playhead there. Auto-scroll only
+        // engages on subsequent moves.
+        const bool firstEvent = !m_playheadDragging;
+        m_playheadDragging = true;
+        if (firstEvent) {
+            m_playheadDragMoved = false;
+            m_playheadPos = m_videoTrack->xToSeconds(x);
+            if (m_playheadOverlay)
+                m_playheadOverlay->setPlayheadX(x);
+            if (m_scrollArea && m_scrollArea->horizontalScrollBar())
+                m_playheadDragViewportX = x - m_scrollArea->horizontalScrollBar()->value();
+            emit scrubPositionChanged(m_playheadPos);
+            return;
+        }
+        m_playheadDragMoved = true;
+        const int barX = resolvePlayheadDragX(x);
+        m_playheadPos = m_videoTrack->xToSeconds(barX);
+        if (m_playheadOverlay)
+            m_playheadOverlay->setPlayheadX(barX);
+        if (m_playheadAutoScrollTimer && !m_playheadAutoScrollTimer->isActive())
+            m_playheadAutoScrollTimer->start();
         emit scrubPositionChanged(m_playheadPos);
     });
-    connect(m_playheadOverlay, &PlayheadOverlay::playheadReleased, this, [this](int x) {
-        m_playheadPos = m_videoTrack->xToSeconds(x);
+    connect(m_playheadOverlay, &PlayheadOverlay::playheadReleased, this, [this, resolvePlayheadDragX](int x) {
+        const bool useClamp = m_playheadDragMoved;
+        m_playheadDragging = false;
+        m_playheadDragMoved = false;
+        if (m_playheadAutoScrollTimer)
+            m_playheadAutoScrollTimer->stop();
+        // Pure click (no drag) lands the bar exactly where the user clicked
+        // — even inside the outer 15% scroll zone — so a single click in any
+        // visible area is a precise scrub. A release after an actual drag,
+        // however, must keep the clamped position so the bar matches what
+        // the user saw mid-drag instead of snapping to the raw cursor x.
+        const int barX = useClamp ? resolvePlayheadDragX(x) : x;
+        m_playheadPos = m_videoTrack->xToSeconds(barX);
+        if (m_playheadOverlay)
+            m_playheadOverlay->setPlayheadX(barX);
         emit positionChanged(m_playheadPos);
     });
+
+    if (!m_playheadAutoScrollTimer) {
+        m_playheadAutoScrollTimer = new QTimer(this);
+        m_playheadAutoScrollTimer->setInterval(16); // ~60 Hz while drag-scrolling
+        connect(m_playheadAutoScrollTimer, &QTimer::timeout,
+                this, &Timeline::onPlayheadAutoScrollTick);
+    }
     tracksOuterLayout->addWidget(m_playheadOverlay);
 
     m_tracksWidget = new QWidget();
@@ -1431,6 +1577,31 @@ void Timeline::setupUI()
     });
     m_textStripHeader = new QWidget(m_headerColumn);
     m_textStripHeader->setFixedHeight(m_trackHeight);
+    // Belt-and-suspenders sync: whatever resize path actually changes the
+    // textStrip's height (callback, layout invalidation, refreshTextStrip
+    // re-entry, etc.), mirror it onto the header column's matching row so
+    // the V1 lock/mute icons never drift away from the V1 clip block. The
+    // explicit setFixedHeight calls in the row-height callback should keep
+    // these in sync, but the resize-event filter is the empirical fallback
+    // for any path that bypasses the callback.
+    {
+        struct HeightFollower : public QObject {
+            QPointer<QWidget> follower;
+            bool eventFilter(QObject *obj, QEvent *e) override {
+                if (e->type() == QEvent::Resize) {
+                    if (auto *src = qobject_cast<QWidget*>(obj)) {
+                        if (follower && follower->height() != src->height())
+                            follower->setFixedHeight(src->height());
+                    }
+                }
+                return false;
+            }
+        };
+        auto *follower = new HeightFollower;
+        follower->follower = m_textStripHeader;
+        follower->setParent(m_textStrip);
+        m_textStrip->installEventFilter(follower);
+    }
     m_textStripHeader->setStyleSheet(
         "background-color: #353535; color: #ddd; border-right: 1px solid #1a1a1a;");
     auto *thLayout = new QHBoxLayout(m_textStripHeader);
@@ -1473,7 +1644,26 @@ void Timeline::setupUI()
     tracksContainer->installEventFilter(this);
     m_scrollArea->viewport()->installEventFilter(this);
 
-    contentHbox->addWidget(m_headerColumn);
+    // Wrap the header column in its own QScrollArea so the V/A header
+    // rows scroll vertically in lockstep with the right-side track scroll.
+    // Without this, scrolling the tracks down leaves the header labels
+    // pinned at the top while the clip rows slide upward — the lock /
+    // mute icons drift away from the clips they label.
+    auto *headerScrollArea = new QScrollArea(contentArea);
+    headerScrollArea->setWidgetResizable(true);
+    headerScrollArea->setFrameShape(QFrame::NoFrame);
+    headerScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    headerScrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    headerScrollArea->setFixedWidth(kHeaderColumnWidth);
+    headerScrollArea->setStyleSheet("background-color: #252525;");
+    headerScrollArea->setWidget(m_headerColumn);
+
+    // Sync vertical scroll: when the user scrolls the tracks side, the
+    // header column must follow so V1's icons stay next to the V1 row.
+    connect(m_scrollArea->verticalScrollBar(), &QScrollBar::valueChanged,
+            headerScrollArea->verticalScrollBar(), &QScrollBar::setValue);
+
+    contentHbox->addWidget(headerScrollArea);
     contentHbox->addWidget(m_scrollArea, 1);
 
     layout->addWidget(contentArea);
@@ -2367,6 +2557,25 @@ void Timeline::setClipColorCorrection(const ColorCorrection &cc)
     saveUndoState("Color correction");
 }
 
+void Timeline::applyTransitionToSelected(const Transition &t)
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0) return;
+    auto clips = m_videoTrack->clips();
+    if (sel >= clips.size()) return;
+    // FadeIn is the only transition that semantically belongs at the start
+    // of a clip ("fade in from black"); every other type — FadeOut, all the
+    // wipes/slides, cross-dissolve — describes how this clip ENDS or hands
+    // off to the next, so they live on trailOut.
+    if (t.type == TransitionType::FadeIn)
+        clips[sel].leadIn = t;
+    else
+        clips[sel].trailOut = t;
+    m_videoTrack->setClips(clips);
+    saveUndoState(QString("Add transition: %1").arg(Transition::typeName(t.type)));
+    scheduleEmitSequenceChanged();
+}
+
 void Timeline::setClipEffects(const QVector<VideoEffect> &effects)
 {
     int sel = m_videoTrack->selectedClip();
@@ -2769,6 +2978,14 @@ void Timeline::setTrackHeight(int h)
                         continue;
                     if (hw == m_textStripHeader && m_textStripCustomHeight > 0)
                         continue;
+                    // m_magnetArea sits above the V/A header rows and pairs
+                    // with the right side's [time-ruler 22 + playhead-overlay
+                    // 15] strip. Its height is locked to 37 px so V1's
+                    // header stays vertically aligned with the V1 track —
+                    // resizing it with m_trackHeight is what made the lock
+                    // and mute icons drift away from their tracks.
+                    if (hw == m_magnetArea)
+                        continue;
                     hw->setFixedHeight(m_trackHeight);
                 }
             }
@@ -2835,6 +3052,10 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double opacity = 1.0;
         double volume = 1.0;
         int clipIdx = -1;
+        TransitionType leadInType = TransitionType::None;
+        double leadInDuration = 0.0;
+        TransitionType trailOutType = TransitionType::None;
+        double trailOutDuration = 0.0;
     };
 
     QVector<QVector<Interval>> trackIntervals;
@@ -2865,6 +3086,10 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.opacity = c.opacity;
                 iv.volume = c.volume;
                 iv.clipIdx = ci;
+                iv.leadInType = c.leadIn.type;
+                iv.leadInDuration = c.leadIn.duration;
+                iv.trailOutType = c.trailOut.type;
+                iv.trailOutDuration = c.trailOut.duration;
                 ivs.append(iv);
                 accum += clipDur;
             }
@@ -2905,6 +3130,10 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.opacity = iv.opacity;
         e.volume = iv.volume;
         e.sourceClipIndex = iv.clipIdx;
+        e.leadInType = iv.leadInType;
+        e.leadInDuration = iv.leadInDuration;
+        e.trailOutType = iv.trailOutType;
+        e.trailOutDuration = iv.trailOutDuration;
         qInfo() << "[SEQ] entry idx=" << result.size()
                 << "tl=[" << iv.timelineStart << "," << iv.timelineEnd << "]"
                 << "clip=[" << iv.clipIn << "," << iv.clipOut << "]"
@@ -2955,6 +3184,10 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             e.audioMuted = trackMuted;
             e.volume = c.volume;
             e.sourceClipIndex = ci;
+            e.leadInType = c.leadIn.type;
+            e.leadInDuration = c.leadIn.duration;
+            e.trailOutType = c.trailOut.type;
+            e.trailOutDuration = c.trailOut.duration;
             result.append(e);
             accum += clipDur;
         }
@@ -3076,6 +3309,56 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
     // setClips bypasses modified(); trigger sequence rebuild explicitly.
     scheduleEmitSequenceChanged();
     scheduleEmitSequenceChanged();
+}
+
+void Timeline::onPlayheadAutoScrollTick()
+{
+    // Drives auto-scroll while the user drags the playhead bar with the
+    // cursor held in the outer 15% of the viewport. The bar visually pins
+    // at the 15% / 85% boundary; the timeline scrolls under it, advancing
+    // m_playheadPos so the user keeps scrubbing without losing sight of
+    // the bar.
+    if (!m_playheadDragging) {
+        if (m_playheadAutoScrollTimer)
+            m_playheadAutoScrollTimer->stop();
+        return;
+    }
+    if (!m_scrollArea || !m_scrollArea->viewport() || !m_videoTrack)
+        return;
+    QScrollBar *hbar = m_scrollArea->horizontalScrollBar();
+    if (!hbar)
+        return;
+
+    const int viewportW = m_scrollArea->viewport()->width();
+    if (viewportW <= 0)
+        return;
+    const int scrollX = hbar->value();
+    const int leftZone = static_cast<int>(viewportW * 0.15);
+    const int rightZone = static_cast<int>(viewportW * 0.85);
+
+    int delta = 0;
+    if (m_playheadDragViewportX < leftZone) {
+        const int overshoot = leftZone - m_playheadDragViewportX;
+        delta = -qBound(2, overshoot / 2, 80);
+    } else if (m_playheadDragViewportX > rightZone) {
+        const int overshoot = m_playheadDragViewportX - rightZone;
+        delta = qBound(2, overshoot / 2, 80);
+    } else {
+        return; // cursor inside the central 70% free zone — no auto-scroll
+    }
+
+    const int newScrollX = qBound(hbar->minimum(), scrollX + delta, hbar->maximum());
+    if (newScrollX == scrollX)
+        return; // already at the rail; nothing more to scroll
+
+    hbar->setValue(newScrollX);
+
+    const int boundary = (delta < 0) ? leftZone : rightZone;
+    const int barX = newScrollX + boundary;
+    m_playheadPos = m_videoTrack->xToSeconds(barX);
+    if (m_playheadOverlay)
+        m_playheadOverlay->setPlayheadX(barX);
+    emit scrubPositionChanged(m_playheadPos);
 }
 
 void Timeline::syncPlayheadOverlay()

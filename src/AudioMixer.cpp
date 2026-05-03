@@ -46,6 +46,7 @@ struct AudioDecoderEntry {
     // would play out of phase with other tracks (CRITICAL #2 from the
     // Phase 2 review).
     int64_t ringStartTlUs = 0;
+    double prevGain = 1.0; // last gain applied in inner copy loop, used to ramp at fragment seam
     bool eof = false;
     bool seekPending = true;         // first-time seek to entry's start when approached
     AVPacket *pkt = nullptr;
@@ -252,7 +253,16 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // entry's audio relative to the rest of the mix.
         if (e->ringStartTlUs < cursorUs) {
             const int64_t lateUs = cursorUs - e->ringStartTlUs;
-            const qint64 lateB = usToBytes(lateUs);
+            // Bound the late-drop click duration to 2ms (audible threshold).
+            // The tolerant-dedup path in seekTo bumps m_writeCursorUs to the
+            // target without updating per-entry ringStartTlUs, so this branch
+            // can fire with lateUs up to the dedup window (~100 ms) and
+            // silently discard that much legitimate in-time audio = boundary
+            // pop. Clamping to 2 ms keeps the drop inaudible; the residual
+            // desync self-corrects over the next few readData fragments.
+            constexpr int64_t kMaxLateDropUs = 2'000;
+            const int64_t clampedLateUs = qMin(lateUs, kMaxLateDropUs);
+            const qint64 lateB = usToBytes(clampedLateUs);
             const qint64 dropBytes = qMin<qint64>(lateB, liveBytes(*e));
             if (dropBytes > 0) {
                 e->ringHead += static_cast<int>(dropBytes);
@@ -268,10 +278,35 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         const int trackIdx = e->entry.sourceTrack;
         if (trackIdx >= 0 && trackIdx < m_mixer->m_trackStates.size())
             gain *= m_mixer->m_trackStates[trackIdx].effectiveGain;
+
+        // Edge-attached audio fade. Linear ramp matching the video FadeIn /
+        // FadeOut applied in VideoPlayer::displayFrame so A/V stay in lock
+        // step. The ramp uses the cursor at the start of this readData
+        // fragment — a 64 KB ring is ~340 ms, so the within-fragment error
+        // is well below audible threshold for the typical 0.5-2 s fade
+        // window. If sub-buffer accuracy ever matters we can compute the
+        // multiplier per-sample inside the copy loop below.
+        const double posSec = static_cast<double>(cursorUs) / 1e6;
+        const double elapsed = posSec - e->entry.timelineStart;
+        const double remaining = e->entry.timelineEnd - posSec;
+        if (e->entry.leadInType == TransitionType::FadeIn
+            && e->entry.leadInDuration > 0.0
+            && elapsed >= 0.0 && elapsed < e->entry.leadInDuration) {
+            gain *= qBound(0.0, elapsed / e->entry.leadInDuration, 1.0);
+        } else if (e->entry.trailOutType == TransitionType::FadeOut
+            && e->entry.trailOutDuration > 0.0
+            && remaining >= 0.0 && remaining < e->entry.trailOutDuration) {
+            gain *= qBound(0.0, remaining / e->entry.trailOutDuration, 1.0);
+        }
         if (gain <= 0.0) {
             // Drain the ring so this muted entry stays in time with the
             // cursor; otherwise unmuting mid-playback would resume from a
             // stale position.
+            // Track prevGain through the muted window so the ramp on unmute
+            // starts from 0 instead of the pre-mute gain. Otherwise lowering
+            // volume while muted and then unmuting produces a brief blip as
+            // the ramp descends from 1.0 to the new gain.
+            e->prevGain = 0.0;
             const int dropBytes = static_cast<int>(qMin<qint64>(maxlen, liveBytes(*e)));
             e->ringHead += dropBytes;
             e->ringStartTlUs += bytesToUs(dropBytes);
@@ -281,13 +316,24 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         const int copyBytes = static_cast<int>(qMin<qint64>(maxlen, liveBytes(*e)));
         const int copySamples = copyBytes / static_cast<int>(sizeof(int16_t));
         const int16_t *src = reinterpret_cast<const int16_t *>(liveData(*e));
-        if (qFuzzyCompare(gain, 1.0)) {
-            for (int i = 0; i < copySamples; ++i)
-                accum[i] += src[i];
-        } else {
-            for (int i = 0; i < copySamples; ++i)
-                accum[i] += static_cast<int32_t>(src[i] * gain);
+        // Per-sample 5ms gain ramp at fragment seam to suppress click at entry
+        // transitions (volume / fade / mute step). Ramps from prevGain → gain over
+        // the first qMin(copySamples, 240) samples (240 = 5ms @ 48kHz stereo, the
+        // shortest perceptually de-clicking length). Inside an entry the ramp is
+        // inert (prevGain == gain), so cost is 1 div + 240 fmadds per fragment.
+        // prevGain is intentionally NOT reset on seek/setSequence — the click is
+        // between two fragments of the OS sink callback, not within the entry's
+        // data lifecycle.
+        const int rampLen = qMin(copySamples, 240);
+        const double gainStep = (rampLen > 0) ? (gain - e->prevGain) / static_cast<double>(rampLen) : 0.0;
+        for (int i = 0; i < rampLen; ++i) {
+            const double g = e->prevGain + gainStep * static_cast<double>(i);
+            accum[i] += static_cast<int32_t>(src[i] * g);
         }
+        for (int i = rampLen; i < copySamples; ++i) {
+            accum[i] += static_cast<int32_t>(src[i] * gain);
+        }
+        e->prevGain = gain;
         e->ringHead += copyBytes;
         e->ringStartTlUs += bytesToUs(copyBytes);
         anyMixed = true;

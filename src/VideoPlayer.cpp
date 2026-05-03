@@ -1024,19 +1024,12 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
     // Audio is driven by the AudioMixer's master clock now — re-anchor it
     // so the new entry's local position is reached on the next refill tick.
     m_timelinePositionUs = static_cast<int64_t>(next.timelineStart * AV_TIME_BASE);
-    if (m_mixer) m_mixer->seekTo(m_timelinePositionUs);
 
-    if (wasPlaying)
-        m_playing = true;
-    m_suppressUiUpdates = prevSuppress;
-    // resetDecoder (called from loadFile) ran updatePlayButton with
-    // m_playing=false and disabled the pause button. After we restore
-    // m_playing above, sync the button enabled state again — otherwise
-    // the user sees the pause button as un-clickable across every clip
-    // boundary that crosses a file switch.
-    updatePlayButton();
-    updatePositionUi();
-
+    // Run the auto-resume play() BEFORE the mixer seekTo below. AudioMixer
+    // dedup branches all gate on m_playing.load(); calling seekTo first when
+    // playback was paused mid-boundary would land in the unguarded full
+    // sinkSnap->reset()+start() path and produce an OS-level click.
+    //
     // Iteration 10 — auto-resume invariant on clip boundary. User report:
     // "クリップの切り替えの所で止まる、クリップの最初所に来たら自動で再生
     // される様には出来る？" Even with Iteration 9 hot-swap clean, a
@@ -1056,6 +1049,19 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
         if (m_mixer) m_mixer->play();
         scheduleNextFrame();
     }
+
+    if (m_mixer) m_mixer->seekTo(m_timelinePositionUs);
+
+    if (wasPlaying)
+        m_playing = true;
+    m_suppressUiUpdates = prevSuppress;
+    // resetDecoder (called from loadFile) ran updatePlayButton with
+    // m_playing=false and disabled the pause button. After we restore
+    // m_playing above, sync the button enabled state again — otherwise
+    // the user sees the pause button as un-clickable across every clip
+    // boundary that crosses a file switch.
+    updatePlayButton();
+    updatePositionUi();
     return true;
 }
 
@@ -1572,7 +1578,42 @@ bool VideoPlayer::canUseInteropFastPath(const AVFrame *frame) const
 void VideoPlayer::displayFrame(const QImage &image)
 {
     m_lastSourceFrame = image;
-    const QImage composed = composeFrameWithOverlays(image);
+    QImage composed = composeFrameWithOverlays(image);
+
+    // Edge-attached transitions: FadeIn at the start, FadeOut at the end of
+    // the active entry's timeline window. Linear ramp from black (alpha=0)
+    // to full image (alpha=1). CrossDissolve / wipes / slides land in a
+    // later iteration — those need access to the OUTGOING clip's frame
+    // (CrossDissolve) or path geometry (wipe/slide), neither of which is
+    // wired through this single-image displayFrame contract yet.
+    if (!composed.isNull() && sequenceActive()
+        && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+        const auto &e = m_sequence[m_activeEntry];
+        const double T = static_cast<double>(m_timelinePositionUs)
+                       / static_cast<double>(AV_TIME_BASE);
+        const double elapsed = T - e.timelineStart;
+        const double remaining = e.timelineEnd - T;
+        double alpha = 1.0;
+        if (e.leadInType == TransitionType::FadeIn
+            && e.leadInDuration > 0.0
+            && elapsed >= 0.0 && elapsed < e.leadInDuration) {
+            alpha = qBound(0.0, elapsed / e.leadInDuration, 1.0);
+        } else if (e.trailOutType == TransitionType::FadeOut
+            && e.trailOutDuration > 0.0
+            && remaining >= 0.0 && remaining < e.trailOutDuration) {
+            alpha = qBound(0.0, remaining / e.trailOutDuration, 1.0);
+        }
+        if (alpha < 0.999) {
+            QImage faded(composed.size(), QImage::Format_ARGB32_Premultiplied);
+            faded.fill(Qt::black);
+            QPainter pp(&faded);
+            pp.setOpacity(alpha);
+            pp.drawImage(0, 0, composed);
+            pp.end();
+            composed = faded;
+        }
+    }
+
     m_currentFrameImage = composed;
     if (m_useGL && m_glPreview) {
         m_glPreview->setDisplayAspectRatio(effectiveDisplayAspectRatio());
