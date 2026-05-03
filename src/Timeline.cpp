@@ -869,13 +869,15 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
         painter.drawText(textRect, Qt::AlignLeft | Qt::AlignVCenter,
             painter.fontMetrics().elidedText(label, Qt::ElideRight, textRect.width()));
 
-        // Transition badges. Amber gradient band at the bottom of the clip,
-        // width = transition duration in pixels (capped at half the clip
-        // width so a long transition on a short clip doesn't paint over the
-        // entire body). Gradient fades toward the clip interior so the user
-        // can read at-a-glance which edge is fading and over how long.
-        const int bandH = qMin(8, qMax(4, m_rowHeight / 6));
-        const int bandY = m_rowHeight - bandH - 2; // 2 px gap above resize handle
+        // Transition badge. Fixed-size pill at the affected corner — top-left
+        // for leadIn (FadeIn), top-right for trailOut (FadeOut /
+        // CrossDissolve / Wipe / Slide). Coloured per type so the user can
+        // tell them apart at a glance, with abbrev + duration text. Width
+        // is fixed at kBadgeW px regardless of clip width or transition
+        // duration; clipped to the clip's actual width on tiny clips.
+        constexpr int kBadgeW = 64;
+        constexpr int kBadgeH = 18;
+        const int badgeY = 3;
         auto transitionAbbrev = [](TransitionType type) -> QString {
             switch (type) {
                 case TransitionType::None:          return "";
@@ -891,36 +893,55 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
             }
             return "";
         };
+        auto transitionColor = [](TransitionType type) -> QColor {
+            switch (type) {
+                case TransitionType::FadeIn:
+                case TransitionType::FadeOut:
+                    return QColor(255, 200, 80);   // amber
+                case TransitionType::CrossDissolve:
+                    return QColor(190, 140, 245);  // purple
+                case TransitionType::WipeLeft:
+                case TransitionType::WipeRight:
+                case TransitionType::WipeUp:
+                case TransitionType::WipeDown:
+                    return QColor(120, 220, 240);  // cyan
+                case TransitionType::SlideLeft:
+                case TransitionType::SlideRight:
+                    return QColor(255, 140, 200);  // pink
+                default:
+                    return QColor(255, 200, 80);
+            }
+        };
+        auto paintTransitionBadge = [&](const Transition &t, int badgeX) {
+            if (t.type == TransitionType::None) return;
+            const int badgeW = qMin(kBadgeW, clipWidth - 4);
+            if (badgeW < 12) return;
+            const QColor base = transitionColor(t.type);
+            const QRect badge(badgeX, badgeY, badgeW, kBadgeH);
+
+            painter.setRenderHint(QPainter::Antialiasing, true);
+            painter.setBrush(base);
+            painter.setPen(QPen(base.darker(160), 1));
+            painter.drawRoundedRect(badge, 4, 4);
+            painter.setRenderHint(QPainter::Antialiasing, false);
+
+            QString label = QString("%1 %2s")
+                .arg(transitionAbbrev(t.type))
+                .arg(t.duration, 0, 'f', 1);
+            painter.setPen(QPen(QColor(20, 10, 0), 1));
+            painter.setFont(QFont("Arial", 8, QFont::Bold));
+            const QString elided = painter.fontMetrics().elidedText(
+                label, Qt::ElideRight, badgeW - 8);
+            painter.drawText(badge.adjusted(4, 0, -4, 0),
+                             Qt::AlignCenter, elided);
+        };
         if (m_clips[i].leadIn.type != TransitionType::None) {
-            int durPx = qMax(6, static_cast<int>(
-                m_clips[i].leadIn.duration * m_pixelsPerSecond));
-            int badgeW = qMin(durPx, qMax(20, clipWidth / 2));
-            QRect band(x, bandY, badgeW, bandH);
-            QLinearGradient g(band.topLeft(), band.topRight());
-            g.setColorAt(0.0, QColor(255, 200, 80, 230));
-            g.setColorAt(1.0, QColor(255, 200, 80, 30));
-            painter.fillRect(band, g);
-            painter.setPen(QPen(QColor(40, 30, 0), 1));
-            painter.setFont(QFont("Arial", 7, QFont::Bold));
-            painter.drawText(QRect(x + 2, bandY - 1, badgeW - 4, bandH + 2),
-                             Qt::AlignLeft | Qt::AlignVCenter,
-                             transitionAbbrev(m_clips[i].leadIn.type));
+            paintTransitionBadge(m_clips[i].leadIn, x + 2);
         }
         if (m_clips[i].trailOut.type != TransitionType::None) {
-            int durPx = qMax(6, static_cast<int>(
-                m_clips[i].trailOut.duration * m_pixelsPerSecond));
-            int badgeW = qMin(durPx, qMax(20, clipWidth / 2));
-            int bx = x + clipWidth - badgeW;
-            QRect band(bx, bandY, badgeW, bandH);
-            QLinearGradient g(band.topLeft(), band.topRight());
-            g.setColorAt(0.0, QColor(255, 200, 80, 30));
-            g.setColorAt(1.0, QColor(255, 200, 80, 230));
-            painter.fillRect(band, g);
-            painter.setPen(QPen(QColor(40, 30, 0), 1));
-            painter.setFont(QFont("Arial", 7, QFont::Bold));
-            painter.drawText(QRect(bx + 2, bandY - 1, badgeW - 4, bandH + 2),
-                             Qt::AlignRight | Qt::AlignVCenter,
-                             transitionAbbrev(m_clips[i].trailOut.type));
+            const int badgeW = qMin(kBadgeW, clipWidth - 4);
+            paintTransitionBadge(m_clips[i].trailOut,
+                                 x + clipWidth - badgeW - 2);
         }
         x += clipWidth;
     }
@@ -2381,7 +2402,11 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     if (!track->isClipSelected(clipIndex))
         track->setSelectedClip(clipIndex);
 
-    const int linkGroup = track->clips()[clipIndex].linkGroup;
+    const ClipInfo &clipInfo = track->clips()[clipIndex];
+    const int linkGroup = clipInfo.linkGroup;
+    const bool hasTransition = clipInfo.leadIn.type != TransitionType::None
+                            || clipInfo.trailOut.type != TransitionType::None;
+
     QMenu menu;
     QAction *cutAct = menu.addAction(QStringLiteral("カット"));
     QAction *copyAct = menu.addAction(QStringLiteral("コピー"));
@@ -2392,6 +2417,22 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *relinkAct = menu.addAction(QStringLiteral("再同期"));
     relinkAct->setEnabled(linkGroup == 0);
 
+    menu.addSeparator();
+    QMenu *transitionMenu = menu.addMenu(QStringLiteral("トランジション"));
+    QAction *xdAct = transitionMenu->addAction(QStringLiteral("クロスディゾルブ (1.0s)"));
+    QAction *fiAct = transitionMenu->addAction(QStringLiteral("フェードイン (0.5s)"));
+    QAction *foAct = transitionMenu->addAction(QStringLiteral("フェードアウト (0.5s)"));
+    transitionMenu->addSeparator();
+    QAction *transDialogAct = transitionMenu->addAction(QStringLiteral("カスタム..."));
+    QAction *transClearAct = nullptr;
+    if (hasTransition) {
+        transitionMenu->addSeparator();
+        transClearAct = transitionMenu->addAction(QStringLiteral("トランジションを削除"));
+    }
+
+    QAction *fxAct = menu.addAction(QStringLiteral("ビデオエフェクト..."));
+    QAction *ccAct = menu.addAction(QStringLiteral("色補正 / グレーディング..."));
+
     QAction *chosen = menu.exec(globalPos);
     if (!chosen) return;
     if (chosen == cutAct) cutSelectedClip();
@@ -2399,6 +2440,28 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     else if (chosen == deleteAct) deleteSelectedClip();
     else if (chosen == unlinkAct) unlinkClipGroup(linkGroup);
     else if (chosen == relinkAct) relinkClipAt(track, clipIndex);
+    else if (chosen == xdAct) {
+        Transition t;
+        t.type = TransitionType::CrossDissolve;
+        t.duration = 1.0;
+        applyTransitionToSelected(t);
+    }
+    else if (chosen == fiAct) {
+        Transition t;
+        t.type = TransitionType::FadeIn;
+        t.duration = 0.5;
+        applyTransitionToSelected(t);
+    }
+    else if (chosen == foAct) {
+        Transition t;
+        t.type = TransitionType::FadeOut;
+        t.duration = 0.5;
+        applyTransitionToSelected(t);
+    }
+    else if (chosen == transDialogAct) emit transitionDialogRequested();
+    else if (transClearAct && chosen == transClearAct) clearTransitionsOnSelected();
+    else if (chosen == fxAct) emit videoEffectsDialogRequested();
+    else if (chosen == ccAct) emit colorCorrectionRequested();
 }
 
 void Timeline::undo()
@@ -2563,16 +2626,69 @@ void Timeline::applyTransitionToSelected(const Transition &t)
     if (sel < 0) return;
     auto clips = m_videoTrack->clips();
     if (sel >= clips.size()) return;
-    // FadeIn is the only transition that semantically belongs at the start
-    // of a clip ("fade in from black"); every other type — FadeOut, all the
-    // wipes/slides, cross-dissolve — describes how this clip ENDS or hands
-    // off to the next, so they live on trailOut.
-    if (t.type == TransitionType::FadeIn)
+    // Boundary transitions apply to BOTH sides of the cut so the user
+    // doesn't need two manual operations and the badge appears on both
+    // adjacent clips. Pairing rules:
+    //   FadeIn  → this.leadIn = FadeIn; prev.trailOut = FadeOut (mirror)
+    //   FadeOut → this.trailOut = FadeOut; next.leadIn = FadeIn (mirror)
+    //   CrossDissolve / Wipe / Slide → both this.trailOut and next.leadIn
+    //                                  set to the SAME type
+    // Sequence-edge cases (no neighbour on the paired side) fall back to
+    // single-side application — that's how a clip "fades in from black"
+    // at the start of the timeline still works.
+    if (t.type == TransitionType::FadeIn) {
         clips[sel].leadIn = t;
-    else
+        if (sel > 0) {
+            Transition mirror;
+            mirror.type = TransitionType::FadeOut;
+            mirror.duration = t.duration;
+            clips[sel - 1].trailOut = mirror;
+        }
+    } else if (t.type == TransitionType::FadeOut) {
         clips[sel].trailOut = t;
+        if (sel + 1 < clips.size()) {
+            Transition mirror;
+            mirror.type = TransitionType::FadeIn;
+            mirror.duration = t.duration;
+            clips[sel + 1].leadIn = mirror;
+        }
+    } else {
+        clips[sel].trailOut = t;
+        if (sel + 1 < clips.size())
+            clips[sel + 1].leadIn = t;
+    }
     m_videoTrack->setClips(clips);
     saveUndoState(QString("Add transition: %1").arg(Transition::typeName(t.type)));
+    scheduleEmitSequenceChanged();
+}
+
+void Timeline::clearTransitionsOnSelected()
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0) return;
+    auto clips = m_videoTrack->clips();
+    if (sel >= clips.size()) return;
+    const bool hadLead = clips[sel].leadIn.type != TransitionType::None;
+    const bool hadTrail = clips[sel].trailOut.type != TransitionType::None;
+    if (!hadLead && !hadTrail) return;
+    // Mirror teardown — applyTransitionToSelected pairs leadIn/trailOut
+    // across adjacent clips (FadeIn pairs with prev.trailOut=FadeOut,
+    // FadeOut with next.leadIn=FadeIn, CrossDissolve/Wipe/Slide with the
+    // same type on the other side). Clearing only this clip's slots
+    // would leave the neighbour with a half-paired transition that fires
+    // an audio fade or visual blend with nothing to blend against.
+    if (hadLead && sel > 0
+        && clips[sel - 1].trailOut.type != TransitionType::None) {
+        clips[sel - 1].trailOut = Transition{};
+    }
+    if (hadTrail && sel + 1 < clips.size()
+        && clips[sel + 1].leadIn.type != TransitionType::None) {
+        clips[sel + 1].leadIn = Transition{};
+    }
+    clips[sel].leadIn = Transition{};
+    clips[sel].trailOut = Transition{};
+    m_videoTrack->setClips(clips);
+    saveUndoState("Clear transitions");
     scheduleEmitSequenceChanged();
 }
 
@@ -3095,6 +3211,37 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
             }
         }
         trackIntervals.append(ivs);
+    }
+
+    // Premiere-style CrossDissolve overlap: when two adjacent same-track
+    // clips share a CrossDissolve transition (A.trailOut + B.leadIn), pull
+    // B's timelineStart back by the transition duration so the two intervals
+    // actually overlap on the timeline. End-at-Cut alignment — only B's
+    // clipIn handle is consumed (no need to extend A past its clipOut). The
+    // duration is clamped to B's available source handle so we never seek
+    // before the start of B's source media.
+    for (auto &trackIvs : trackIntervals) {
+        for (int j = 1; j < trackIvs.size(); ++j) {
+            Interval &a = trackIvs[j - 1];
+            Interval &b = trackIvs[j];
+            if (a.trailOutType != TransitionType::CrossDissolve) continue;
+            if (b.leadInType != TransitionType::CrossDissolve) continue;
+            const double askedD = qMin(a.trailOutDuration, b.leadInDuration);
+            if (askedD <= 0.0) continue;
+            const double bSpeed = (b.speed > 0.0) ? b.speed : 1.0;
+            const double availableD = b.clipIn / bSpeed;
+            const double effectiveD = qMin(askedD, qMax(0.0, availableD));
+            if (effectiveD < 0.01) continue;
+            b.timelineStart -= effectiveD;
+            b.clipIn -= effectiveD * bSpeed;
+            a.trailOutDuration = effectiveD;
+            b.leadInDuration = effectiveD;
+            qInfo() << "[SEQ] CrossDissolve overlap pair: track=" << a.trackIdx
+                    << "askedD=" << askedD << "availableD=" << availableD
+                    << "effectiveD=" << effectiveD
+                    << "B.timelineStart=" << b.timelineStart
+                    << "B.clipIn=" << b.clipIn;
+        }
     }
 
     QVector<Interval> visible;

@@ -259,6 +259,14 @@ void MainWindow::setupUI()
                 (void)idx;
             });
 
+    // Right-click clip menu → existing dialogs. Timeline doesn't own them.
+    connect(m_timeline, &Timeline::transitionDialogRequested,
+            this, &MainWindow::addTransition);
+    connect(m_timeline, &Timeline::videoEffectsDialogRequested,
+            this, &MainWindow::videoEffects);
+    connect(m_timeline, &Timeline::colorCorrectionRequested,
+            this, &MainWindow::colorCorrection);
+
     mainLayout->addWidget(m_welcomeWidget);
     mainLayout->addWidget(m_mainSplitter);
     setCentralWidget(centralWidget);

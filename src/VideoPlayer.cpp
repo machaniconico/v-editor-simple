@@ -998,10 +998,6 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
     }
 
     m_activeEntry = newEntryIdx;
-    // CrossDissolve cache held the predecoded next-entry frame; that entry
-    // just rotated into m_activeEntry so the cache is stale.
-    m_crossDissolveNextFrame = QImage();
-    m_crossDissolveNextEntryIdx = -1;
     // US-T35 apply the new entry's per-clip video source transform to the
     // GL preview so each clip keeps its own scale/offset.
     // V3 sprint fix (architect NIT) — prefer edit-target transform on boundary
@@ -1584,9 +1580,10 @@ void VideoPlayer::displayFrame(const QImage &image)
     m_lastSourceFrame = image;
     QImage composed = composeFrameWithOverlays(image);
 
-    // Edge-attached transitions: FadeIn / FadeOut alpha-ramp against black,
-    // CrossDissolve blends against the next same-track entry's first frame
-    // predecoded by handlePlaybackTick into m_crossDissolveNextFrame.
+    // Edge-attached transitions: FadeIn / FadeOut alpha-ramp against black.
+    // CrossDissolve uses the timeline-overlap path — Timeline overlaps the
+    // CrossDissolve pair so B is in m_sequence with timelineStart pulled
+    // back by D, and the blend happens via harvestOverlayLayer below.
     // Wipes / slides need path geometry not yet wired through displayFrame.
     if (!composed.isNull() && sequenceActive()
         && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
@@ -1604,17 +1601,6 @@ void VideoPlayer::displayFrame(const QImage &image)
             && e.trailOutDuration > 0.0
             && remaining >= 0.0 && remaining < e.trailOutDuration) {
             alpha = qBound(0.0, remaining / e.trailOutDuration, 1.0);
-        } else if (e.trailOutType == TransitionType::CrossDissolve
-            && e.trailOutDuration > 0.0
-            && remaining >= 0.0 && remaining < e.trailOutDuration
-            && !m_crossDissolveNextFrame.isNull()) {
-            // progress=0 → pure A, progress=1 → pure B (predecoded).
-            const double progress = qBound(0.0,
-                                           1.0 - remaining / e.trailOutDuration,
-                                           1.0);
-            composed = OverlayRenderer::applyTransition(
-                composed, m_crossDissolveNextFrame,
-                TransitionType::CrossDissolve, progress);
         }
         if (alpha < 0.999) {
             QImage faded(composed.size(), QImage::Format_ARGB32_Premultiplied);
@@ -1624,6 +1610,46 @@ void VideoPlayer::displayFrame(const QImage &image)
             pp.drawImage(0, 0, composed);
             pp.end();
             composed = faded;
+        }
+
+        // CrossDissolve overlap blend. When this entry's trailOutType is
+        // CrossDissolve and we're inside its trailOut window, look for the
+        // overlapping next same-track entry (Timeline pulled its
+        // timelineStart back by D) and blend its currently-playing frame
+        // on top of the active frame using progress-based opacity.
+        if (e.trailOutType == TransitionType::CrossDissolve
+            && e.trailOutDuration > 0.0
+            && remaining >= 0.0 && remaining < e.trailOutDuration) {
+            int nextIdx = -1;
+            const double overlapStart = e.timelineEnd - e.trailOutDuration;
+            // eps covers floating-point rounding only — the search range
+            // [overlapStart, e.timelineEnd] is the actual overlap window.
+            const double eps = 1e-3;
+            for (int i = 0; i < m_sequence.size(); ++i) {
+                if (i == m_activeEntry) continue;
+                const auto &c = m_sequence[i];
+                if (c.sourceTrack != e.sourceTrack) continue;
+                if (c.leadInType != TransitionType::CrossDissolve) continue;
+                if (c.timelineStart >= overlapStart - eps
+                    && c.timelineStart <= e.timelineEnd + eps) {
+                    if (nextIdx < 0
+                        || m_sequence[nextIdx].timelineStart > c.timelineStart) {
+                        nextIdx = i;
+                    }
+                }
+            }
+            if (nextIdx >= 0) {
+                DecodedLayer layer;
+                if (harvestOverlayLayer(m_sequence[nextIdx], nextIdx, &layer)
+                    && !layer.rgb.isNull()) {
+                    const double progress = qBound(0.0,
+                                                   1.0 - remaining / e.trailOutDuration,
+                                                   1.0);
+                    composed = OverlayRenderer::applyTransition(
+                        composed, layer.rgb,
+                        TransitionType::CrossDissolve, progress);
+                }
+            }
         }
     }
 
@@ -2713,63 +2739,6 @@ void VideoPlayer::handlePlaybackTick()
                     m_prerolledEntryIdx = prerollIdx;
                 }
             }
-        }
-    }
-
-    // CrossDissolve predecode — inside the active entry's trailOut window
-    // when type==CrossDissolve, decode the next same-track entry's first
-    // frame so displayFrame can blend via OverlayRenderer::applyTransition.
-    // harvestOverlayLayer reuses the boundary preroll's warm decoder;
-    // entryLocalPositionUs clamps to next.clipIn while T is still in A.
-    // Cache is cleared on window exit so it never leaks across ticks.
-    if (sequenceActive()
-        && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
-        const auto &activeE = m_sequence[m_activeEntry];
-        const double T = static_cast<double>(m_timelinePositionUs)
-                       / static_cast<double>(AV_TIME_BASE);
-        const double remaining = activeE.timelineEnd - T;
-        const bool inXdWindow = activeE.trailOutType == TransitionType::CrossDissolve
-                                && activeE.trailOutDuration > 0.0
-                                && remaining >= 0.0
-                                && remaining < activeE.trailOutDuration;
-        if (inXdWindow) {
-            const double eps = 1e-3;
-            int xdNextIdx = -1;
-            for (int i = 0; i < m_sequence.size(); ++i) {
-                if (i == m_activeEntry) continue;
-                const auto &c = m_sequence[i];
-                if (c.sourceTrack != activeE.sourceTrack) continue;
-                if (c.timelineStart >= activeE.timelineEnd - eps) {
-                    if (xdNextIdx < 0
-                        || m_sequence[xdNextIdx].timelineStart > c.timelineStart) {
-                        xdNextIdx = i;
-                    }
-                }
-            }
-            if (xdNextIdx >= 0) {
-                // Drop a stale frame from a different "next" entry before
-                // harvesting — e.g. user scrubs into another A→C window
-                // while the cache still holds B from the prior A→B path.
-                // Otherwise harvestOverlayLayer's first-tick miss would
-                // leave the wrong frame visible until the window exits.
-                if (m_crossDissolveNextEntryIdx != xdNextIdx) {
-                    m_crossDissolveNextFrame = QImage();
-                    m_crossDissolveNextEntryIdx = -1;
-                }
-                const auto &nextE = m_sequence[xdNextIdx];
-                DecodedLayer layer;
-                if (harvestOverlayLayer(nextE, xdNextIdx, &layer)
-                    && !layer.rgb.isNull()) {
-                    m_crossDissolveNextFrame = layer.rgb;
-                    m_crossDissolveNextEntryIdx = xdNextIdx;
-                }
-            } else if (m_crossDissolveNextEntryIdx != -1) {
-                m_crossDissolveNextFrame = QImage();
-                m_crossDissolveNextEntryIdx = -1;
-            }
-        } else if (m_crossDissolveNextEntryIdx != -1) {
-            m_crossDissolveNextFrame = QImage();
-            m_crossDissolveNextEntryIdx = -1;
         }
     }
 

@@ -289,18 +289,19 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         const double posSec = static_cast<double>(cursorUs) / 1e6;
         const double elapsed = posSec - e->entry.timelineStart;
         const double remaining = e->entry.timelineEnd - posSec;
-        if (e->entry.leadInType == TransitionType::FadeIn
+        if ((e->entry.leadInType == TransitionType::FadeIn
+             || e->entry.leadInType == TransitionType::CrossDissolve)
             && e->entry.leadInDuration > 0.0
             && elapsed >= 0.0 && elapsed < e->entry.leadInDuration) {
+            // CrossDissolve leadIn is symmetric to the trailOut extension
+            // below — Timeline overlaps the pair on the timeline so A's
+            // trailOut fade-out and B's leadIn fade-in fire at the same
+            // wall-clock window, combining into a linear audio crossfade.
             gain *= qBound(0.0, elapsed / e->entry.leadInDuration, 1.0);
         } else if ((e->entry.trailOutType == TransitionType::FadeOut
                     || e->entry.trailOutType == TransitionType::CrossDissolve)
             && e->entry.trailOutDuration > 0.0
             && remaining >= 0.0 && remaining < e->entry.trailOutDuration) {
-            // v0 treats CrossDissolve audio as an asymmetric FadeOut on the
-            // outgoing entry. A proper equal-power crossfade with the next
-            // entry's leadIn is a Step 3 follow-up — this avoids an audible
-            // hard cut while video does the visual blend in displayFrame.
             gain *= qBound(0.0, remaining / e->entry.trailOutDuration, 1.0);
         }
         if (gain <= 0.0) {

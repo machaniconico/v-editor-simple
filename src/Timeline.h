@@ -295,6 +295,8 @@ public:
     // the clip's leadIn slot (start-of-clip); every other type writes to
     // trailOut (end-of-clip / boundary to next clip).
     void applyTransitionToSelected(const Transition &t);
+    // Reset both leadIn and trailOut on the selected clip back to None.
+    void clearTransitionsOnSelected();
     void setClipEffects(const QVector<VideoEffect> &effects);
     void setClipKeyframes(const KeyframeManager &km);
     ColorCorrection clipColorCorrection() const;
@@ -375,6 +377,13 @@ signals:
     // timeline text strip so MainWindow can resync the right-panel
     // 開始時間 / 表示時間 spinboxes and re-push the preview overlays.
     void textOverlayTimeChanged(int overlayIndex, double startTime, double endTime);
+    // Right-click → "カスタム..." / "ビデオエフェクト..." / "色補正..." in the
+    // clip context menu. Timeline doesn't own the dialogs themselves, so it
+    // signals up to MainWindow which holds the existing entry points
+    // (addTransition / videoEffects / colorCorrection).
+    void transitionDialogRequested();
+    void videoEffectsDialogRequested();
+    void colorCorrectionRequested();
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
