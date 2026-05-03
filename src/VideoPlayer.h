@@ -514,6 +514,13 @@ private:
     // dedicated field instead so multi-track ticks never paint overlays
     // on top of a previously-composited frame.
     QImage m_lastV1RawFrame;
+    // CrossDissolve next-entry frame cache. Populated by handlePlaybackTick
+    // during the trailOut window of the active entry when its trailOutType
+    // is CrossDissolve. Consumed by displayFrame to blend over the active
+    // frame via OverlayRenderer::applyTransition. Invalidated by
+    // advanceToEntry when the active entry rotates.
+    QImage m_crossDissolveNextFrame;
+    int m_crossDissolveNextEntryIdx = -1;
     // Persistent canvas-sized scratch buffer for the compositor.
     // Re-allocated only on canvas size / format change; refilled with
     // black every compositor tick. Avoids ~8MB ARGB allocations per tick
