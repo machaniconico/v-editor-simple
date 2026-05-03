@@ -880,16 +880,25 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
         const int badgeY = 3;
         auto transitionAbbrev = [](TransitionType type) -> QString {
             switch (type) {
-                case TransitionType::None:          return "";
-                case TransitionType::FadeIn:        return "Fi";
-                case TransitionType::FadeOut:       return "Fo";
-                case TransitionType::CrossDissolve: return "X";
-                case TransitionType::WipeLeft:      return "WL";
-                case TransitionType::WipeRight:     return "WR";
-                case TransitionType::WipeUp:        return "WU";
-                case TransitionType::WipeDown:      return "WD";
-                case TransitionType::SlideLeft:     return "SL";
-                case TransitionType::SlideRight:    return "SR";
+                case TransitionType::None:               return "";
+                case TransitionType::FadeIn:             return "Fi";
+                case TransitionType::FadeOut:            return "Fo";
+                case TransitionType::CrossDissolve:      return "X";
+                case TransitionType::WipeLeft:           return "WL";
+                case TransitionType::WipeRight:          return "WR";
+                case TransitionType::WipeUp:             return "WU";
+                case TransitionType::WipeDown:           return "WD";
+                case TransitionType::SlideLeft:          return "SL";
+                case TransitionType::SlideRight:         return "SR";
+                case TransitionType::SlideUp:            return "SU";
+                case TransitionType::SlideDown:          return "SD";
+                case TransitionType::DipToBlack:         return "DB";
+                case TransitionType::DipToWhite:         return "DW";
+                case TransitionType::IrisRound:          return "IR";
+                case TransitionType::IrisBox:            return "IB";
+                case TransitionType::ClockWipe:          return "CW";
+                case TransitionType::BarnDoorHorizontal: return "BH";
+                case TransitionType::BarnDoorVertical:   return "BV";
             }
             return "";
         };
@@ -899,15 +908,25 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
                 case TransitionType::FadeOut:
                     return QColor(255, 200, 80);   // amber
                 case TransitionType::CrossDissolve:
-                    return QColor(190, 140, 245);  // purple
+                case TransitionType::DipToBlack:
+                case TransitionType::DipToWhite:
+                    return QColor(190, 140, 245);  // purple — dissolves
                 case TransitionType::WipeLeft:
                 case TransitionType::WipeRight:
                 case TransitionType::WipeUp:
                 case TransitionType::WipeDown:
-                    return QColor(120, 220, 240);  // cyan
+                case TransitionType::ClockWipe:
+                case TransitionType::BarnDoorHorizontal:
+                case TransitionType::BarnDoorVertical:
+                    return QColor(120, 220, 240);  // cyan — wipes
                 case TransitionType::SlideLeft:
                 case TransitionType::SlideRight:
-                    return QColor(255, 140, 200);  // pink
+                case TransitionType::SlideUp:
+                case TransitionType::SlideDown:
+                    return QColor(255, 140, 200);  // pink — slides
+                case TransitionType::IrisRound:
+                case TransitionType::IrisBox:
+                    return QColor(150, 230, 150);  // green — iris
                 default:
                     return QColor(255, 200, 80);
             }
@@ -2422,15 +2441,25 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *xdAct = transitionMenu->addAction(QStringLiteral("クロスディゾルブ (1.0s)"));
     QAction *fiAct = transitionMenu->addAction(QStringLiteral("フェードイン (0.5s)"));
     QAction *foAct = transitionMenu->addAction(QStringLiteral("フェードアウト (0.5s)"));
+    QAction *dbAct = transitionMenu->addAction(QStringLiteral("黒へディップ (1.0s)"));
+    QAction *dwAct = transitionMenu->addAction(QStringLiteral("白へディップ (1.0s)"));
     transitionMenu->addSeparator();
     QMenu *wipeMenu = transitionMenu->addMenu(QStringLiteral("ワイプ (1.0s)"));
     QAction *wlAct = wipeMenu->addAction(QStringLiteral("左 → 右"));
     QAction *wrAct = wipeMenu->addAction(QStringLiteral("右 → 左"));
     QAction *wuAct = wipeMenu->addAction(QStringLiteral("上 → 下"));
     QAction *wdAct = wipeMenu->addAction(QStringLiteral("下 → 上"));
+    QAction *cwAct = wipeMenu->addAction(QStringLiteral("時計回り"));
+    QAction *bhAct = wipeMenu->addAction(QStringLiteral("バーンドア (水平)"));
+    QAction *bvAct = wipeMenu->addAction(QStringLiteral("バーンドア (垂直)"));
     QMenu *slideMenu = transitionMenu->addMenu(QStringLiteral("スライド (1.0s)"));
     QAction *slAct = slideMenu->addAction(QStringLiteral("左へ"));
     QAction *srAct = slideMenu->addAction(QStringLiteral("右へ"));
+    QAction *suAct = slideMenu->addAction(QStringLiteral("上へ"));
+    QAction *sdAct = slideMenu->addAction(QStringLiteral("下へ"));
+    QMenu *irisMenu = transitionMenu->addMenu(QStringLiteral("アイリス (1.0s)"));
+    QAction *irAct = irisMenu->addAction(QStringLiteral("円"));
+    QAction *ibAct = irisMenu->addAction(QStringLiteral("矩形"));
     transitionMenu->addSeparator();
     QAction *transDialogAct = transitionMenu->addAction(QStringLiteral("カスタム..."));
     QAction *transClearAct = nullptr;
@@ -2467,16 +2496,38 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         t.duration = 0.5;
         applyTransitionToSelected(t);
     }
+    else if (chosen == dbAct) {
+        Transition t;
+        t.type = TransitionType::DipToBlack;
+        t.duration = 1.0;
+        applyTransitionToSelected(t);
+    }
+    else if (chosen == dwAct) {
+        Transition t;
+        t.type = TransitionType::DipToWhite;
+        t.duration = 1.0;
+        applyTransitionToSelected(t);
+    }
     else if (chosen == wlAct || chosen == wrAct || chosen == wuAct
-             || chosen == wdAct || chosen == slAct || chosen == srAct) {
+             || chosen == wdAct || chosen == cwAct || chosen == bhAct
+             || chosen == bvAct || chosen == slAct || chosen == srAct
+             || chosen == suAct || chosen == sdAct
+             || chosen == irAct || chosen == ibAct) {
         Transition t;
         t.duration = 1.0;
         if (chosen == wlAct)      t.type = TransitionType::WipeLeft;
         else if (chosen == wrAct) t.type = TransitionType::WipeRight;
         else if (chosen == wuAct) t.type = TransitionType::WipeUp;
         else if (chosen == wdAct) t.type = TransitionType::WipeDown;
+        else if (chosen == cwAct) t.type = TransitionType::ClockWipe;
+        else if (chosen == bhAct) t.type = TransitionType::BarnDoorHorizontal;
+        else if (chosen == bvAct) t.type = TransitionType::BarnDoorVertical;
         else if (chosen == slAct) t.type = TransitionType::SlideLeft;
-        else                      t.type = TransitionType::SlideRight;
+        else if (chosen == srAct) t.type = TransitionType::SlideRight;
+        else if (chosen == suAct) t.type = TransitionType::SlideUp;
+        else if (chosen == sdAct) t.type = TransitionType::SlideDown;
+        else if (chosen == irAct) t.type = TransitionType::IrisRound;
+        else                      t.type = TransitionType::IrisBox;
         applyTransitionToSelected(t);
     }
     else if (chosen == transDialogAct) emit transitionDialogRequested();

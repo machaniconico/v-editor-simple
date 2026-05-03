@@ -107,15 +107,24 @@ void TransitionDialog::setupUI()
     auto *form = new QFormLayout();
 
     m_typeCombo = new QComboBox(this);
-    m_typeCombo->addItem("Fade In",         static_cast<int>(TransitionType::FadeIn));
-    m_typeCombo->addItem("Fade Out",        static_cast<int>(TransitionType::FadeOut));
-    m_typeCombo->addItem("Cross Dissolve",  static_cast<int>(TransitionType::CrossDissolve));
-    m_typeCombo->addItem("Wipe Left",       static_cast<int>(TransitionType::WipeLeft));
-    m_typeCombo->addItem("Wipe Right",      static_cast<int>(TransitionType::WipeRight));
-    m_typeCombo->addItem("Wipe Up",         static_cast<int>(TransitionType::WipeUp));
-    m_typeCombo->addItem("Wipe Down",       static_cast<int>(TransitionType::WipeDown));
-    m_typeCombo->addItem("Slide Left",      static_cast<int>(TransitionType::SlideLeft));
-    m_typeCombo->addItem("Slide Right",     static_cast<int>(TransitionType::SlideRight));
+    m_typeCombo->addItem("Fade In",            static_cast<int>(TransitionType::FadeIn));
+    m_typeCombo->addItem("Fade Out",           static_cast<int>(TransitionType::FadeOut));
+    m_typeCombo->addItem("Cross Dissolve",     static_cast<int>(TransitionType::CrossDissolve));
+    m_typeCombo->addItem("Dip to Black",       static_cast<int>(TransitionType::DipToBlack));
+    m_typeCombo->addItem("Dip to White",       static_cast<int>(TransitionType::DipToWhite));
+    m_typeCombo->addItem("Wipe Left",          static_cast<int>(TransitionType::WipeLeft));
+    m_typeCombo->addItem("Wipe Right",         static_cast<int>(TransitionType::WipeRight));
+    m_typeCombo->addItem("Wipe Up",            static_cast<int>(TransitionType::WipeUp));
+    m_typeCombo->addItem("Wipe Down",          static_cast<int>(TransitionType::WipeDown));
+    m_typeCombo->addItem("Clock Wipe",         static_cast<int>(TransitionType::ClockWipe));
+    m_typeCombo->addItem("Barn Door (H)",      static_cast<int>(TransitionType::BarnDoorHorizontal));
+    m_typeCombo->addItem("Barn Door (V)",      static_cast<int>(TransitionType::BarnDoorVertical));
+    m_typeCombo->addItem("Iris Round",         static_cast<int>(TransitionType::IrisRound));
+    m_typeCombo->addItem("Iris Box",           static_cast<int>(TransitionType::IrisBox));
+    m_typeCombo->addItem("Slide Left",         static_cast<int>(TransitionType::SlideLeft));
+    m_typeCombo->addItem("Slide Right",        static_cast<int>(TransitionType::SlideRight));
+    m_typeCombo->addItem("Slide Up",           static_cast<int>(TransitionType::SlideUp));
+    m_typeCombo->addItem("Slide Down",         static_cast<int>(TransitionType::SlideDown));
     form->addRow("Type:", m_typeCombo);
 
     m_durationSpin = new QDoubleSpinBox(this);

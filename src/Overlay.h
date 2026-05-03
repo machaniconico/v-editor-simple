@@ -36,7 +36,16 @@ enum class TransitionType {
     WipeUp,
     WipeDown,
     SlideLeft,
-    SlideRight
+    SlideRight,
+    SlideUp,
+    SlideDown,
+    DipToBlack,
+    DipToWhite,
+    IrisRound,
+    IrisBox,
+    ClockWipe,
+    BarnDoorHorizontal,
+    BarnDoorVertical
 };
 
 // True when the type renders as a "boundary" blend between two clips:
@@ -52,6 +61,15 @@ inline bool isOverlapTransition(TransitionType t) {
         case TransitionType::WipeDown:
         case TransitionType::SlideLeft:
         case TransitionType::SlideRight:
+        case TransitionType::SlideUp:
+        case TransitionType::SlideDown:
+        case TransitionType::DipToBlack:
+        case TransitionType::DipToWhite:
+        case TransitionType::IrisRound:
+        case TransitionType::IrisBox:
+        case TransitionType::ClockWipe:
+        case TransitionType::BarnDoorHorizontal:
+        case TransitionType::BarnDoorVertical:
             return true;
         default:
             return false;
@@ -64,16 +82,25 @@ struct Transition {
 
     static QString typeName(TransitionType t) {
         switch (t) {
-            case TransitionType::None:          return "None";
-            case TransitionType::FadeIn:        return "Fade In";
-            case TransitionType::FadeOut:        return "Fade Out";
-            case TransitionType::CrossDissolve: return "Cross Dissolve";
-            case TransitionType::WipeLeft:      return "Wipe Left";
-            case TransitionType::WipeRight:     return "Wipe Right";
-            case TransitionType::WipeUp:        return "Wipe Up";
-            case TransitionType::WipeDown:      return "Wipe Down";
-            case TransitionType::SlideLeft:     return "Slide Left";
-            case TransitionType::SlideRight:    return "Slide Right";
+            case TransitionType::None:               return "None";
+            case TransitionType::FadeIn:             return "Fade In";
+            case TransitionType::FadeOut:            return "Fade Out";
+            case TransitionType::CrossDissolve:      return "Cross Dissolve";
+            case TransitionType::WipeLeft:           return "Wipe Left";
+            case TransitionType::WipeRight:          return "Wipe Right";
+            case TransitionType::WipeUp:             return "Wipe Up";
+            case TransitionType::WipeDown:           return "Wipe Down";
+            case TransitionType::SlideLeft:          return "Slide Left";
+            case TransitionType::SlideRight:         return "Slide Right";
+            case TransitionType::SlideUp:            return "Slide Up";
+            case TransitionType::SlideDown:          return "Slide Down";
+            case TransitionType::DipToBlack:         return "Dip to Black";
+            case TransitionType::DipToWhite:         return "Dip to White";
+            case TransitionType::IrisRound:          return "Iris Round";
+            case TransitionType::IrisBox:            return "Iris Box";
+            case TransitionType::ClockWipe:          return "Clock Wipe";
+            case TransitionType::BarnDoorHorizontal: return "Barn Door (H)";
+            case TransitionType::BarnDoorVertical:   return "Barn Door (V)";
         }
         return "Unknown";
     }

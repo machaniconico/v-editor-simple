@@ -167,6 +167,108 @@ QImage OverlayRenderer::applyTransition(const QImage &from, const QImage &to,
         break;
     }
 
+    case TransitionType::SlideUp: {
+        int offset = static_cast<int>(h * progress);
+        painter.drawImage(0, -offset, fromScaled);
+        painter.drawImage(0, h - offset, toScaled);
+        break;
+    }
+
+    case TransitionType::SlideDown: {
+        int offset = static_cast<int>(h * progress);
+        painter.drawImage(0, offset, fromScaled);
+        painter.drawImage(0, -h + offset, toScaled);
+        break;
+    }
+
+    case TransitionType::DipToBlack:
+    case TransitionType::DipToWhite: {
+        // First half: A fades to black/white. Second half: black/white fades
+        // to B. Symmetric — at progress=0.5 the frame is solid black/white.
+        const QColor mid = (type == TransitionType::DipToBlack)
+                           ? QColor(0, 0, 0) : QColor(255, 255, 255);
+        painter.fillRect(0, 0, w, h, mid);
+        if (progress < 0.5) {
+            painter.setOpacity(1.0 - progress * 2.0);
+            painter.drawImage(0, 0, fromScaled);
+        } else {
+            painter.setOpacity((progress - 0.5) * 2.0);
+            painter.drawImage(0, 0, toScaled);
+        }
+        break;
+    }
+
+    case TransitionType::IrisRound: {
+        // Circular iris expanding from the centre — B revealed inside the
+        // growing disc.
+        painter.drawImage(0, 0, fromScaled);
+        const int cx = w / 2;
+        const int cy = h / 2;
+        const double maxR = std::sqrt(double(cx) * cx + double(cy) * cy) + 2.0;
+        const double r = maxR * progress;
+        QPainterPath path;
+        path.addEllipse(QPointF(cx, cy), r, r);
+        painter.setClipPath(path);
+        painter.drawImage(0, 0, toScaled);
+        break;
+    }
+
+    case TransitionType::IrisBox: {
+        // Rectangular iris expanding from the centre.
+        painter.drawImage(0, 0, fromScaled);
+        const int rectW = static_cast<int>(w * progress);
+        const int rectH = static_cast<int>(h * progress);
+        const int rx = (w - rectW) / 2;
+        const int ry = (h - rectH) / 2;
+        painter.setClipRect(rx, ry, rectW, rectH);
+        painter.drawImage(0, 0, toScaled);
+        break;
+    }
+
+    case TransitionType::ClockWipe: {
+        // Radial sweep clockwise from 12 o'clock. Skip the pie-path entirely
+        // at progress >= 1 so the closeSubpath()'s radial line back to the
+        // center doesn't leave a 1-pixel seam at the final frame.
+        if (progress >= 1.0) {
+            painter.drawImage(0, 0, toScaled);
+            break;
+        }
+        painter.drawImage(0, 0, fromScaled);
+        const int cx = w / 2;
+        const int cy = h / 2;
+        const double maxR = std::sqrt(double(cx) * cx + double(cy) * cy) + 2.0;
+        QPainterPath path;
+        path.moveTo(cx, cy);
+        // Qt arc angles: 0° at 3 o'clock, positive = counter-clockwise.
+        // Start at 90° (12 o'clock) and sweep negative for clockwise.
+        path.arcTo(cx - maxR, cy - maxR, maxR * 2, maxR * 2,
+                   90.0, -360.0 * progress);
+        path.closeSubpath();
+        painter.setClipPath(path);
+        painter.drawImage(0, 0, toScaled);
+        break;
+    }
+
+    case TransitionType::BarnDoorHorizontal: {
+        // Two doors opening horizontally from the centre, revealing B
+        // through the widening gap.
+        painter.drawImage(0, 0, fromScaled);
+        const int strip = static_cast<int>((w / 2) * progress);
+        const int cx = w / 2;
+        painter.setClipRect(cx - strip, 0, strip * 2, h);
+        painter.drawImage(0, 0, toScaled);
+        break;
+    }
+
+    case TransitionType::BarnDoorVertical: {
+        painter.drawImage(0, 0, fromScaled);
+        const int strip = static_cast<int>((h / 2) * progress);
+        const int cy = h / 2;
+        painter.setClipRect(0, cy - strip, w, strip * 2);
+        painter.drawImage(0, 0, toScaled);
+        break;
+    }
+
     default:
         painter.drawImage(0, 0, (progress < 0.5) ? fromScaled : toScaled);
         break;
