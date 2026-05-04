@@ -837,6 +837,19 @@ int VideoPlayer::findActiveEntryAt(int64_t timelineUs) const
     // Before the first → first.
     if (tSec < m_sequence.first().timelineStart)
         return 0;
+    // Gap between clips — snap forward to the NEXT clip. Without this, a
+    // 1-frame step that lands on / just past clip[i].timelineEnd but
+    // before clip[i+1].timelineStart returned -1 → caller's fallback
+    // collapsed it to idx=0 (or the last clamped position) and the user
+    // got stuck at the boundary. Forward stepping was the visible victim
+    // because backward-into-a-loaded-prev-clip happened to switch files
+    // anyway via needSwitch, but the seek still failed — same root cause.
+    for (int i = 0; i < m_sequence.size() - 1; ++i) {
+        if (tSec >= m_sequence[i].timelineEnd
+            && tSec < m_sequence[i + 1].timelineStart) {
+            return i + 1;
+        }
+    }
     return -1;
 }
 
@@ -1391,18 +1404,136 @@ void VideoPlayer::pause()
 void VideoPlayer::stepForward()
 {
     pause();
+    // Frame-step is an immediate explicit action. Any deferred slider /
+    // timeline seek left armed by m_seekTimer would otherwise fire
+    // ~15 ms later and overwrite the stepped position with a stale
+    // target. pause() does NOT stop m_seekTimer.
+    if (m_seekTimer)
+        m_seekTimer->stop();
+    m_pendingSeekMs = -1;
+    m_pendingSeekPrecise = false;
+
     const int64_t step = m_frameDurationUs > 0 ? m_frameDurationUs : AV_TIME_BASE / 30;
-    const int64_t target = qMin(m_durationUs > 0 ? m_durationUs - 1 : INT64_MAX,
-                                m_currentPositionUs + step);
-    seekInternal(target, /*displayFrame=*/true, /*precise=*/true);
+
+    if (!sequenceActive()) {
+        // Single-file mode — step within file-local coordinates.
+        const int64_t target = qMin(m_durationUs > 0 ? m_durationUs - 1 : INT64_MAX,
+                                    m_currentPositionUs + step);
+        if (target <= m_currentPositionUs) return;
+        seekInternal(target, /*displayFrame=*/true, /*precise=*/true);
+        m_currentPositionUs = target;
+        updatePositionUi();
+        return;
+    }
+
+    // Sequence mode — guarantee m_timelinePositionUs advances by `step`,
+    // crossing clip boundaries / gaps as needed. The user invariant is
+    // "1F never gets stuck except at timeline 0 / sequence end". To honour
+    // it we (a) compute the desired new timeline position, (b) drive the
+    // seek/advance through the existing infrastructure, then (c) FORCE
+    // m_timelinePositionUs to the desired position even if updatePositionUi
+    // reprojected it backward from m_currentPositionUs (the historic
+    // forward-step revert path).
+    const int64_t maxUs = m_sequenceDurationUs > 0
+        ? m_sequenceDurationUs - 1 : INT64_MAX;
+    const int64_t newPos = qMin(maxUs, m_timelinePositionUs + step);
+    if (newPos == m_timelinePositionUs) return; // at end of sequence
+
+    const int idx = findActiveEntryAt(newPos);
+    if (idx >= 0 && idx < static_cast<int>(m_sequence.size())
+        && m_activeEntry >= 0 && m_activeEntry < static_cast<int>(m_sequence.size())
+        && idx != m_activeEntry) {
+        const auto &cur = m_sequence[m_activeEntry];
+        const auto &next = m_sequence[idx];
+        if (next.timelineStart >= cur.timelineEnd - 1e-6) {
+            // Non-overlap cross — clean snap to next entry's start.
+            advanceToEntry(idx);
+            // advanceToEntry sets m_timelinePositionUs to next.timelineStart.
+            // For a gap-stretched step (target landed past next.timelineStart),
+            // force forward so the user actually advances by `step`.
+            if (newPos > m_timelinePositionUs) {
+                m_timelinePositionUs = newPos;
+                forceTimelineUiToCurrent();
+            }
+            return;
+        }
+    }
+
+    // Same-entry or overlap step — natural decode advances the file
+    // decoder by exactly 1 frame, sidestepping precise-seek-within-GOP
+    // rounding. Reproject from the actual decoded PTS so the timeline
+    // axis tracks frame-rate accurately (avoids ~1-frame skew compounding
+    // on VFR or 23.976 sources). Force-forward to newPos ONLY when the
+    // reprojection went backward (reproject regression scenario).
+    if (decodeNextFrame(true)) {
+        const int64_t projected = (m_activeEntry >= 0
+                && m_activeEntry < static_cast<int>(m_sequence.size()))
+            ? fileLocalToTimelineUs(m_activeEntry, m_currentPositionUs)
+            : newPos;
+        m_timelinePositionUs = qMax(projected, newPos);
+        forceTimelineUiToCurrent();
+        return;
+    }
+
+    // EOF on the active source — fall back to seekToTimelineUs which
+    // will hot-swap or loadFile if the resolved entry differs. After
+    // it returns, force m_timelinePositionUs forward in case
+    // updatePositionUi snapped it back.
+    seekToTimelineUs(newPos, /*precise=*/true);
+    if (m_timelinePositionUs < newPos) {
+        m_timelinePositionUs = newPos;
+        forceTimelineUiToCurrent();
+    }
 }
 
 void VideoPlayer::stepBackward()
 {
     pause();
+    if (m_seekTimer)
+        m_seekTimer->stop();
+    m_pendingSeekMs = -1;
+    m_pendingSeekPrecise = false;
     const int64_t step = m_frameDurationUs > 0 ? m_frameDurationUs : AV_TIME_BASE / 30;
-    const int64_t target = qMax<int64_t>(0, m_currentPositionUs - step);
-    seekInternal(target, /*displayFrame=*/true, /*precise=*/true);
+    if (sequenceActive()) {
+        const int64_t target = qMax<int64_t>(0, m_timelinePositionUs - step);
+        if (target == m_timelinePositionUs) return; // at start
+        seekToTimelineUs(target, /*precise=*/true);
+        // Symmetric force: ensure m_timelinePositionUs ends at target even
+        // if reprojection snapped it forward (e.g., into next overlap).
+        if (m_timelinePositionUs > target) {
+            m_timelinePositionUs = target;
+            forceTimelineUiToCurrent();
+        }
+    } else {
+        const int64_t target = qMax<int64_t>(0, m_currentPositionUs - step);
+        seekInternal(target, /*displayFrame=*/true, /*precise=*/true);
+        m_currentPositionUs = target;
+        updatePositionUi();
+    }
+}
+
+// Force seekbar / time label / positionChanged signal to reflect the
+// CURRENT m_timelinePositionUs without reprojecting from m_currentPositionUs.
+// stepForward / stepBackward use this when they need to override the
+// reproject-from-file-local that updatePositionUi() does in sequence mode.
+void VideoPlayer::forceTimelineUiToCurrent()
+{
+    if (m_suppressUiUpdates) return;
+    const int64_t displayUs = sequenceActive()
+        ? m_timelinePositionUs : m_currentPositionUs;
+    const int64_t totalUs = sequenceActive()
+        ? m_sequenceDurationUs : m_durationUs;
+    const int sliderValue = qMin(sliderTimelinePosition(displayUs),
+                                 m_seekBar->maximum());
+    {
+        const QSignalBlocker blocker(m_seekBar);
+        if (!m_seekBar->isSliderDown())
+            m_seekBar->setValue(sliderValue);
+    }
+    m_timeLabel->setText(QString("%1 / %2")
+        .arg(formatTimestamp(displayUs))
+        .arg(formatTimestamp(totalUs)));
+    emit positionChanged(static_cast<double>(displayUs) / AV_TIME_BASE);
 }
 
 void VideoPlayer::stop()
@@ -1596,11 +1727,13 @@ void VideoPlayer::displayFrame(const QImage &image)
         if (e.leadInType == TransitionType::FadeIn
             && e.leadInDuration > 0.0
             && elapsed >= 0.0 && elapsed < e.leadInDuration) {
-            alpha = qBound(0.0, elapsed / e.leadInDuration, 1.0);
+            const double raw = qBound(0.0, elapsed / e.leadInDuration, 1.0);
+            alpha = applyEasing(raw, e.leadInEasing);
         } else if (e.trailOutType == TransitionType::FadeOut
             && e.trailOutDuration > 0.0
             && remaining >= 0.0 && remaining < e.trailOutDuration) {
-            alpha = qBound(0.0, remaining / e.trailOutDuration, 1.0);
+            const double raw = qBound(0.0, remaining / e.trailOutDuration, 1.0);
+            alpha = applyEasing(raw, e.trailOutEasing);
         }
         if (alpha < 0.999) {
             QImage faded(composed.size(), QImage::Format_ARGB32_Premultiplied);
@@ -1642,9 +1775,10 @@ void VideoPlayer::displayFrame(const QImage &image)
                 DecodedLayer layer;
                 if (harvestOverlayLayer(m_sequence[nextIdx], nextIdx, &layer)
                     && !layer.rgb.isNull()) {
-                    const double progress = qBound(0.0,
+                    const double rawProgress = qBound(0.0,
                                                    1.0 - remaining / e.trailOutDuration,
                                                    1.0);
+                    const double progress = applyEasing(rawProgress, e.trailOutEasing);
                     composed = OverlayRenderer::applyTransition(
                         composed, layer.rgb,
                         e.trailOutType, progress);

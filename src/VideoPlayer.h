@@ -232,6 +232,13 @@ private:
     void scheduleNextFrame();
     void performPendingSeek();
     void updatePositionUi();
+    // Like updatePositionUi() but does NOT reproject m_timelinePositionUs
+    // from m_currentPositionUs. Used by stepForward/Backward when they need
+    // the seekbar / time label / positionChanged signal to honour the
+    // already-set m_timelinePositionUs verbatim (sequence-mode reprojection
+    // would otherwise snap the playhead back to the active entry's
+    // file-local PTS, undoing the step).
+    void forceTimelineUiToCurrent();
     bool seekInternal(int64_t positionUs, bool displayFrame, bool precise);
     bool decodeNextFrame(bool displayFrame);
     bool presentDecodedFrame(AVFrame *frame, bool displayFrame);

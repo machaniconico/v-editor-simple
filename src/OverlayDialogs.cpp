@@ -4,6 +4,86 @@
 #include <QGroupBox>
 #include <QDialogButtonBox>
 #include <QFileDialog>
+#include <QInputDialog>
+#include <QMessageBox>
+#include <QSettings>
+
+// --- TransitionPresetStore ---
+
+QList<TransitionPreset> TransitionPresetStore::loadAll()
+{
+    QSettings prefs("VSimpleEditor", "Preferences");
+    QList<TransitionPreset> out;
+    const int size = prefs.beginReadArray("transitionPresets");
+    for (int i = 0; i < size; ++i) {
+        prefs.setArrayIndex(i);
+        TransitionPreset p;
+        p.name = prefs.value("name").toString();
+        if (p.name.isEmpty()) continue;
+        p.transition.type = static_cast<TransitionType>(
+            prefs.value("type", static_cast<int>(TransitionType::CrossDissolve)).toInt());
+        p.transition.duration = prefs.value("duration", 1.0).toDouble();
+        p.transition.alignment = static_cast<TransitionAlignment>(
+            prefs.value("alignment", static_cast<int>(TransitionAlignment::Center)).toInt());
+        p.transition.easing = static_cast<TransitionEasing>(
+            prefs.value("easing", static_cast<int>(TransitionEasing::Linear)).toInt());
+        out.append(p);
+    }
+    prefs.endArray();
+    return out;
+}
+
+void TransitionPresetStore::save(const QString &name, const Transition &t)
+{
+    if (name.trimmed().isEmpty()) return;
+    auto presets = loadAll();
+    // Replace if a preset with this name already exists, otherwise append.
+    bool replaced = false;
+    for (auto &p : presets) {
+        if (p.name == name) { p.transition = t; replaced = true; break; }
+    }
+    if (!replaced) {
+        TransitionPreset p;
+        p.name = name;
+        p.transition = t;
+        presets.append(p);
+    }
+    QSettings prefs("VSimpleEditor", "Preferences");
+    prefs.beginWriteArray("transitionPresets");
+    for (int i = 0; i < presets.size(); ++i) {
+        prefs.setArrayIndex(i);
+        prefs.setValue("name", presets[i].name);
+        prefs.setValue("type", static_cast<int>(presets[i].transition.type));
+        prefs.setValue("duration", presets[i].transition.duration);
+        prefs.setValue("alignment", static_cast<int>(presets[i].transition.alignment));
+        prefs.setValue("easing", static_cast<int>(presets[i].transition.easing));
+    }
+    prefs.endArray();
+}
+
+void TransitionPresetStore::remove(const QString &name)
+{
+    auto presets = loadAll();
+    QList<TransitionPreset> kept;
+    for (const auto &p : presets) {
+        if (p.name != name) kept.append(p);
+    }
+    if (kept.size() == presets.size()) return; // nothing removed
+    QSettings prefs("VSimpleEditor", "Preferences");
+    // Clear the entire array first — beginWriteArray with a smaller size
+    // doesn't truncate stale entries on some Qt versions.
+    prefs.remove("transitionPresets");
+    prefs.beginWriteArray("transitionPresets");
+    for (int i = 0; i < kept.size(); ++i) {
+        prefs.setArrayIndex(i);
+        prefs.setValue("name", kept[i].name);
+        prefs.setValue("type", static_cast<int>(kept[i].transition.type));
+        prefs.setValue("duration", kept[i].transition.duration);
+        prefs.setValue("alignment", static_cast<int>(kept[i].transition.alignment));
+        prefs.setValue("easing", static_cast<int>(kept[i].transition.easing));
+    }
+    prefs.endArray();
+}
 
 // --- TextOverlayDialog ---
 
@@ -101,30 +181,66 @@ TransitionDialog::TransitionDialog(QWidget *parent) : QDialog(parent)
     setupUI();
 }
 
+void TransitionDialog::refreshPresetCombo()
+{
+    if (!m_presetCombo) return;
+    m_presetCombo->blockSignals(true);
+    m_presetCombo->clear();
+    m_presetCombo->addItem(QStringLiteral("(プリセットを選択)"), QString());
+    for (const auto &p : TransitionPresetStore::loadAll()) {
+        m_presetCombo->addItem(p.name, p.name);
+    }
+    m_presetCombo->blockSignals(false);
+}
+
 void TransitionDialog::setupUI()
 {
     auto *layout = new QVBoxLayout(this);
     auto *form = new QFormLayout();
 
+    // Preset row first — it lets the user load + apply a saved combo
+    // without touching the rest of the form. Save-as button next to it
+    // captures the current Type/Duration/Alignment/Easing as a new preset.
+    m_presetCombo = new QComboBox(this);
+    auto *saveBtn = new QPushButton(QStringLiteral("名前を付けて保存..."), this);
+    auto *delBtn  = new QPushButton(QStringLiteral("削除"), this);
+    auto *presetRow = new QHBoxLayout();
+    presetRow->addWidget(m_presetCombo, 1);
+    presetRow->addWidget(saveBtn);
+    presetRow->addWidget(delBtn);
+    form->addRow(QStringLiteral("プリセット:"), presetRow);
+
     m_typeCombo = new QComboBox(this);
-    m_typeCombo->addItem("Fade In",            static_cast<int>(TransitionType::FadeIn));
-    m_typeCombo->addItem("Fade Out",           static_cast<int>(TransitionType::FadeOut));
-    m_typeCombo->addItem("Cross Dissolve",     static_cast<int>(TransitionType::CrossDissolve));
-    m_typeCombo->addItem("Dip to Black",       static_cast<int>(TransitionType::DipToBlack));
-    m_typeCombo->addItem("Dip to White",       static_cast<int>(TransitionType::DipToWhite));
-    m_typeCombo->addItem("Wipe Left",          static_cast<int>(TransitionType::WipeLeft));
-    m_typeCombo->addItem("Wipe Right",         static_cast<int>(TransitionType::WipeRight));
-    m_typeCombo->addItem("Wipe Up",            static_cast<int>(TransitionType::WipeUp));
-    m_typeCombo->addItem("Wipe Down",          static_cast<int>(TransitionType::WipeDown));
-    m_typeCombo->addItem("Clock Wipe",         static_cast<int>(TransitionType::ClockWipe));
-    m_typeCombo->addItem("Barn Door (H)",      static_cast<int>(TransitionType::BarnDoorHorizontal));
-    m_typeCombo->addItem("Barn Door (V)",      static_cast<int>(TransitionType::BarnDoorVertical));
-    m_typeCombo->addItem("Iris Round",         static_cast<int>(TransitionType::IrisRound));
-    m_typeCombo->addItem("Iris Box",           static_cast<int>(TransitionType::IrisBox));
-    m_typeCombo->addItem("Slide Left",         static_cast<int>(TransitionType::SlideLeft));
-    m_typeCombo->addItem("Slide Right",        static_cast<int>(TransitionType::SlideRight));
-    m_typeCombo->addItem("Slide Up",           static_cast<int>(TransitionType::SlideUp));
-    m_typeCombo->addItem("Slide Down",         static_cast<int>(TransitionType::SlideDown));
+    // Display order grouped by family. Labels come from Transition::typeName
+    // so a rename in Overlay.h flows here without a parallel edit.
+    static const TransitionType kDialogTypeOrder[] = {
+        TransitionType::FadeIn, TransitionType::FadeOut,
+        TransitionType::CrossDissolve,
+        TransitionType::DipToBlack, TransitionType::DipToWhite,
+        TransitionType::WipeLeft, TransitionType::WipeRight,
+        TransitionType::WipeUp, TransitionType::WipeDown,
+        TransitionType::ClockWipe,
+        TransitionType::BarnDoorHorizontal, TransitionType::BarnDoorVertical,
+        TransitionType::IrisRound, TransitionType::IrisBox,
+        TransitionType::SlideLeft, TransitionType::SlideRight,
+        TransitionType::SlideUp, TransitionType::SlideDown,
+        TransitionType::PushLeft, TransitionType::PushRight,
+        TransitionType::PushUp, TransitionType::PushDown,
+        TransitionType::CrossZoom, TransitionType::FilmDissolve,
+        TransitionType::SpinCW, TransitionType::SpinCCW,
+        TransitionType::DitherDissolve,
+        TransitionType::IrisRoundClose, TransitionType::IrisBoxClose,
+        TransitionType::BarnDoorHClose, TransitionType::BarnDoorVClose,
+        TransitionType::ClockWipeCCW,
+        TransitionType::WhipPanLeft, TransitionType::WhipPanRight,
+        TransitionType::Glitch, TransitionType::LightLeak,
+        TransitionType::FlipHorizontal, TransitionType::FlipVertical,
+        TransitionType::LensFlare, TransitionType::FilmBurn,
+        TransitionType::Pixelate, TransitionType::BlurDissolve,
+        TransitionType::CameraShake, TransitionType::ColorChannelShift,
+    };
+    for (const TransitionType t : kDialogTypeOrder)
+        m_typeCombo->addItem(Transition::typeName(t), static_cast<int>(t));
     form->addRow("Type:", m_typeCombo);
 
     m_durationSpin = new QDoubleSpinBox(this);
@@ -134,6 +250,70 @@ void TransitionDialog::setupUI()
     m_durationSpin->setSuffix(" s");
     form->addRow("Duration:", m_durationSpin);
 
+    m_alignmentCombo = new QComboBox(this);
+    m_alignmentCombo->addItem("Center at Cut",
+        static_cast<int>(TransitionAlignment::Center));
+    m_alignmentCombo->addItem("Start at Cut",
+        static_cast<int>(TransitionAlignment::Start));
+    m_alignmentCombo->addItem("End at Cut",
+        static_cast<int>(TransitionAlignment::End));
+    form->addRow("Alignment:", m_alignmentCombo);
+
+    m_easingCombo = new QComboBox(this);
+    m_easingCombo->addItem("Linear",      static_cast<int>(TransitionEasing::Linear));
+    m_easingCombo->addItem("Ease In",     static_cast<int>(TransitionEasing::EaseIn));
+    m_easingCombo->addItem("Ease Out",    static_cast<int>(TransitionEasing::EaseOut));
+    m_easingCombo->addItem("Ease In/Out", static_cast<int>(TransitionEasing::EaseInOut));
+    form->addRow("Easing:", m_easingCombo);
+
+    // Preset wiring (after the four field combos so we can read/write
+    // them when applying or capturing a preset).
+    refreshPresetCombo();
+    connect(m_presetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+        this, [this](int idx) {
+            if (idx <= 0) return; // sentinel "(プリセットを選択)"
+            const QString name = m_presetCombo->itemData(idx).toString();
+            for (const auto &p : TransitionPresetStore::loadAll()) {
+                if (p.name != name) continue;
+                const int typeIdx = m_typeCombo->findData(static_cast<int>(p.transition.type));
+                if (typeIdx >= 0) m_typeCombo->setCurrentIndex(typeIdx);
+                m_durationSpin->setValue(p.transition.duration);
+                const int aIdx = m_alignmentCombo->findData(static_cast<int>(p.transition.alignment));
+                if (aIdx >= 0) m_alignmentCombo->setCurrentIndex(aIdx);
+                const int eIdx = m_easingCombo->findData(static_cast<int>(p.transition.easing));
+                if (eIdx >= 0) m_easingCombo->setCurrentIndex(eIdx);
+                break;
+            }
+        });
+    connect(saveBtn, &QPushButton::clicked, this, [this]() {
+        bool ok = false;
+        const QString name = QInputDialog::getText(this,
+            QStringLiteral("プリセット保存"),
+            QStringLiteral("プリセット名:"),
+            QLineEdit::Normal, QString(), &ok);
+        if (!ok || name.trimmed().isEmpty()) return;
+        Transition t;
+        t.type = static_cast<TransitionType>(m_typeCombo->currentData().toInt());
+        t.duration = m_durationSpin->value();
+        t.alignment = static_cast<TransitionAlignment>(m_alignmentCombo->currentData().toInt());
+        t.easing = static_cast<TransitionEasing>(m_easingCombo->currentData().toInt());
+        TransitionPresetStore::save(name.trimmed(), t);
+        refreshPresetCombo();
+        const int idx = m_presetCombo->findData(name.trimmed());
+        if (idx >= 0) m_presetCombo->setCurrentIndex(idx);
+    });
+    connect(delBtn, &QPushButton::clicked, this, [this]() {
+        const int idx = m_presetCombo->currentIndex();
+        if (idx <= 0) return;
+        const QString name = m_presetCombo->itemData(idx).toString();
+        if (QMessageBox::question(this,
+                QStringLiteral("プリセット削除"),
+                QStringLiteral("プリセット「%1」を削除しますか?").arg(name))
+            != QMessageBox::Yes) return;
+        TransitionPresetStore::remove(name);
+        refreshPresetCombo();
+    });
+
     layout->addLayout(form);
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -141,6 +321,10 @@ void TransitionDialog::setupUI()
     connect(buttons, &QDialogButtonBox::accepted, this, [this]() {
         m_result.type = static_cast<TransitionType>(m_typeCombo->currentData().toInt());
         m_result.duration = m_durationSpin->value();
+        m_result.alignment = static_cast<TransitionAlignment>(
+            m_alignmentCombo->currentData().toInt());
+        m_result.easing = static_cast<TransitionEasing>(
+            m_easingCombo->currentData().toInt());
         accept();
     });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);

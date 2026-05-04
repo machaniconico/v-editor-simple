@@ -35,6 +35,16 @@ private:
     QColor m_bgColor = QColor(0, 0, 0, 160);
 };
 
+// Persistence layer for user-saved Transition presets. Backed by
+// QSettings("VSimpleEditor", "Preferences") under the "transitionPresets"
+// group. All functions are static — no instance state.
+class TransitionPresetStore {
+public:
+    static QList<TransitionPreset> loadAll();
+    static void save(const QString &name, const Transition &t);
+    static void remove(const QString &name);
+};
+
 class TransitionDialog : public QDialog
 {
     Q_OBJECT
@@ -43,9 +53,13 @@ public:
     Transition result() const { return m_result; }
 private:
     void setupUI();
+    void refreshPresetCombo();
     Transition m_result;
     QComboBox *m_typeCombo;
     QDoubleSpinBox *m_durationSpin;
+    QComboBox *m_alignmentCombo;
+    QComboBox *m_easingCombo;
+    QComboBox *m_presetCombo;
 };
 
 class ImageOverlayDialog : public QDialog

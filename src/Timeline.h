@@ -99,7 +99,9 @@ enum class DragMode {
     None,
     TrimLeft,
     TrimRight,
-    MoveClip
+    MoveClip,
+    TransitionLeadInResize,
+    TransitionTrailOutResize
 };
 
 class TimelineTrack : public QWidget
@@ -207,6 +209,9 @@ private:
     int m_dragStartX = 0;
     double m_dragOriginalValue = 0.0;
     double m_dragOriginalLeadIn = 0.0;
+    // Captured at the start of a transition badge handle drag so we can
+    // compute new duration = original + (delta px / pps) without drift.
+    double m_dragOriginalTransitionDuration = 0.0;
     // leadInSec of the clip RIGHT AFTER the dragged one, captured at drag
     // start. Used to compensate its gap during a MoveClip drag so downstream
     // clips don't slide when the user repositions a single clip. -1 = no next.
@@ -384,6 +389,12 @@ signals:
     void transitionDialogRequested();
     void videoEffectsDialogRequested();
     void colorCorrectionRequested();
+    // Emitted from applyTransitionToSelected when the requested duration
+    // could not be honored against the available source handles. Carries
+    // the asked vs effective duration in seconds so MainWindow can show
+    // a status message ("クロスディゾルブを 1.0s → 0.4s に短縮").
+    void transitionShortened(QString transitionTypeName,
+                             double askedSec, double effectiveSec);
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;

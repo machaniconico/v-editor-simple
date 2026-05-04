@@ -266,6 +266,15 @@ void MainWindow::setupUI()
             this, &MainWindow::videoEffects);
     connect(m_timeline, &Timeline::colorCorrectionRequested,
             this, &MainWindow::colorCorrection);
+    connect(m_timeline, &Timeline::transitionShortened,
+            this, [this](const QString &name, double askedSec, double effSec) {
+                statusBar()->showMessage(
+                    QString("ハンドル不足: %1 を %2s → %3s に短縮しました")
+                        .arg(name)
+                        .arg(askedSec, 0, 'f', 2)
+                        .arg(effSec,   0, 'f', 2),
+                    5000);
+            });
 
     mainLayout->addWidget(m_welcomeWidget);
     mainLayout->addWidget(m_mainSplitter);
@@ -464,6 +473,15 @@ void MainWindow::setupMenuBar()
     m_rippleDeleteAction = editMenu->addAction("リップル削除");
     m_rippleDeleteAction->setShortcut(QKeySequence(Qt::SHIFT | Qt::Key_Delete));
     connect(m_rippleDeleteAction, &QAction::triggered, this, &MainWindow::rippleDelete);
+
+    editMenu->addSeparator();
+
+    auto *applyDefaultTransAct = editMenu->addAction("規定トランジションを適用(&D)");
+    applyDefaultTransAct->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_D));
+    connect(applyDefaultTransAct, &QAction::triggered, this, &MainWindow::applyDefaultTransition);
+
+    auto *editDefaultTransAct = editMenu->addAction("規定トランジション設定...");
+    connect(editDefaultTransAct, &QAction::triggered, this, &MainWindow::editDefaultTransition);
 
     editMenu->addSeparator();
 
@@ -2050,6 +2068,143 @@ void MainWindow::addTransition()
         m_timeline->applyTransitionToSelected(transition);
         statusBar()->showMessage(QString("Added transition: %1 (%2s)")
             .arg(Transition::typeName(transition.type)).arg(transition.duration));
+    }
+}
+
+void MainWindow::applyDefaultTransition()
+{
+    if (!m_timeline->hasSelection()) {
+        statusBar()->showMessage("Select a clip first", 2000);
+        return;
+    }
+    QSettings prefs("VSimpleEditor", "Preferences");
+    const int rawType = prefs.value("transition/defaultType",
+        static_cast<int>(TransitionType::CrossDissolve)).toInt();
+    const double duration = qBound(0.1,
+        prefs.value("transition/defaultDuration", 1.0).toDouble(), 5.0);
+    const int rawEasing = prefs.value("transition/defaultEasing",
+        static_cast<int>(TransitionEasing::Linear)).toInt();
+    Transition t;
+    t.type = static_cast<TransitionType>(rawType);
+    t.duration = duration;
+    t.easing = static_cast<TransitionEasing>(rawEasing);
+    m_timeline->applyTransitionToSelected(t);
+    statusBar()->showMessage(QString("Applied default transition: %1 (%2s, %3)")
+        .arg(Transition::typeName(t.type))
+        .arg(t.duration, 0, 'f', 1)
+        .arg(Transition::easingName(t.easing)), 2000);
+}
+
+void MainWindow::editDefaultTransition()
+{
+    QSettings prefs("VSimpleEditor", "Preferences");
+    const int curType = prefs.value("transition/defaultType",
+        static_cast<int>(TransitionType::CrossDissolve)).toInt();
+    const double curDuration = prefs.value("transition/defaultDuration", 1.0).toDouble();
+    const int curEasing = prefs.value("transition/defaultEasing",
+        static_cast<int>(TransitionEasing::Linear)).toInt();
+
+    QDialog dialog(this);
+    dialog.setWindowTitle("規定トランジション設定");
+    auto *form = new QFormLayout(&dialog);
+
+    auto *typeCombo = new QComboBox(&dialog);
+    const TransitionType options[] = {
+        TransitionType::CrossDissolve,
+        TransitionType::FadeIn,
+        TransitionType::FadeOut,
+        TransitionType::DipToBlack,
+        TransitionType::DipToWhite,
+        TransitionType::WipeLeft,
+        TransitionType::WipeRight,
+        TransitionType::WipeUp,
+        TransitionType::WipeDown,
+        TransitionType::ClockWipe,
+        TransitionType::BarnDoorHorizontal,
+        TransitionType::BarnDoorVertical,
+        TransitionType::SlideLeft,
+        TransitionType::SlideRight,
+        TransitionType::SlideUp,
+        TransitionType::SlideDown,
+        TransitionType::PushLeft,
+        TransitionType::PushRight,
+        TransitionType::PushUp,
+        TransitionType::PushDown,
+        TransitionType::CrossZoom,
+        TransitionType::FilmDissolve,
+        TransitionType::SpinCW,
+        TransitionType::SpinCCW,
+        TransitionType::DitherDissolve,
+        TransitionType::BlurDissolve,
+        TransitionType::Pixelate,
+        TransitionType::WhipPanLeft,
+        TransitionType::WhipPanRight,
+        TransitionType::Glitch,
+        TransitionType::LightLeak,
+        TransitionType::LensFlare,
+        TransitionType::FilmBurn,
+        TransitionType::CameraShake,
+        TransitionType::ColorChannelShift,
+        TransitionType::FlipHorizontal,
+        TransitionType::FlipVertical,
+        TransitionType::IrisRound,
+        TransitionType::IrisRoundClose,
+        TransitionType::IrisBox,
+        TransitionType::IrisBoxClose,
+        TransitionType::BarnDoorHClose,
+        TransitionType::BarnDoorVClose,
+        TransitionType::ClockWipeCCW,
+    };
+    int curIdx = 0;
+    for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); ++i) {
+        typeCombo->addItem(Transition::typeName(options[i]), static_cast<int>(options[i]));
+        if (static_cast<int>(options[i]) == curType) curIdx = static_cast<int>(i);
+    }
+    typeCombo->setCurrentIndex(curIdx);
+
+    auto *durSpin = new QDoubleSpinBox(&dialog);
+    durSpin->setRange(0.1, 5.0);
+    durSpin->setSingleStep(0.1);
+    durSpin->setDecimals(2);
+    durSpin->setSuffix(" s");
+    durSpin->setValue(qBound(0.1, curDuration, 5.0));
+
+    auto *easingCombo = new QComboBox(&dialog);
+    const TransitionEasing easingOptions[] = {
+        TransitionEasing::Linear,
+        TransitionEasing::EaseIn,
+        TransitionEasing::EaseOut,
+        TransitionEasing::EaseInOut,
+    };
+    int curEasingIdx = 0;
+    for (size_t i = 0; i < sizeof(easingOptions) / sizeof(easingOptions[0]); ++i) {
+        easingCombo->addItem(Transition::easingName(easingOptions[i]),
+            static_cast<int>(easingOptions[i]));
+        if (static_cast<int>(easingOptions[i]) == curEasing)
+            curEasingIdx = static_cast<int>(i);
+    }
+    easingCombo->setCurrentIndex(curEasingIdx);
+
+    form->addRow("種類", typeCombo);
+    form->addRow("時間", durSpin);
+    form->addRow("イージング", easingCombo);
+
+    auto *buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    form->addRow(buttons);
+
+    if (dialog.exec() == QDialog::Accepted) {
+        prefs.setValue("transition/defaultType", typeCombo->currentData().toInt());
+        prefs.setValue("transition/defaultDuration", durSpin->value());
+        prefs.setValue("transition/defaultEasing", easingCombo->currentData().toInt());
+        statusBar()->showMessage(
+            QString("Default transition: %1 (%2s, %3)")
+                .arg(typeCombo->currentText())
+                .arg(durSpin->value(), 0, 'f', 1)
+                .arg(easingCombo->currentText()),
+            2000);
     }
 }
 

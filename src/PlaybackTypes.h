@@ -32,8 +32,10 @@ struct PlaybackEntry {
     // (and AudioMixer the gain) over the duration without reading Timeline.
     TransitionType leadInType = TransitionType::None;
     double leadInDuration = 0.0;
+    TransitionEasing leadInEasing = TransitionEasing::Linear;
     TransitionType trailOutType = TransitionType::None;
     double trailOutDuration = 0.0;
+    TransitionEasing trailOutEasing = TransitionEasing::Linear;
 };
 
 Q_DECLARE_METATYPE(PlaybackEntry)

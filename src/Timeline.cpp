@@ -1,6 +1,26 @@
 #include "Timeline.h"
 #include "ProxyManager.h"
 #include "UndoManager.h"
+#include "OverlayDialogs.h"
+
+namespace {
+// Transition badge geometry. The badge width grows with duration so the
+// user gets live visual feedback while dragging the resize handle (a 6 px
+// band on the inward edge). The 18 px Y-band defines the hit-test area
+// for both the press handler and the hover-cursor logic.
+constexpr int kTransBadgeMinW    = 40;
+constexpr int kTransBadgeMaxW    = 160;
+constexpr int kTransBadgeHandleW = 6;
+constexpr int kTransBadgeYTop    = 3;
+constexpr int kTransBadgeH       = 18;
+constexpr int kTransBadgeYBot    = kTransBadgeYTop + kTransBadgeH;
+
+inline int transBadgeWidth(double durSec, double pps, int clipWidth) {
+    const int desired = static_cast<int>(durSec * pps);
+    return qBound(kTransBadgeMinW, desired,
+                  qMin(kTransBadgeMaxW, clipWidth - 4));
+}
+} // namespace
 
 // Small strip drawn above the V/A tracks that visualizes each text
 // overlay's time range as a rounded rectangle with the (truncated) overlay
@@ -277,6 +297,7 @@ private:
 #include <QMenu>
 #include <QSettings>
 #include <QAction>
+#include <QToolTip>
 #include <QHash>
 
 extern "C" {
@@ -869,15 +890,12 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
         painter.drawText(textRect, Qt::AlignLeft | Qt::AlignVCenter,
             painter.fontMetrics().elidedText(label, Qt::ElideRight, textRect.width()));
 
-        // Transition badge. Fixed-size pill at the affected corner — top-left
-        // for leadIn (FadeIn), top-right for trailOut (FadeOut /
-        // CrossDissolve / Wipe / Slide). Coloured per type so the user can
-        // tell them apart at a glance, with abbrev + duration text. Width
-        // is fixed at kBadgeW px regardless of clip width or transition
-        // duration; clipped to the clip's actual width on tiny clips.
-        constexpr int kBadgeW = 64;
-        constexpr int kBadgeH = 18;
-        const int badgeY = 3;
+        // Transition badge. Pill at the affected corner — top-left for
+        // leadIn (FadeIn), top-right for trailOut (FadeOut / CrossDissolve
+        // / Wipe / Slide). Coloured per type so the user can tell them
+        // apart at a glance, with abbrev + duration text. Geometry constants
+        // and the duration-tracking width come from the file-scope helpers
+        // so paint, hit-test, and hover all agree.
         auto transitionAbbrev = [](TransitionType type) -> QString {
             switch (type) {
                 case TransitionType::None:               return "";
@@ -899,6 +917,32 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
                 case TransitionType::ClockWipe:          return "CW";
                 case TransitionType::BarnDoorHorizontal: return "BH";
                 case TransitionType::BarnDoorVertical:   return "BV";
+                case TransitionType::PushLeft:           return "PL";
+                case TransitionType::PushRight:          return "PR";
+                case TransitionType::PushUp:             return "PU";
+                case TransitionType::PushDown:           return "PD";
+                case TransitionType::CrossZoom:          return "CZ";
+                case TransitionType::FilmDissolve:       return "Fd";
+                case TransitionType::SpinCW:             return "S+";
+                case TransitionType::SpinCCW:            return "S-";
+                case TransitionType::DitherDissolve:     return "Dt";
+                case TransitionType::IrisRoundClose:     return "ir";
+                case TransitionType::IrisBoxClose:       return "ib";
+                case TransitionType::BarnDoorHClose:     return "bH";
+                case TransitionType::BarnDoorVClose:     return "bV";
+                case TransitionType::ClockWipeCCW:       return "cw";
+                case TransitionType::WhipPanLeft:        return "<<";
+                case TransitionType::WhipPanRight:       return ">>";
+                case TransitionType::Glitch:             return "G!";
+                case TransitionType::LightLeak:          return "LL";
+                case TransitionType::FlipHorizontal:     return "FH";
+                case TransitionType::FlipVertical:       return "FV";
+                case TransitionType::LensFlare:          return "Lf";
+                case TransitionType::FilmBurn:           return "FB";
+                case TransitionType::Pixelate:           return "Px";
+                case TransitionType::BlurDissolve:       return "Bl";
+                case TransitionType::CameraShake:        return "Sk";
+                case TransitionType::ColorChannelShift:  return "Ch";
             }
             return "";
         };
@@ -910,33 +954,64 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
                 case TransitionType::CrossDissolve:
                 case TransitionType::DipToBlack:
                 case TransitionType::DipToWhite:
+                case TransitionType::FilmDissolve:
+                case TransitionType::DitherDissolve:
+                case TransitionType::BlurDissolve:
+                case TransitionType::Pixelate:
                     return QColor(190, 140, 245);  // purple — dissolves
                 case TransitionType::WipeLeft:
                 case TransitionType::WipeRight:
                 case TransitionType::WipeUp:
                 case TransitionType::WipeDown:
                 case TransitionType::ClockWipe:
+                case TransitionType::ClockWipeCCW:
                 case TransitionType::BarnDoorHorizontal:
                 case TransitionType::BarnDoorVertical:
+                case TransitionType::BarnDoorHClose:
+                case TransitionType::BarnDoorVClose:
                     return QColor(120, 220, 240);  // cyan — wipes
                 case TransitionType::SlideLeft:
                 case TransitionType::SlideRight:
                 case TransitionType::SlideUp:
                 case TransitionType::SlideDown:
                     return QColor(255, 140, 200);  // pink — slides
+                case TransitionType::PushLeft:
+                case TransitionType::PushRight:
+                case TransitionType::PushUp:
+                case TransitionType::PushDown:
+                case TransitionType::WhipPanLeft:
+                case TransitionType::WhipPanRight:
+                    return QColor(255, 175, 100); // peach — push / whip (kin to slide)
+                case TransitionType::CrossZoom:
+                    return QColor(255, 110, 110); // red — zoom (energetic)
+                case TransitionType::SpinCW:
+                case TransitionType::SpinCCW:
+                case TransitionType::FlipHorizontal:
+                case TransitionType::FlipVertical:
+                case TransitionType::CameraShake:
+                    return QColor(255, 235, 90); // yellow — spin / flip / shake (motion)
+                case TransitionType::Glitch:
+                case TransitionType::ColorChannelShift:
+                    return QColor(220, 80, 240); // magenta — glitch / channel shift (digital)
+                case TransitionType::LightLeak:
+                case TransitionType::LensFlare:
+                case TransitionType::FilmBurn:
+                    return QColor(255, 200, 120); // amber — leak / flare / burn (warm optical)
                 case TransitionType::IrisRound:
                 case TransitionType::IrisBox:
+                case TransitionType::IrisRoundClose:
+                case TransitionType::IrisBoxClose:
                     return QColor(150, 230, 150);  // green — iris
                 default:
                     return QColor(255, 200, 80);
             }
         };
-        auto paintTransitionBadge = [&](const Transition &t, int badgeX) {
+        auto paintTransitionBadge = [&](const Transition &t, int badgeX, bool handleOnRight) {
             if (t.type == TransitionType::None) return;
-            const int badgeW = qMin(kBadgeW, clipWidth - 4);
+            const int badgeW = transBadgeWidth(t.duration, m_pixelsPerSecond, clipWidth);
             if (badgeW < 12) return;
             const QColor base = transitionColor(t.type);
-            const QRect badge(badgeX, badgeY, badgeW, kBadgeH);
+            const QRect badge(badgeX, kTransBadgeYTop, badgeW, kTransBadgeH);
 
             painter.setRenderHint(QPainter::Antialiasing, true);
             painter.setBrush(base);
@@ -944,23 +1019,46 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
             painter.drawRoundedRect(badge, 4, 4);
             painter.setRenderHint(QPainter::Antialiasing, false);
 
-            QString label = QString("%1 %2s")
-                .arg(transitionAbbrev(t.type))
-                .arg(t.duration, 0, 'f', 1);
+            // Drag handle indicator. Two short vertical lines on the inward
+            // edge of the badge; the actual hit-test zone is 6 px wide.
+            const int handleX = handleOnRight ? badge.right() - 4 : badge.left() + 1;
+            painter.setPen(QPen(base.darker(220), 1));
+            painter.drawLine(handleX,     badge.top() + 3, handleX,     badge.bottom() - 3);
+            painter.drawLine(handleX + 2, badge.top() + 3, handleX + 2, badge.bottom() - 3);
+
+            // Two-tier label: full ("X 1.0s") if it fits, otherwise just
+            // the duration ("1.0s") so the user can always read seconds.
+            // The type is still encoded in the badge color when the abbrev
+            // is dropped, and hover gives a tooltip with the full name.
             painter.setPen(QPen(QColor(20, 10, 0), 1));
             painter.setFont(QFont("Arial", 8, QFont::Bold));
-            const QString elided = painter.fontMetrics().elidedText(
-                label, Qt::ElideRight, badgeW - 8);
+            const QString full = QString("%1 %2s")
+                .arg(transitionAbbrev(t.type))
+                .arg(t.duration, 0, 'f', 1);
+            const QString compact = QString("%1s").arg(t.duration, 0, 'f', 1);
+            const QString tiny = QString::number(qRound(t.duration)) + "s";
+            const auto fm = painter.fontMetrics();
+            const int avail = badgeW - 8;
+            QString shown = (fm.horizontalAdvance(full) <= avail) ? full
+                          : (fm.horizontalAdvance(compact) <= avail) ? compact
+                          : (fm.horizontalAdvance(tiny) <= avail) ? tiny
+                          : fm.elidedText(compact, Qt::ElideRight, avail);
             painter.drawText(badge.adjusted(4, 0, -4, 0),
-                             Qt::AlignCenter, elided);
+                             Qt::AlignCenter, shown);
         };
         if (m_clips[i].leadIn.type != TransitionType::None) {
-            paintTransitionBadge(m_clips[i].leadIn, x + 2);
+            // leadIn handle sits on the badge's right edge — drag right to
+            // grow into the clip.
+            paintTransitionBadge(m_clips[i].leadIn, x + 2, /*handleOnRight*/ true);
         }
         if (m_clips[i].trailOut.type != TransitionType::None) {
-            const int badgeW = qMin(kBadgeW, clipWidth - 4);
+            const int badgeW = transBadgeWidth(m_clips[i].trailOut.duration,
+                                               m_pixelsPerSecond, clipWidth);
+            // trailOut handle sits on the badge's left edge — drag left to
+            // grow toward the cut.
             paintTransitionBadge(m_clips[i].trailOut,
-                                 x + clipWidth - badgeW - 2);
+                                 x + clipWidth - badgeW - 2,
+                                 /*handleOnRight*/ false);
         }
         x += clipWidth;
     }
@@ -1030,6 +1128,59 @@ void TimelineTrack::mousePressEvent(QMouseEvent *event)
             emit clipContextMenuRequested(hit, event->globalPosition().toPoint());
             event->accept();
             return;
+        }
+    }
+
+    // Transition badge drag handle hit-test. Runs BEFORE the seek/trim/move
+    // detection so clicking the handle starts a duration resize without
+    // jumping the playhead. The handle band is small enough that ordinary
+    // trim clicks (clip outer edge, not badge corner) still route to
+    // TrimLeft / TrimRight when the user lands outside the band.
+    if (event->button() == Qt::LeftButton && !additive) {
+        const int hitClip = clipAtX(event->pos().x());
+        const int cy = event->pos().y();
+        if (hitClip >= 0 && cy >= kTransBadgeYTop && cy <= kTransBadgeYBot) {
+            const int cx = clipStartX(hitClip);
+            const int cw = qMax(20, static_cast<int>(
+                m_clips[hitClip].effectiveDuration() * m_pixelsPerSecond));
+            const auto &clip = m_clips[hitClip];
+            if (clip.leadIn.type != TransitionType::None
+                && clip.leadIn.duration > 0.0) {
+                const int badgeX = cx + 2;
+                const int badgeW = transBadgeWidth(clip.leadIn.duration,
+                                                   m_pixelsPerSecond, cw);
+                const int handleX = badgeX + badgeW - kTransBadgeHandleW;
+                if (event->pos().x() >= handleX
+                    && event->pos().x() <= handleX + kTransBadgeHandleW) {
+                    setSelectedClip(hitClip);
+                    emit clipClicked(hitClip);
+                    m_dragMode = DragMode::TransitionLeadInResize;
+                    m_dragClipIndex = hitClip;
+                    m_dragStartX = event->pos().x();
+                    m_dragOriginalTransitionDuration = clip.leadIn.duration;
+                    setCursor(Qt::SizeHorCursor);
+                    event->accept();
+                    return;
+                }
+            }
+            if (clip.trailOut.type != TransitionType::None
+                && clip.trailOut.duration > 0.0) {
+                const int badgeW = transBadgeWidth(clip.trailOut.duration,
+                                                   m_pixelsPerSecond, cw);
+                const int badgeX = cx + cw - badgeW - 2;
+                if (event->pos().x() >= badgeX
+                    && event->pos().x() <= badgeX + kTransBadgeHandleW) {
+                    setSelectedClip(hitClip);
+                    emit clipClicked(hitClip);
+                    m_dragMode = DragMode::TransitionTrailOutResize;
+                    m_dragClipIndex = hitClip;
+                    m_dragStartX = event->pos().x();
+                    m_dragOriginalTransitionDuration = clip.trailOut.duration;
+                    setCursor(Qt::SizeHorCursor);
+                    event->accept();
+                    return;
+                }
+            }
         }
     }
 
@@ -1180,6 +1331,32 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
         update();
         return;
     }
+    if (m_dragMode == DragMode::TransitionLeadInResize
+        || m_dragMode == DragMode::TransitionTrailOutResize) {
+        if (m_dragClipIndex < 0 || m_dragClipIndex >= m_clips.size()) {
+            m_dragMode = DragMode::None;
+            m_dragClipIndex = -1;
+            setCursor(Qt::ArrowCursor);
+            return;
+        }
+        ClipInfo &clip = m_clips[m_dragClipIndex];
+        const double maxDur = qMax(0.1, clip.effectiveDuration());
+        const int dx = event->pos().x() - m_dragStartX;
+        const double deltaSec = static_cast<double>(dx) / m_pixelsPerSecond;
+        if (m_dragMode == DragMode::TransitionLeadInResize) {
+            // Drag right grows leadIn, drag left shrinks it.
+            clip.leadIn.duration =
+                qBound(0.1, m_dragOriginalTransitionDuration + deltaSec, maxDur);
+        } else {
+            // trailOut handle is on the badge's left edge — drag left grows
+            // it (deltaSec negative), drag right shrinks it.
+            clip.trailOut.duration =
+                qBound(0.1, m_dragOriginalTransitionDuration - deltaSec, maxDur);
+        }
+        setCursor(Qt::SizeHorCursor);
+        update();
+        return;
+    }
     if (m_dragMode == DragMode::TrimLeft || m_dragMode == DragMode::TrimRight) {
         if (m_dragClipIndex < 0 || m_dragClipIndex >= m_clips.size()) {
             m_dragMode = DragMode::None;
@@ -1214,6 +1391,57 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
     }
 
     int hover = clipAtX(event->pos().x());
+    // Transition badge hover takes priority — only fires inside the badge
+    // Y-band so ordinary clip-body hover still routes to OpenHand / SizeHor.
+    // Two zones: handle (6 px inward edge) → SizeHorCursor; badge body →
+    // tooltip with full transition name + duration so the user can read
+    // them even when the badge is too narrow to display the label.
+    if (hover >= 0) {
+        const int cy = event->pos().y();
+        if (cy >= kTransBadgeYTop && cy <= kTransBadgeYBot) {
+            const int cx = clipStartX(hover);
+            const int cw = qMax(20, static_cast<int>(
+                m_clips[hover].effectiveDuration() * m_pixelsPerSecond));
+            const auto &c = m_clips[hover];
+            const int px = event->pos().x();
+            auto tipFor = [](const Transition &t) {
+                return QString("%1 — %2 s")
+                    .arg(Transition::typeName(t.type))
+                    .arg(t.duration, 0, 'f', 2);
+            };
+            if (c.leadIn.type != TransitionType::None && c.leadIn.duration > 0.0) {
+                const int badgeX = cx + 2;
+                const int badgeW = transBadgeWidth(c.leadIn.duration,
+                                                   m_pixelsPerSecond, cw);
+                const int handleX = badgeX + badgeW - kTransBadgeHandleW;
+                if (px >= handleX && px <= handleX + kTransBadgeHandleW) {
+                    setCursor(Qt::SizeHorCursor);
+                    QToolTip::showText(event->globalPosition().toPoint(),
+                                       tipFor(c.leadIn), this);
+                    return;
+                }
+                if (px >= badgeX && px < badgeX + badgeW) {
+                    QToolTip::showText(event->globalPosition().toPoint(),
+                                       tipFor(c.leadIn), this);
+                }
+            }
+            if (c.trailOut.type != TransitionType::None && c.trailOut.duration > 0.0) {
+                const int badgeW = transBadgeWidth(c.trailOut.duration,
+                                                   m_pixelsPerSecond, cw);
+                const int badgeX = cx + cw - badgeW - 2;
+                if (px >= badgeX && px <= badgeX + kTransBadgeHandleW) {
+                    setCursor(Qt::SizeHorCursor);
+                    QToolTip::showText(event->globalPosition().toPoint(),
+                                       tipFor(c.trailOut), this);
+                    return;
+                }
+                if (px >= badgeX && px < badgeX + badgeW) {
+                    QToolTip::showText(event->globalPosition().toPoint(),
+                                       tipFor(c.trailOut), this);
+                }
+            }
+        }
+    }
     if (hover >= 0 && m_selectedClips.contains(hover)) {
         int cx = clipStartX(hover);
         int cw = qMax(20, static_cast<int>(m_clips[hover].effectiveDuration() * m_pixelsPerSecond));
@@ -1240,8 +1468,21 @@ void TimelineTrack::mouseReleaseEvent(QMouseEvent *event)
             emit modified();
     }
     if (m_dragMode == DragMode::TrimLeft || m_dragMode == DragMode::TrimRight) emit modified();
+    if ((m_dragMode == DragMode::TransitionLeadInResize
+         || m_dragMode == DragMode::TransitionTrailOutResize)
+        && m_dragClipIndex >= 0 && m_dragClipIndex < m_clips.size()) {
+        const ClipInfo &clip = m_clips[m_dragClipIndex];
+        const double newDur = (m_dragMode == DragMode::TransitionLeadInResize)
+            ? clip.leadIn.duration
+            : clip.trailOut.duration;
+        // Threshold guards against an unintended click-without-drag from
+        // emitting modified() and pushing an empty undo entry.
+        if (qAbs(newDur - m_dragOriginalTransitionDuration) > 0.01)
+            emit modified();
+    }
     m_dragMode = DragMode::None; m_dragClipIndex = -1; m_dropTargetIndex = -1;
     m_dragOriginalLeadInNext = -1.0;
+    m_dragOriginalTransitionDuration = 0.0;
     setCursor(Qt::ArrowCursor); update();
 }
 
@@ -2421,6 +2662,101 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     if (!track->isClipSelected(clipIndex))
         track->setSelectedClip(clipIndex);
 
+    // Audio-track context menu — visual transitions don't apply, so we
+    // show a simplified menu with just the audio-relevant transitions
+    // (FadeIn/Out + equal-power CrossDissolve) plus the standard
+    // edit ops. AudioMixer reads leadIn/trailOut directly from the audio
+    // clip so setting these here gives an audio-only fade with no video
+    // mirror. Used for J-cut / L-cut workflows where audio fades earlier
+    // or later than the video cut.
+    if (m_audioTracks.contains(track)) {
+        const ClipInfo &aClip = track->clips()[clipIndex];
+        const int aLinkGroup = aClip.linkGroup;
+        const bool aHasTrans = aClip.leadIn.type != TransitionType::None
+                            || aClip.trailOut.type != TransitionType::None;
+        QMenu aMenu;
+        QAction *aCut = aMenu.addAction(QStringLiteral("カット"));
+        QAction *aCopy = aMenu.addAction(QStringLiteral("コピー"));
+        QAction *aDel = aMenu.addAction(QStringLiteral("削除"));
+        aMenu.addSeparator();
+        QAction *aUnlink = aMenu.addAction(QStringLiteral("同期を切る"));
+        aUnlink->setEnabled(aLinkGroup > 0);
+        aMenu.addSeparator();
+        QMenu *atMenu = aMenu.addMenu(QStringLiteral("音声トランジション"));
+        QAction *aXdAct = atMenu->addAction(QStringLiteral("クロスフェード (1.0s)"));
+        QAction *aFiAct = atMenu->addAction(QStringLiteral("フェードイン (0.5s)"));
+        QAction *aFoAct = atMenu->addAction(QStringLiteral("フェードアウト (0.5s)"));
+        QAction *aClearAct = nullptr;
+        if (aHasTrans) {
+            atMenu->addSeparator();
+            aClearAct = atMenu->addAction(QStringLiteral("音声トランジション削除"));
+        }
+        QAction *aChosen = aMenu.exec(globalPos);
+        if (!aChosen) return;
+        // Helper: mutate this audio track only (no video mirror) so the
+        // audio fade can outlive or precede the video cut for J/L-cuts.
+        auto applyAudioOnly = [&](TransitionType type, double duration) {
+            auto clips = track->clips();
+            if (clipIndex >= clips.size()) return;
+            Transition t;
+            t.type = type;
+            t.duration = duration;
+            if (type == TransitionType::FadeIn) {
+                clips[clipIndex].leadIn = t;
+                if (clipIndex > 0) {
+                    Transition mirror;
+                    mirror.type = TransitionType::FadeOut;
+                    mirror.duration = duration;
+                    clips[clipIndex - 1].trailOut = mirror;
+                }
+            } else if (type == TransitionType::FadeOut) {
+                clips[clipIndex].trailOut = t;
+                if (clipIndex + 1 < clips.size()) {
+                    Transition mirror;
+                    mirror.type = TransitionType::FadeIn;
+                    mirror.duration = duration;
+                    clips[clipIndex + 1].leadIn = mirror;
+                }
+            } else { // CrossDissolve (audio-only equal-power crossfade)
+                clips[clipIndex].trailOut = t;
+                if (clipIndex + 1 < clips.size())
+                    clips[clipIndex + 1].leadIn = t;
+            }
+            track->setClips(clips);
+            saveUndoState(QString("Audio-only transition: %1")
+                .arg(Transition::typeName(type)));
+            scheduleEmitSequenceChanged();
+        };
+        if (aChosen == aCut) cutSelectedClip();
+        else if (aChosen == aCopy) copySelectedClip();
+        else if (aChosen == aDel) deleteSelectedClip();
+        else if (aChosen == aUnlink) unlinkClipGroup(aLinkGroup);
+        else if (aChosen == aXdAct) applyAudioOnly(TransitionType::CrossDissolve, 1.0);
+        else if (aChosen == aFiAct) applyAudioOnly(TransitionType::FadeIn, 0.5);
+        else if (aChosen == aFoAct) applyAudioOnly(TransitionType::FadeOut, 0.5);
+        else if (aClearAct && aChosen == aClearAct) {
+            auto clips = track->clips();
+            if (clipIndex < clips.size()) {
+                const bool hadLead = clips[clipIndex].leadIn.type != TransitionType::None;
+                const bool hadTrail = clips[clipIndex].trailOut.type != TransitionType::None;
+                if (hadLead && clipIndex > 0
+                    && clips[clipIndex - 1].trailOut.type != TransitionType::None) {
+                    clips[clipIndex - 1].trailOut = Transition{};
+                }
+                if (hadTrail && clipIndex + 1 < clips.size()
+                    && clips[clipIndex + 1].leadIn.type != TransitionType::None) {
+                    clips[clipIndex + 1].leadIn = Transition{};
+                }
+                clips[clipIndex].leadIn = Transition{};
+                clips[clipIndex].trailOut = Transition{};
+                track->setClips(clips);
+                saveUndoState("Clear audio transitions");
+                scheduleEmitSequenceChanged();
+            }
+        }
+        return;
+    }
+
     const ClipInfo &clipInfo = track->clips()[clipIndex];
     const int linkGroup = clipInfo.linkGroup;
     const bool hasTransition = clipInfo.leadIn.type != TransitionType::None
@@ -2439,6 +2775,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     menu.addSeparator();
     QMenu *transitionMenu = menu.addMenu(QStringLiteral("トランジション"));
     QAction *xdAct = transitionMenu->addAction(QStringLiteral("クロスディゾルブ (1.0s)"));
+    QAction *fdAct = transitionMenu->addAction(QStringLiteral("フィルムディゾルブ (1.0s)"));
+    QAction *ddAct = transitionMenu->addAction(QStringLiteral("ディザディゾルブ (1.0s)"));
+    QAction *blAct = transitionMenu->addAction(QStringLiteral("ブラーディゾルブ (1.0s)"));
+    QAction *pxAct = transitionMenu->addAction(QStringLiteral("ピクセレート (1.0s)"));
     QAction *fiAct = transitionMenu->addAction(QStringLiteral("フェードイン (0.5s)"));
     QAction *foAct = transitionMenu->addAction(QStringLiteral("フェードアウト (0.5s)"));
     QAction *dbAct = transitionMenu->addAction(QStringLiteral("黒へディップ (1.0s)"));
@@ -2449,18 +2789,64 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *wrAct = wipeMenu->addAction(QStringLiteral("右 → 左"));
     QAction *wuAct = wipeMenu->addAction(QStringLiteral("上 → 下"));
     QAction *wdAct = wipeMenu->addAction(QStringLiteral("下 → 上"));
-    QAction *cwAct = wipeMenu->addAction(QStringLiteral("時計回り"));
-    QAction *bhAct = wipeMenu->addAction(QStringLiteral("バーンドア (水平)"));
-    QAction *bvAct = wipeMenu->addAction(QStringLiteral("バーンドア (垂直)"));
+    QAction *cwAct  = wipeMenu->addAction(QStringLiteral("時計回り"));
+    QAction *cwcAct = wipeMenu->addAction(QStringLiteral("反時計回り"));
+    QAction *bhAct  = wipeMenu->addAction(QStringLiteral("バーンドア (水平・開く)"));
+    QAction *bhcAct = wipeMenu->addAction(QStringLiteral("バーンドア (水平・閉じる)"));
+    QAction *bvAct  = wipeMenu->addAction(QStringLiteral("バーンドア (垂直・開く)"));
+    QAction *bvcAct = wipeMenu->addAction(QStringLiteral("バーンドア (垂直・閉じる)"));
     QMenu *slideMenu = transitionMenu->addMenu(QStringLiteral("スライド (1.0s)"));
     QAction *slAct = slideMenu->addAction(QStringLiteral("左へ"));
     QAction *srAct = slideMenu->addAction(QStringLiteral("右へ"));
     QAction *suAct = slideMenu->addAction(QStringLiteral("上へ"));
     QAction *sdAct = slideMenu->addAction(QStringLiteral("下へ"));
+    QMenu *pushMenu = transitionMenu->addMenu(QStringLiteral("プッシュ (1.0s)"));
+    QAction *plAct = pushMenu->addAction(QStringLiteral("左へ"));
+    QAction *prAct = pushMenu->addAction(QStringLiteral("右へ"));
+    QAction *puAct = pushMenu->addAction(QStringLiteral("上へ"));
+    QAction *pdAct = pushMenu->addAction(QStringLiteral("下へ"));
     QMenu *irisMenu = transitionMenu->addMenu(QStringLiteral("アイリス (1.0s)"));
-    QAction *irAct = irisMenu->addAction(QStringLiteral("円"));
-    QAction *ibAct = irisMenu->addAction(QStringLiteral("矩形"));
+    QAction *irAct  = irisMenu->addAction(QStringLiteral("円・開く"));
+    QAction *ircAct = irisMenu->addAction(QStringLiteral("円・閉じる"));
+    QAction *ibAct  = irisMenu->addAction(QStringLiteral("矩形・開く"));
+    QAction *ibcAct = irisMenu->addAction(QStringLiteral("矩形・閉じる"));
+    QAction *czAct = transitionMenu->addAction(QStringLiteral("クロスズーム (1.0s)"));
+    QMenu *spinMenu = transitionMenu->addMenu(QStringLiteral("スピン (1.0s)"));
+    QAction *scwAct  = spinMenu->addAction(QStringLiteral("時計回り"));
+    QAction *sccwAct = spinMenu->addAction(QStringLiteral("反時計回り"));
+    QMenu *whipMenu = transitionMenu->addMenu(QStringLiteral("ウィップパン (0.5s)"));
+    QAction *wplAct = whipMenu->addAction(QStringLiteral("左へ"));
+    QAction *wprAct = whipMenu->addAction(QStringLiteral("右へ"));
+    QAction *glAct  = transitionMenu->addAction(QStringLiteral("グリッチ (0.5s)"));
+    QAction *llAct  = transitionMenu->addAction(QStringLiteral("ライトリーク (1.0s)"));
+    QAction *lfAct  = transitionMenu->addAction(QStringLiteral("レンズフレア (1.0s)"));
+    QAction *fbAct  = transitionMenu->addAction(QStringLiteral("フィルムバーン (1.0s)"));
+    QAction *skAct  = transitionMenu->addAction(QStringLiteral("カメラシェイク (0.5s)"));
+    QAction *chAct  = transitionMenu->addAction(QStringLiteral("チャンネルシフト (0.5s)"));
+    QMenu *flipMenu = transitionMenu->addMenu(QStringLiteral("フリップ (1.0s)"));
+    QAction *fhAct  = flipMenu->addAction(QStringLiteral("水平 (Y軸回転)"));
+    QAction *fvAct  = flipMenu->addAction(QStringLiteral("垂直 (X軸回転)"));
     transitionMenu->addSeparator();
+    // User-saved presets — populated dynamically from QSettings via
+    // TransitionPresetStore. Empty submenu when nothing is saved.
+    QMenu *presetMenu = transitionMenu->addMenu(QStringLiteral("プリセット"));
+    QList<QPair<QAction *, TransitionPreset>> presetActs;
+    {
+        const auto loaded = TransitionPresetStore::loadAll();
+        if (loaded.isEmpty()) {
+            QAction *empty = presetMenu->addAction(QStringLiteral("(プリセット未登録)"));
+            empty->setEnabled(false);
+        } else {
+            for (const auto &p : loaded) {
+                const QString label = QStringLiteral("%1  (%2, %3s)")
+                    .arg(p.name)
+                    .arg(Transition::typeName(p.transition.type))
+                    .arg(p.transition.duration, 0, 'f', 1);
+                QAction *act = presetMenu->addAction(label);
+                presetActs.append({ act, p });
+            }
+        }
+    }
     QAction *transDialogAct = transitionMenu->addAction(QStringLiteral("カスタム..."));
     QAction *transClearAct = nullptr;
     if (hasTransition) {
@@ -2481,6 +2867,30 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     else if (chosen == xdAct) {
         Transition t;
         t.type = TransitionType::CrossDissolve;
+        t.duration = 1.0;
+        applyTransitionToSelected(t);
+    }
+    else if (chosen == fdAct) {
+        Transition t;
+        t.type = TransitionType::FilmDissolve;
+        t.duration = 1.0;
+        applyTransitionToSelected(t);
+    }
+    else if (chosen == ddAct) {
+        Transition t;
+        t.type = TransitionType::DitherDissolve;
+        t.duration = 1.0;
+        applyTransitionToSelected(t);
+    }
+    else if (chosen == blAct) {
+        Transition t;
+        t.type = TransitionType::BlurDissolve;
+        t.duration = 1.0;
+        applyTransitionToSelected(t);
+    }
+    else if (chosen == pxAct) {
+        Transition t;
+        t.type = TransitionType::Pixelate;
         t.duration = 1.0;
         applyTransitionToSelected(t);
     }
@@ -2509,31 +2919,80 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         applyTransitionToSelected(t);
     }
     else if (chosen == wlAct || chosen == wrAct || chosen == wuAct
-             || chosen == wdAct || chosen == cwAct || chosen == bhAct
-             || chosen == bvAct || chosen == slAct || chosen == srAct
+             || chosen == wdAct || chosen == cwAct || chosen == cwcAct
+             || chosen == bhAct || chosen == bhcAct
+             || chosen == bvAct || chosen == bvcAct
+             || chosen == slAct || chosen == srAct
              || chosen == suAct || chosen == sdAct
-             || chosen == irAct || chosen == ibAct) {
+             || chosen == plAct || chosen == prAct
+             || chosen == puAct || chosen == pdAct
+             || chosen == czAct || chosen == scwAct || chosen == sccwAct
+             || chosen == wplAct || chosen == wprAct || chosen == glAct
+             || chosen == llAct || chosen == fhAct || chosen == fvAct
+             || chosen == lfAct || chosen == fbAct
+             || chosen == skAct || chosen == chAct
+             || chosen == irAct || chosen == ircAct
+             || chosen == ibAct || chosen == ibcAct) {
         Transition t;
-        t.duration = 1.0;
+        // Whip pan, glitch, camera shake, channel shift are punchy/short
+        // by NLE convention; everyone else gets the 1.0s default we've
+        // been using for context-menu presets. Custom dialog can override
+        // either way.
+        t.duration = (chosen == wplAct || chosen == wprAct || chosen == glAct
+                      || chosen == skAct || chosen == chAct)
+            ? 0.5 : 1.0;
         if (chosen == wlAct)      t.type = TransitionType::WipeLeft;
         else if (chosen == wrAct) t.type = TransitionType::WipeRight;
         else if (chosen == wuAct) t.type = TransitionType::WipeUp;
         else if (chosen == wdAct) t.type = TransitionType::WipeDown;
-        else if (chosen == cwAct) t.type = TransitionType::ClockWipe;
-        else if (chosen == bhAct) t.type = TransitionType::BarnDoorHorizontal;
-        else if (chosen == bvAct) t.type = TransitionType::BarnDoorVertical;
+        else if (chosen == cwAct)  t.type = TransitionType::ClockWipe;
+        else if (chosen == cwcAct) t.type = TransitionType::ClockWipeCCW;
+        else if (chosen == bhAct)  t.type = TransitionType::BarnDoorHorizontal;
+        else if (chosen == bhcAct) t.type = TransitionType::BarnDoorHClose;
+        else if (chosen == bvAct)  t.type = TransitionType::BarnDoorVertical;
+        else if (chosen == bvcAct) t.type = TransitionType::BarnDoorVClose;
         else if (chosen == slAct) t.type = TransitionType::SlideLeft;
         else if (chosen == srAct) t.type = TransitionType::SlideRight;
         else if (chosen == suAct) t.type = TransitionType::SlideUp;
         else if (chosen == sdAct) t.type = TransitionType::SlideDown;
-        else if (chosen == irAct) t.type = TransitionType::IrisRound;
-        else                      t.type = TransitionType::IrisBox;
+        else if (chosen == plAct) t.type = TransitionType::PushLeft;
+        else if (chosen == prAct) t.type = TransitionType::PushRight;
+        else if (chosen == puAct) t.type = TransitionType::PushUp;
+        else if (chosen == pdAct) t.type = TransitionType::PushDown;
+        else if (chosen == czAct) t.type = TransitionType::CrossZoom;
+        else if (chosen == scwAct)  t.type = TransitionType::SpinCW;
+        else if (chosen == sccwAct) t.type = TransitionType::SpinCCW;
+        else if (chosen == wplAct)  t.type = TransitionType::WhipPanLeft;
+        else if (chosen == wprAct)  t.type = TransitionType::WhipPanRight;
+        else if (chosen == glAct)   t.type = TransitionType::Glitch;
+        else if (chosen == llAct)   t.type = TransitionType::LightLeak;
+        else if (chosen == lfAct)   t.type = TransitionType::LensFlare;
+        else if (chosen == fbAct)   t.type = TransitionType::FilmBurn;
+        else if (chosen == skAct)   t.type = TransitionType::CameraShake;
+        else if (chosen == chAct)   t.type = TransitionType::ColorChannelShift;
+        else if (chosen == fhAct)   t.type = TransitionType::FlipHorizontal;
+        else if (chosen == fvAct)   t.type = TransitionType::FlipVertical;
+        else if (chosen == irAct)  t.type = TransitionType::IrisRound;
+        else if (chosen == ircAct) t.type = TransitionType::IrisRoundClose;
+        else if (chosen == ibAct)  t.type = TransitionType::IrisBox;
+        else                       t.type = TransitionType::IrisBoxClose;
         applyTransitionToSelected(t);
     }
     else if (chosen == transDialogAct) emit transitionDialogRequested();
     else if (transClearAct && chosen == transClearAct) clearTransitionsOnSelected();
     else if (chosen == fxAct) emit videoEffectsDialogRequested();
     else if (chosen == ccAct) emit colorCorrectionRequested();
+    else {
+        // Preset dispatch — chosen action might be one of the dynamically
+        // populated preset entries. Match by pointer since the labels
+        // include the type/duration suffix and could collide with user
+        // names that happen to match.
+        for (const auto &pair : presetActs) {
+            if (chosen != pair.first) continue;
+            applyTransitionToSelected(pair.second.transition);
+            break;
+        }
+    }
 }
 
 void Timeline::undo()
@@ -2714,6 +3173,7 @@ void Timeline::applyTransitionToSelected(const Transition &t)
             Transition mirror;
             mirror.type = TransitionType::FadeOut;
             mirror.duration = t.duration;
+            mirror.easing = t.easing;
             clips[sel - 1].trailOut = mirror;
         }
     } else if (t.type == TransitionType::FadeOut) {
@@ -2722,6 +3182,7 @@ void Timeline::applyTransitionToSelected(const Transition &t)
             Transition mirror;
             mirror.type = TransitionType::FadeIn;
             mirror.duration = t.duration;
+            mirror.easing = t.easing;
             clips[sel + 1].leadIn = mirror;
         }
     } else {
@@ -2730,8 +3191,89 @@ void Timeline::applyTransitionToSelected(const Transition &t)
             clips[sel + 1].leadIn = t;
     }
     m_videoTrack->setClips(clips);
+
+    // Mirror to the linked audio track at the same index so AudioMixer
+    // applies the matching equal-power crossfade automatically. Pro NLEs
+    // (Premiere/DaVinci/FCP X) all default to linked V+A transitions —
+    // setting one without the other always sounds wrong (audio just
+    // jump-cuts under a video crossfade). Users who want video-only
+    // transitions can break the link with the unlink command first.
+    if (m_audioTrack) {
+        auto aClips = m_audioTrack->clips();
+        if (sel < aClips.size()) {
+            if (t.type == TransitionType::FadeIn) {
+                aClips[sel].leadIn = t;
+                if (sel > 0) {
+                    Transition mirror;
+                    mirror.type = TransitionType::FadeOut;
+                    mirror.duration = t.duration;
+                    mirror.easing = t.easing;
+                    aClips[sel - 1].trailOut = mirror;
+                }
+            } else if (t.type == TransitionType::FadeOut) {
+                aClips[sel].trailOut = t;
+                if (sel + 1 < aClips.size()) {
+                    Transition mirror;
+                    mirror.type = TransitionType::FadeIn;
+                    mirror.duration = t.duration;
+                    mirror.easing = t.easing;
+                    aClips[sel + 1].leadIn = mirror;
+                }
+            } else {
+                aClips[sel].trailOut = t;
+                if (sel + 1 < aClips.size())
+                    aClips[sel + 1].leadIn = t;
+            }
+            m_audioTrack->setClips(aClips);
+        }
+    }
+
     saveUndoState(QString("Add transition: %1").arg(Transition::typeName(t.type)));
     scheduleEmitSequenceChanged();
+
+    // Handle-shortage advisory. Pure overlap transitions (CrossDissolve /
+    // Wipe / Slide / Iris / Dip / Barn / ClockWipe) need source media past
+    // the selected clip's outPoint and / or before the next clip's inPoint
+    // depending on alignment. We mirror computePlaybackSequence's math
+    // here so the message matches what the user will actually see.
+    if (isOverlapTransition(t.type) && sel + 1 < clips.size()) {
+        const auto &a = clips[sel];
+        const auto &b = clips[sel + 1];
+        const double aSpeed = (a.speed > 0.0) ? a.speed : 1.0;
+        const double bSpeed = (b.speed > 0.0) ? b.speed : 1.0;
+        const double aOutPoint = (a.outPoint > 0.0) ? a.outPoint : a.duration;
+        const double aTrail = qMax(0.0, (a.duration - aOutPoint) / aSpeed);
+        const double bLead  = qMax(0.0, b.inPoint / bSpeed);
+        const double askedD = t.duration;
+        double aExtend = 0.0, bRetract = 0.0;
+        switch (t.alignment) {
+            case TransitionAlignment::Start:
+                aExtend  = qMin(askedD, aTrail);
+                break;
+            case TransitionAlignment::End:
+                bRetract = qMin(askedD, bLead);
+                break;
+            case TransitionAlignment::Center:
+                aExtend  = qMin(askedD * 0.5, aTrail);
+                bRetract = qMin(askedD * 0.5, bLead);
+                if (aExtend + bRetract < askedD) {
+                    if (bRetract < askedD * 0.5) {
+                        aExtend += qMin(askedD - aExtend - bRetract,
+                                        aTrail - aExtend);
+                    }
+                    if (aExtend + bRetract < askedD && aExtend < askedD * 0.5) {
+                        bRetract += qMin(askedD - aExtend - bRetract,
+                                         bLead - bRetract);
+                    }
+                }
+                break;
+        }
+        const double effectiveD = aExtend + bRetract;
+        if (effectiveD + 0.005 < askedD) {
+            emit transitionShortened(Transition::typeName(t.type),
+                                     askedD, effectiveD);
+        }
+    }
 }
 
 void Timeline::clearTransitionsOnSelected()
@@ -2760,6 +3302,28 @@ void Timeline::clearTransitionsOnSelected()
     clips[sel].leadIn = Transition{};
     clips[sel].trailOut = Transition{};
     m_videoTrack->setClips(clips);
+
+    // Mirror teardown on the linked audio track. AudioMixer reads its
+    // crossfade window from PlaybackEntry.leadIn/trailOut which is sourced
+    // from the audio clips, so leaving them set here would keep the audio
+    // fading even after the visual transition is gone.
+    if (m_audioTrack) {
+        auto aClips = m_audioTrack->clips();
+        if (sel < aClips.size()) {
+            if (hadLead && sel > 0
+                && aClips[sel - 1].trailOut.type != TransitionType::None) {
+                aClips[sel - 1].trailOut = Transition{};
+            }
+            if (hadTrail && sel + 1 < aClips.size()
+                && aClips[sel + 1].leadIn.type != TransitionType::None) {
+                aClips[sel + 1].leadIn = Transition{};
+            }
+            aClips[sel].leadIn = Transition{};
+            aClips[sel].trailOut = Transition{};
+            m_audioTrack->setClips(aClips);
+        }
+    }
+
     saveUndoState("Clear transitions");
     scheduleEmitSequenceChanged();
 }
@@ -3242,8 +3806,12 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         int clipIdx = -1;
         TransitionType leadInType = TransitionType::None;
         double leadInDuration = 0.0;
+        TransitionAlignment leadInAlignment = TransitionAlignment::Center;
+        TransitionEasing leadInEasing = TransitionEasing::Linear;
         TransitionType trailOutType = TransitionType::None;
         double trailOutDuration = 0.0;
+        TransitionAlignment trailOutAlignment = TransitionAlignment::Center;
+        TransitionEasing trailOutEasing = TransitionEasing::Linear;
     };
 
     QVector<QVector<Interval>> trackIntervals;
@@ -3276,8 +3844,12 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.clipIdx = ci;
                 iv.leadInType = c.leadIn.type;
                 iv.leadInDuration = c.leadIn.duration;
+                iv.leadInAlignment = c.leadIn.alignment;
+                iv.leadInEasing = c.leadIn.easing;
                 iv.trailOutType = c.trailOut.type;
                 iv.trailOutDuration = c.trailOut.duration;
+                iv.trailOutAlignment = c.trailOut.alignment;
+                iv.trailOutEasing = c.trailOut.easing;
                 ivs.append(iv);
                 accum += clipDur;
             }
@@ -3285,37 +3857,84 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         trackIntervals.append(ivs);
     }
 
-    // Premiere-style overlap for boundary transitions: when two adjacent
-    // same-track clips share a matching CrossDissolve / Wipe / Slide
-    // transition (A.trailOut + B.leadIn same type), pull B's timelineStart
-    // back by the transition duration so the two intervals actually
-    // overlap. End-at-Cut alignment — only B's clipIn handle is consumed
-    // (no need to extend A past its clipOut). Duration clamped to B's
-    // available source handle so we never seek before the start of B's
-    // source media.
+    // Premiere-style overlap for boundary transitions. Center-at-Cut
+    // alignment (Premiere default): the transition is split so half lives
+    // in A's trail handle and half in B's lead handle. Each side may
+    // borrow from the other when its own handle runs short, gracefully
+    // degrading toward End-at-Cut (A no trail) or Start-at-Cut (B no lead)
+    // before giving up. We only kick in when the two intervals are
+    // adjacent on the timeline (no leadIn gap on B), since a deliberate
+    // gap means the user wants a hard cut, not a transition.
     for (auto &trackIvs : trackIntervals) {
         for (int j = 1; j < trackIvs.size(); ++j) {
             Interval &a = trackIvs[j - 1];
             Interval &b = trackIvs[j];
             if (!isOverlapTransition(a.trailOutType)) continue;
             if (a.trailOutType != b.leadInType) continue;
+            if (qAbs(a.timelineEnd - b.timelineStart) > 1e-3) continue;
             const double askedD = qMin(a.trailOutDuration, b.leadInDuration);
             if (askedD <= 0.0) continue;
+            const double aSpeed = (a.speed > 0.0) ? a.speed : 1.0;
             const double bSpeed = (b.speed > 0.0) ? b.speed : 1.0;
-            const double availableD = b.clipIn / bSpeed;
-            const double effectiveD = qMin(askedD, qMax(0.0, availableD));
+            // A's trail handle = source frames past clipOut, divided by speed.
+            // We grab the source duration from the owning ClipInfo since the
+            // Interval struct does not carry it.
+            double aTrailAvailable = 0.0;
+            auto *aTrack = m_videoTracks.value(a.trackIdx, nullptr);
+            if (aTrack && a.clipIdx >= 0 && a.clipIdx < aTrack->clips().size()) {
+                const auto &ac = aTrack->clips()[a.clipIdx];
+                aTrailAvailable = qMax(0.0, (ac.duration - a.clipOut) / aSpeed);
+            }
+            const double bLeadAvailable = qMax(0.0, b.clipIn / bSpeed);
+
+            double aExtend = 0.0, bRetract = 0.0;
+            switch (a.trailOutAlignment) {
+                case TransitionAlignment::Start:
+                    // Premiere "Start at Cut": entire transition AFTER cut.
+                    // Consumes A's trail handle only; B stays put.
+                    aExtend = qMin(askedD, aTrailAvailable);
+                    break;
+                case TransitionAlignment::End:
+                    // Premiere "End at Cut": entire transition BEFORE cut.
+                    // Consumes B's lead handle only; A stays put.
+                    bRetract = qMin(askedD, bLeadAvailable);
+                    break;
+                case TransitionAlignment::Center:
+                    // Premiere default: D/2 each side, with borrowing when
+                    // one side runs short so the user gets the requested
+                    // duration whenever physics allow.
+                    aExtend  = qMin(askedD * 0.5, aTrailAvailable);
+                    bRetract = qMin(askedD * 0.5, bLeadAvailable);
+                    if (aExtend + bRetract < askedD) {
+                        if (bRetract < askedD * 0.5) {
+                            const double slack = qMin(askedD - aExtend - bRetract,
+                                                      aTrailAvailable - aExtend);
+                            if (slack > 0.0) aExtend += slack;
+                        }
+                        if (aExtend + bRetract < askedD && aExtend < askedD * 0.5) {
+                            const double slack = qMin(askedD - aExtend - bRetract,
+                                                      bLeadAvailable - bRetract);
+                            if (slack > 0.0) bRetract += slack;
+                        }
+                    }
+                    break;
+            }
+            const double effectiveD = aExtend + bRetract;
             if (effectiveD < 0.01) continue;
-            b.timelineStart -= effectiveD;
-            b.clipIn -= effectiveD * bSpeed;
+
+            a.clipOut       += aExtend * aSpeed;
+            a.timelineEnd   += aExtend;
+            b.timelineStart -= bRetract;
+            b.clipIn        -= bRetract * bSpeed;
             a.trailOutDuration = effectiveD;
-            b.leadInDuration = effectiveD;
+            b.leadInDuration   = effectiveD;
             qInfo() << "[SEQ] overlap pair:"
                     << Transition::typeName(a.trailOutType)
                     << "track=" << a.trackIdx
-                    << "askedD=" << askedD << "availableD=" << availableD
-                    << "effectiveD=" << effectiveD
-                    << "B.timelineStart=" << b.timelineStart
-                    << "B.clipIn=" << b.clipIn;
+                    << "askedD=" << askedD
+                    << "aTrail=" << aTrailAvailable << "bLead=" << bLeadAvailable
+                    << "aExtend=" << aExtend << "bRetract=" << bRetract
+                    << "effectiveD=" << effectiveD;
         }
     }
 
@@ -3354,8 +3973,10 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.sourceClipIndex = iv.clipIdx;
         e.leadInType = iv.leadInType;
         e.leadInDuration = iv.leadInDuration;
+        e.leadInEasing = iv.leadInEasing;
         e.trailOutType = iv.trailOutType;
         e.trailOutDuration = iv.trailOutDuration;
+        e.trailOutEasing = iv.trailOutEasing;
         qInfo() << "[SEQ] entry idx=" << result.size()
                 << "tl=[" << iv.timelineStart << "," << iv.timelineEnd << "]"
                 << "clip=[" << iv.clipIn << "," << iv.clipOut << "]"
@@ -3408,8 +4029,10 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             e.sourceClipIndex = ci;
             e.leadInType = c.leadIn.type;
             e.leadInDuration = c.leadIn.duration;
+            e.leadInEasing = c.leadIn.easing;
             e.trailOutType = c.trailOut.type;
             e.trailOutDuration = c.trailOut.duration;
+            e.trailOutEasing = c.trailOut.easing;
             result.append(e);
             accum += clipDur;
         }

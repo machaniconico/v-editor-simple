@@ -279,13 +279,14 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         if (trackIdx >= 0 && trackIdx < m_mixer->m_trackStates.size())
             gain *= m_mixer->m_trackStates[trackIdx].effectiveGain;
 
-        // Edge-attached audio fade. Linear ramp matching the video FadeIn /
-        // FadeOut applied in VideoPlayer::displayFrame so A/V stay in lock
-        // step. The ramp uses the cursor at the start of this readData
-        // fragment — a 64 KB ring is ~340 ms, so the within-fragment error
-        // is well below audible threshold for the typical 0.5-2 s fade
-        // window. If sub-buffer accuracy ever matters we can compute the
-        // multiplier per-sample inside the copy loop below.
+        // Edge-attached audio fade. Equal-power (sqrt) curve so A.trailOut^2
+        // + B.leadIn^2 == 1 at the midpoint of an overlap crossfade — linear
+        // ramps would sum to 0.5 there and produce a 3 dB perceived dip. The
+        // ramp uses the cursor at the start of this readData fragment — a
+        // 64 KB ring is ~340 ms, so the within-fragment error is well below
+        // audible threshold for the typical 0.5-2 s fade window. If sub-
+        // buffer accuracy ever matters we can compute the multiplier per-
+        // sample inside the copy loop below.
         const double posSec = static_cast<double>(cursorUs) / 1e6;
         const double elapsed = posSec - e->entry.timelineStart;
         const double remaining = e->entry.timelineEnd - posSec;
@@ -299,12 +300,15 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             && remaining >= 0.0 && remaining < e->entry.trailOutDuration;
         if (leadInFade) {
             // Overlap transitions (CrossDissolve / Wipe / Slide) fire both
-            // arms simultaneously during the timeline overlap window —
-            // A's trailOut ramps down while B's leadIn ramps up, combining
-            // into a linear audio crossfade.
-            gain *= qBound(0.0, elapsed / e->entry.leadInDuration, 1.0);
+            // arms simultaneously during the timeline overlap window — A's
+            // trailOut ramps down while B's leadIn ramps up. With sqrt curves
+            // the squared sum stays at unity through the crossfade, so the
+            // perceived loudness is constant.
+            const double t = qBound(0.0, elapsed / e->entry.leadInDuration, 1.0);
+            gain *= std::sqrt(t);
         } else if (trailOutFade) {
-            gain *= qBound(0.0, remaining / e->entry.trailOutDuration, 1.0);
+            const double t = qBound(0.0, remaining / e->entry.trailOutDuration, 1.0);
+            gain *= std::sqrt(t);
         }
         if (gain <= 0.0) {
             // Drain the ring so this muted entry stays in time with the

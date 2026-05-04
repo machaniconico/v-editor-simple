@@ -104,6 +104,8 @@ private slots:
     void importSubtitles();
     void saveTextTemplate();
     void addTransition();
+    void applyDefaultTransition();
+    void editDefaultTransition();
     void addImageOverlay();
     void addPip();
     void setClipVolume();

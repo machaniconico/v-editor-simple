@@ -296,6 +296,8 @@ QJsonObject ProjectFile::transitionToJson(const Transition &t)
     QJsonObject obj;
     obj["type"] = static_cast<int>(t.type);
     obj["duration"] = t.duration;
+    obj["alignment"] = static_cast<int>(t.alignment);
+    obj["easing"] = static_cast<int>(t.easing);
     return obj;
 }
 
@@ -305,6 +307,15 @@ Transition ProjectFile::transitionFromJson(const QJsonObject &obj)
     t.type = static_cast<TransitionType>(
         obj["type"].toInt(static_cast<int>(TransitionType::None)));
     t.duration = obj["duration"].toDouble(0.5);
+    // Pre-alignment projects default to Center, the pro-NLE default and the
+    // alignment that Step 3's overlap math uses when no explicit choice was
+    // serialized.
+    t.alignment = static_cast<TransitionAlignment>(
+        obj["alignment"].toInt(static_cast<int>(TransitionAlignment::Center)));
+    // Pre-easing projects default to Linear — the legacy behaviour where
+    // every transition advanced its progress with no curve applied.
+    t.easing = static_cast<TransitionEasing>(
+        obj["easing"].toInt(static_cast<int>(TransitionEasing::Linear)));
     return t;
 }
 
