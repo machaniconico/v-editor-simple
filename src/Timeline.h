@@ -10,6 +10,7 @@
 #include <QFileInfo>
 #include <QVector>
 #include <QMenu>
+#include <QElapsedTimer>
 #include "VideoEffect.h"
 #include "Keyframe.h"
 #include "WaveformGenerator.h"
@@ -36,6 +37,7 @@ enum class AutoProxyMode {
 };
 
 class UndoManager;
+class Timeline;
 class PlayheadOverlay;
 class TextStripWidget;
 struct TimelineState;
@@ -54,6 +56,10 @@ struct ClipInfo {
     double leadInSec = 0.0; // leading gap before the clip on the timeline, grows on left-trim to keep the right edge fixed
     double speed = 1.0;   // 0.25x - 4.0x
     double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
+    // Pro-NLE "rubber band" volume automation. Each point is (clip-local
+    // seconds, gain). Empty vector = static `volume` for the whole clip.
+    // Sorted by .time; AudioMixer evaluates via linear interpolation.
+    QVector<AudioGainPoint> volumeEnvelope;
     // Non-zero → clip is linked with every other clip that shares the same
     // linkGroup. Linked clips are selected together, dragged together, and
     // deleted together so V/A stays in AV sync. 0 = unlinked / standalone.
@@ -163,16 +169,33 @@ public:
     void setHidden(bool hidden) { m_hidden = hidden; update(); }
     bool isHidden() const { return m_hidden; }
 
+    static constexpr int SNAP_THRESHOLD = 8;
+
     // Edit lock. When locked, mousePressEvent early-returns before entering
     // any drag/trim/split mode and cross-track drops into this track are
     // rejected. The lock is a pure editing guard — playback is unaffected.
     void setLocked(bool locked) { m_locked = locked; update(); }
     bool isLocked() const { return m_locked; }
 
+    // Marks this widget as an audio row so the volume-envelope overlay
+    // (rubber band + draggable points) is only drawn / hit-tested on
+    // audio tracks. Set by Timeline at track-creation time.
+    void setIsAudioTrack(bool isAudio) { m_isAudioTrack = isAudio; update(); }
+    bool isAudioTrack() const { return m_isAudioTrack; }
+
+    // Global toggle for the per-clip volume envelope edit mode. When ON,
+    // audio rows draw the envelope and accept Alt+click / drag / Alt+right
+    // to add / move / remove points. The flag is process-wide so a single
+    // menu action in MainWindow flips every audio track at once.
+    static void setEnvelopeEditMode(bool on);
+    static bool envelopeEditMode();
+
     // Quietly mutate a clip's leadInSec (and optionally its next clip's
     // leadInSec) during a drag coordinated at the Timeline level. Does NOT
     // emit modified(); the drag owner batches a single save-undo on release.
     void applyDragMove(int clipIdx, double leadIn, double nextLeadIn);
+
+    void setTimeline(Timeline *t) { m_timeline = t; }
 
 signals:
     void clipClicked(int index);
@@ -180,6 +203,13 @@ signals:
     void emptyAreaClicked();
     void clipMoved(int fromIndex, int toIndex);
     void modified();
+    // Fired only at the end of a discrete user interaction (drag, trim,
+    // transition handle resize, envelope point edit). Timeline listens and
+    // calls saveUndoState(description) so Ctrl+Z reverts the WHOLE
+    // interaction, not the previous explicit-action snapshot. Distinct
+    // from `modified()` (which is a fan-out for any pixel change and
+    // would push hundreds of undo entries during a single drag).
+    void interactionCompleted(QString description);
     void seekRequested(double seconds);
     void rowHeightChanged(int newHeight);
     void clipContextMenuRequested(int clipIndex, const QPoint &globalPos);
@@ -216,6 +246,8 @@ private:
     // start. Used to compensate its gap during a MoveClip drag so downstream
     // clips don't slide when the user repositions a single clip. -1 = no next.
     double m_dragOriginalLeadInNext = -1.0;
+    // Screen-X of the dragged clip's left edge at drag start, used for snap.
+    int m_dragOriginalClipStartX = 0;
     bool m_snapEnabled = true;
     int m_dropTargetIndex = -1;
 
@@ -224,6 +256,10 @@ private:
     bool m_locked = false;
     bool m_solo = false;
     bool m_hidden = false;
+    bool m_isAudioTrack = false;
+    // Volume-envelope drag state. -1 = no drag in progress.
+    int m_envelopeDragClipIdx = -1;
+    int m_envelopeDragPointIdx = -1;
     int m_rowHeight = 50; // adjustable per-track via setRowHeight
     bool m_resizingHeight = false;
     int m_resizeStartY = 0;
@@ -233,9 +269,9 @@ private:
     int m_dropIndicatorX = -1;
     bool m_dropIndicatorValid = false;
     static constexpr int TRIM_HANDLE_WIDTH = 6;
-    static constexpr int SNAP_THRESHOLD = 8;
     static constexpr int RESIZE_HANDLE_HEIGHT = 6;
     static constexpr int CROSS_TRACK_DRAG_THRESHOLD = 10;
+    Timeline *m_timeline = nullptr;
 };
 
 class Timeline : public QWidget
@@ -265,6 +301,10 @@ public:
     // Snap
     void setSnapEnabled(bool enabled);
     bool snapEnabled() const;
+    qint64 findSnapTarget(qint64 candidateUs, int *outScreenX) const;
+    void triggerSnapLine(int screenX);
+    int snapLineX() const;
+    int snapLineAlpha() const;
 
     // Zoom
     void zoomIn();
@@ -281,6 +321,20 @@ public:
     // Multi-track
     void addVideoTrack();
     void addAudioTrack();
+    // Force every audio row to repaint. Used after global UI state changes
+    // (e.g. the volume-envelope edit-mode toggle) so the overlay flips
+    // visibility on every track at once.
+    void repaintAudioTracks();
+    // Pro-NLE-style auto-ducking. Treats every clip on `voiceTrackIdx` as
+    // a "voice" range and writes a per-clip volumeEnvelope on every OTHER
+    // audio track that overlaps the range so the BGM dips by `duckGain`
+    // (linear) for the duration of each voice clip, ramping in/out over
+    // attack/release seconds. Silently no-ops if voiceTrackIdx is out of
+    // range or that track has no clips.
+    void applyDuckingFromTrack(int voiceTrackIdx,
+                               double duckGain = 0.25,
+                               double attackSec = 0.20,
+                               double releaseSec = 0.40);
     int videoTrackCount() const { return m_videoTracks.size(); }
     int audioTrackCount() const { return m_audioTracks.size(); }
 
@@ -315,6 +369,11 @@ public:
     void toggleSoloTrack(int audioTrackIndex);
 
     void setPlayheadPosition(double seconds);
+    // Chase mode — re-centres the viewport on the playhead when it leaves
+    // the central 50% comfort band. Called automatically from
+    // setPlayheadPosition while the user isn't dragging the playhead bar
+    // (drag has its own pinning behaviour in resolvePlayheadDragX).
+    void ensurePlayheadVisible();
     double playheadPosition() const { return m_playheadPos; }
     double totalDuration() const;
     const QVector<ClipInfo> &videoClips() const {
@@ -407,7 +466,9 @@ private slots:
 private:
     void setupUI();
     void saveUndoState(const QString &description);
+public:
     void restoreState(const TimelineState &state);
+private:
     TimelineState currentState() const;
     void syncPlayheadOverlay();
     void updateInfoLabel();
@@ -504,6 +565,11 @@ private:
     void revertLinkedDragPartners();
     void clearLinkedDragState();
     void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime);
+
+    // Snap line visual feedback
+    int m_snapLineX = -1;
+    QElapsedTimer m_snapLineFadeTimer;
+    static constexpr int kSnapLineFadeMs = 200;
 };
 
 class PlayheadOverlay : public QWidget

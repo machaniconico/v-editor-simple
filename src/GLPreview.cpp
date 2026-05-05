@@ -131,7 +131,7 @@ uniform bool uLutEnabled;
 // 0=sRGB, 1=PQ, 2=HLG. Non-zero applies inverse EOTF + Hable tone map before grading.
 uniform int uHdrTransfer;
 
-// GPU Video Effects — run after CC. Sharpen/Mosaic/ChromaKey stay CPU.
+// GPU Video Effects — run after CC.
 uniform bool  uFxBlurEnable;
 uniform float uFxBlurRadius;   // pixels (shader clamps to a small box kernel)
 uniform vec2  uFxTexSize;      // texture pixel size for blur sampling
@@ -147,6 +147,13 @@ uniform bool  uFxVignetteEnable;
 uniform float uFxVignetteIntensity; // 0..1 strength
 uniform float uFxVignetteRadius;    // 0..1 inner radius
 uniform float uFxTime;         // seconds, seeds the noise hash
+uniform bool  uFxSharpenEnable;
+uniform float uFxSharpenAmount;  // 0..2.0
+uniform bool  uFxMosaicEnable;
+uniform float uFxMosaicSize;
+uniform bool  uFxChromaKeyEnable;
+uniform vec3  uFxChromaKey;
+uniform float uFxChromaTolerance;
 
 vec3 pqInverseEotf(vec3 E) {
     const float m1 = 0.1593017578125;
@@ -318,8 +325,28 @@ vec3 fxApplyVignette(vec3 color, vec2 uv) {
     return color * factor;
 }
 
+vec3 applySharpen(sampler2D tex, vec2 uv, vec2 texelSize, float amount) {
+    vec3 blurred = vec3(0.0);
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx)
+            blurred += texture(tex, uv + vec2(float(dx), float(dy)) * texelSize).rgb;
+    blurred /= 9.0;
+    vec3 color = texture(tex, uv).rgb;
+    return color + amount * (color - blurred);
+}
+
+vec2 applyMosaic(vec2 uv, float mosaicSize) {
+    float blockCount = max(2.0, 100.0 - mosaicSize);
+    return floor(uv * blockCount) / blockCount;
+}
+
+vec4 applyChromaKey(vec3 color, vec3 key, float tolerance) {
+    return vec4(color, smoothstep(tolerance, tolerance + 0.05, distance(color, key)));
+}
+
 void main() {
-    vec4 texColor = texture(uTexture, vTexCoord);
+    vec2 sampleUv = uFxMosaicEnable ? applyMosaic(vTexCoord, uFxMosaicSize) : vTexCoord;
+    vec4 texColor = texture(uTexture, sampleUv);
     vec3 color = uFxBlurEnable ? fxBlur(vTexCoord) : texColor.rgb;
 
     if (uHdrTransfer == 1) {
@@ -364,10 +391,15 @@ void main() {
     if (uFxSepiaEnable)    color = fxApplySepia(color, uFxSepiaStrength);
     if (uFxGrayEnable)     color = fxApplyGray(color, uFxGrayStrength);
     if (uFxInvertEnable)   color = fxApplyInvert(color, uFxInvertStrength);
-    if (uFxVignetteEnable) color = fxApplyVignette(color, vTexCoord);
-    if (uFxNoiseEnable)    color = fxApplyNoise(color, vTexCoord);
+    if (uFxVignetteEnable) color = fxApplyVignette(color, sampleUv);
+    if (uFxNoiseEnable)    color = fxApplyNoise(color, sampleUv);
+    if (uFxSharpenEnable)  color = applySharpen(uTexture, sampleUv, 1.0 / uFxTexSize, uFxSharpenAmount);
 
-    FragColor = vec4(clamp(color, 0.0, 1.0), texColor.a);
+    vec4 outColor = vec4(clamp(color, 0.0, 1.0), texColor.a);
+    if (uFxChromaKeyEnable)
+        outColor = applyChromaKey(outColor.rgb, uFxChromaKey, uFxChromaTolerance);
+
+    FragColor = outColor;
 }
 )";
 
@@ -780,6 +812,13 @@ void GLPreview::createShaderProgram()
     m_locFxVignetteEnable    = m_program->uniformLocation("uFxVignetteEnable");
     m_locFxVignetteIntensity = m_program->uniformLocation("uFxVignetteIntensity");
     m_locFxVignetteRadius    = m_program->uniformLocation("uFxVignetteRadius");
+    m_locFxSharpenEnable     = m_program->uniformLocation("uFxSharpenEnable");
+    m_locFxSharpenAmount     = m_program->uniformLocation("uFxSharpenAmount");
+    m_locFxMosaicEnable      = m_program->uniformLocation("uFxMosaicEnable");
+    m_locFxMosaicSize        = m_program->uniformLocation("uFxMosaicSize");
+    m_locFxChromaKeyEnable   = m_program->uniformLocation("uFxChromaKeyEnable");
+    m_locFxChromaKey         = m_program->uniformLocation("uFxChromaKey");
+    m_locFxChromaTolerance   = m_program->uniformLocation("uFxChromaTolerance");
     m_locFxTime              = m_program->uniformLocation("uFxTime");
 
     // Lift/Gamma/Gain
@@ -1235,10 +1274,13 @@ void GLPreview::paintGL()
 
     // Seed every Fx uniform to off/zero; enable only those found in m_videoEffects.
     bool  fxBlur = false, fxNoise = false, fxSepia = false;
-    bool  fxGray = false, fxInvert = false, fxVignette = false;
+    bool  fxGray = false, fxInvert = false, fxVignette = false, fxSharpen = false;
+    bool  fxMosaic = false, fxChromaKey = false;
     float fxBlurR = 0.0f, fxNoiseA = 0.0f, fxSepiaS = 0.0f;
     float fxGrayS = 0.0f, fxInvertS = 0.0f;
-    float fxVigI = 0.0f, fxVigR = 0.75f;
+    float fxVigI = 0.0f, fxVigR = 0.75f, fxSharpenA = 0.0f;
+    float fxMosaicSize = 0.0f, fxChromaTolerance = 0.0f;
+    QVector3D fxChromaKeyColor(0.0f, 1.0f, 0.0f);
     for (const VideoEffect &e : m_videoEffects) {
         if (!e.enabled) continue;
         switch (e.type) {
@@ -1267,8 +1309,23 @@ void GLPreview::paintGL()
             fxVigI = static_cast<float>(qBound(0.0, e.param1, 1.0));
             fxVigR = static_cast<float>(qBound(0.0, e.param2, 1.0));
             break;
+        case VideoEffectType::Sharpen:
+            fxSharpen = true;
+            fxSharpenA = static_cast<float>(qBound(0.0, e.param1, 2.0));
+            break;
+        case VideoEffectType::Mosaic:
+            fxMosaic = true;
+            fxMosaicSize = static_cast<float>(qBound(0.0, e.param1, 100.0));
+            break;
+        case VideoEffectType::ChromaKey:
+            fxChromaKey = true;
+            fxChromaKeyColor = QVector3D(static_cast<float>(e.keyColor.redF()),
+                                         static_cast<float>(e.keyColor.greenF()),
+                                         static_cast<float>(e.keyColor.blueF()));
+            fxChromaTolerance = static_cast<float>(qBound(0.0, e.param1, 255.0) / 255.0);
+            break;
         default:
-            break; // Sharpen/Mosaic/ChromaKey stay on the CPU fallback path.
+            break;
         }
     }
     m_program->setUniformValue(m_locFxBlurEnable, fxBlur);
@@ -1287,6 +1344,13 @@ void GLPreview::paintGL()
     m_program->setUniformValue(m_locFxVignetteEnable, fxVignette);
     m_program->setUniformValue(m_locFxVignetteIntensity, fxVigI);
     m_program->setUniformValue(m_locFxVignetteRadius, fxVigR);
+    m_program->setUniformValue(m_locFxSharpenEnable, fxSharpen);
+    m_program->setUniformValue(m_locFxSharpenAmount, fxSharpenA);
+    m_program->setUniformValue(m_locFxMosaicEnable, fxMosaic);
+    m_program->setUniformValue(m_locFxMosaicSize, fxMosaicSize);
+    m_program->setUniformValue(m_locFxChromaKeyEnable, fxChromaKey);
+    m_program->setUniformValue(m_locFxChromaKey, fxChromaKeyColor);
+    m_program->setUniformValue(m_locFxChromaTolerance, fxChromaTolerance);
     m_program->setUniformValue(m_locFxTime,
         static_cast<float>(QDateTime::currentMSecsSinceEpoch() % 1000000) / 1000.0f);
     m_program->setUniformValue(m_locBrightness,  static_cast<float>(m_cc.brightness));

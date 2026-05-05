@@ -5,6 +5,20 @@
 #include <QVector>
 #include "Overlay.h"
 
+// Volume automation point.
+//   time = clip-local TIMELINE-display seconds (0.0 == the entry's
+//          timelineStart, AFTER speed/trim are applied). Range = 0..effective
+//          duration. Final-Cut-style: speed changes stretch the envelope,
+//          trim moves the right edge so points beyond effDur clamp to the
+//          last gain. (Premiere uses source-time fixing, which we don't.)
+//   gain = linear multiplier (0.0 = silent, 1.0 = unity, 2.0 = +6 dB cap).
+// AudioMixer linearly interpolates between adjacent points; segments before
+// the first / after the last point clamp to that point's gain.
+struct AudioGainPoint {
+    double time = 0.0;
+    double gain = 1.0;
+};
+
 // Resolved playback descriptor used to communicate the timeline schedule from
 // Timeline to VideoPlayer. Independent from ClipInfo (which carries editor-side
 // metadata like waveforms, effects, keyframes) so VideoPlayer stays lean and
@@ -36,7 +50,13 @@ struct PlaybackEntry {
     TransitionType trailOutType = TransitionType::None;
     double trailOutDuration = 0.0;
     TransitionEasing trailOutEasing = TransitionEasing::Linear;
+
+    // Per-clip volume automation (the audio "rubber band" / pen-tool envelope
+    // in pro NLEs). Empty = use static `volume` for the whole clip; non-empty
+    // = AudioMixer interpolates between points using clip-local time.
+    QVector<AudioGainPoint> volumeEnvelope;
 };
 
+Q_DECLARE_METATYPE(AudioGainPoint)
 Q_DECLARE_METATYPE(PlaybackEntry)
 Q_DECLARE_METATYPE(QVector<PlaybackEntry>)

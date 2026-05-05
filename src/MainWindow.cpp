@@ -7,6 +7,8 @@
 #include "VideoEffectDialogs.h"
 #include "EffectPlugin.h"
 #include "ColorGradingPanel.h"
+#include "LumetriScopes.h"
+#include <QDockWidget>
 #include "GLPreview.h"
 #include "ProxyManager.h"
 #include "ProxyProgressDialog.h"
@@ -40,6 +42,8 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QDir>
+#include <cmath>
+#include "AudioMeterWidget.h"
 #include "GradientStopBar.h"
 #include <QPushButton>
 #include <QDialog>
@@ -140,12 +144,16 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_timeline->undoManager(), &UndoManager::stateChanged, this, [this]() {
         updateEditActions();
     });
+    connect(m_timeline->undoManager(), &UndoManager::stateJumpRequested,
+            m_timeline, &Timeline::restoreState);
 
     // Show welcome screen initially
     showWelcomeScreen();
 
     // Restore saved window state
     restoreWindowState();
+
+    rebuildAudioMeters();
 
     qInfo() << "MainWindow::ctor end";
 }
@@ -585,6 +593,115 @@ void MainWindow::setupMenuBar()
     auto *vstAction = audioMenu->addAction("VST / AUプラグイン...");
     connect(vstAction, &QAction::triggered, this, &MainWindow::openVSTPlugins);
 
+    audioMenu->addSeparator();
+
+    // Track EQ submenu — rebuilt on aboutToShow with one entry per
+    // audio track, each exposing the 5 built-in EQ presets.
+    auto *trackEqMenu = audioMenu->addMenu("Track EQ");
+    connect(trackEqMenu, &QMenu::aboutToShow, this, [this, trackEqMenu]() {
+        trackEqMenu->clear();
+        if (!m_timeline) return;
+        const int trackCount = m_timeline->audioTrackCount();
+        if (trackCount == 0) {
+            auto *info = trackEqMenu->addAction("オーディオトラックがありません");
+            info->setEnabled(false);
+            return;
+        }
+        const auto presets = AudioEQProcessor::presets();
+        auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+        for (int i = 0; i < trackCount; ++i) {
+            auto *trackSub = trackEqMenu->addMenu(QString("A%1").arg(i + 1));
+            for (const auto &preset : presets) {
+                auto *act = trackSub->addAction(preset.name);
+                const int ti = i;
+                const AudioEQConfig cfg = preset.config;
+                const QString presetName = preset.name;
+                connect(act, &QAction::triggered, this,
+                        [this, mixer, ti, cfg, presetName]() {
+                    if (mixer) {
+                        mixer->setTrackEqEnabled(ti, true);
+                        mixer->setTrackEqConfig(ti, cfg);
+                    }
+                    statusBar()->showMessage(
+                        QString("A%1 EQ → %2").arg(ti + 1).arg(presetName),
+                        3000);
+                });
+            }
+            trackSub->addSeparator();
+            auto *bypassAct = trackSub->addAction("Bypass / Reset");
+            const int ti2 = i;
+            connect(bypassAct, &QAction::triggered, this,
+                    [this, mixer, ti2]() {
+                if (mixer) {
+                    mixer->setTrackEqEnabled(ti2, false);
+                }
+                statusBar()->showMessage(
+                    QString("A%1 EQ bypassed").arg(ti2 + 1), 3000);
+           });
+        }
+    });
+
+    // Master Compressor dialog
+    auto *compressorAction = audioMenu->addAction("Master Compressor...");
+    connect(compressorAction, &QAction::triggered, this, &MainWindow::openMasterCompressor);
+
+    audioMenu->addSeparator();
+
+    // Pro-NLE "rubber band" volume envelope. When ON, every audio row
+    // overlays its per-clip envelope; left-click adds a point, drag moves
+    // it, right-click removes it. AudioMixer interpolates linearly.
+    auto *envelopeAction = audioMenu->addAction("ボリュームエンベロープ編集モード");
+    envelopeAction->setCheckable(true);
+    // Ctrl+Shift+E so we don't shadow the existing File→Export Ctrl+E.
+    envelopeAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_E));
+    connect(envelopeAction, &QAction::toggled, this,
+            [this](bool on) {
+                TimelineTrack::setEnvelopeEditMode(on);
+                if (m_timeline) m_timeline->repaintAudioTracks();
+            });
+
+    audioMenu->addSeparator();
+
+    // Pro-NLE auto-ducking. Submenu rebuilt on aboutToShow so newly added
+    // audio tracks appear without restart. Picking A<n> writes a -12 dB
+    // envelope on every other audio track that overlaps that track's
+    // clip ranges (200 ms attack / 400 ms release, Premiere defaults).
+    auto *duckMenu = audioMenu->addMenu("BGM 自動ダッキング");
+    connect(duckMenu, &QMenu::aboutToShow, this, [this, duckMenu]() {
+        duckMenu->clear();
+        if (!m_timeline) return;
+        const int n = m_timeline->audioTrackCount();
+        if (n < 2) {
+            auto *info = duckMenu->addAction("オーディオトラックを 2 本以上に増やしてください");
+            info->setEnabled(false);
+            return;
+        }
+        for (int i = 0; i < n; ++i) {
+            auto *act = duckMenu->addAction(
+                QString("A%1 を voice 扱いして他トラックをダッキング").arg(i + 1));
+            const int ti = i;
+            connect(act, &QAction::triggered, this, [this, ti]() {
+                if (!m_timeline) return;
+                auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+                if (mixer) {
+                    const auto &ad = mixer->autoDuckParams();
+                    const double duckGain = std::pow(10.0, ad.thresholdDb / 20.0);
+                    const double attackSec = ad.attackMs / 1000.0;
+                    const double releaseSec = ad.releaseMs / 1000.0;
+                    m_timeline->applyDuckingFromTrack(ti, duckGain, attackSec, releaseSec);
+                } else {
+                    m_timeline->applyDuckingFromTrack(ti);
+                }
+                statusBar()->showMessage(
+                    QString("A%1 を voice 扱いして他オーディオトラックをダッキングしました").arg(ti + 1),
+                    4000);
+            });
+        }
+    });
+
+    auto *duckSettingsAction = audioMenu->addAction("Auto-Duck Settings...");
+    connect(duckSettingsAction, &QAction::triggered, this, &MainWindow::openAutoDuckSettings);
+
     // マーカー メニュー
     auto *markersMenu = menuBar()->addMenu("マーカー(&K)");
 
@@ -608,6 +725,19 @@ void MainWindow::setupMenuBar()
     auto *fxAction = effectsMenu->addAction("ビデオエフェクト(&V)...");
     fxAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_F));
     connect(fxAction, &QAction::triggered, this, &MainWindow::videoEffects);
+
+    effectsMenu->addSeparator();
+
+    auto *sharpenFxAction = effectsMenu->addAction("シャープン...");
+    connect(sharpenFxAction, &QAction::triggered, this, &MainWindow::applySharpenEffect);
+
+    auto *mosaicFxAction = effectsMenu->addAction("モザイク...");
+    connect(mosaicFxAction, &QAction::triggered, this, &MainWindow::applyMosaicEffect);
+
+    auto *chromaFxAction = effectsMenu->addAction("クロマキー...");
+    connect(chromaFxAction, &QAction::triggered, this, &MainWindow::applyChromaKeyEffect);
+
+    effectsMenu->addSeparator();
 
     auto *pluginAction = effectsMenu->addAction("プラグインエフェクト(&P)...");
     connect(pluginAction, &QAction::triggered, this, &MainWindow::pluginEffects);
@@ -830,6 +960,45 @@ void MainWindow::setupMenuBar()
     colorPanelAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_G));
     connect(colorPanelAction, &QAction::toggled, m_colorGradingPanel, &QDockWidget::setVisible);
     connect(m_colorGradingPanel, &QDockWidget::visibilityChanged, colorPanelAction, &QAction::setChecked);
+
+    // Lumetri Scopes dock — Histogram + Luma Waveform + Vectorscope. Off
+    // by default so first-run users aren't paying CPU on scope math; the
+    // toggle action lives next to the colour grading panel for discovery.
+    auto *scopesDock = new QDockWidget("Lumetri Scopes", this);
+    auto *scopes = new LumetriScopes(scopesDock);
+    scopesDock->setWidget(scopes);
+    scopesDock->setObjectName("LumetriScopesDock");
+    addDockWidget(Qt::RightDockWidgetArea, scopesDock);
+    scopesDock->setVisible(false);
+    if (m_player)
+        connect(m_player, &VideoPlayer::frameComposited,
+                scopes, &LumetriScopes::setFrame);
+    auto *scopesAction = viewMenu->addAction("Lumetri Scopes(&L)");
+    scopesAction->setCheckable(true);
+    scopesAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_L));
+    connect(scopesAction, &QAction::toggled, scopesDock, &QDockWidget::setVisible);
+    connect(scopesDock, &QDockWidget::visibilityChanged, scopesAction, &QAction::setChecked);
+
+    // Audio Meters dock
+    m_audioMetersDock = new QDockWidget("Audio Meters", this);
+    m_audioMetersDock->setObjectName("AudioMetersDock");
+    addDockWidget(Qt::RightDockWidgetArea, m_audioMetersDock);
+    m_audioMetersDock->setVisible(true);
+    auto *audioMetersAction = viewMenu->addAction("Audio Meters");
+    audioMetersAction->setCheckable(true);
+    audioMetersAction->setChecked(true);
+    connect(audioMetersAction, &QAction::toggled, m_audioMetersDock, &QDockWidget::setVisible);
+    connect(m_audioMetersDock, &QDockWidget::visibilityChanged, audioMetersAction, &QAction::setChecked);
+
+    // History dock
+    m_historyDock = new HistoryDockWidget(m_timeline->undoManager(), this);
+    addDockWidget(Qt::RightDockWidgetArea, m_historyDock);
+    m_historyDock->setVisible(true);
+    auto *historyAction = viewMenu->addAction("History");
+    historyAction->setCheckable(true);
+    historyAction->setChecked(true);
+    connect(historyAction, &QAction::toggled, m_historyDock, &QDockWidget::setVisible);
+    connect(m_historyDock, &QDockWidget::visibilityChanged, historyAction, &QAction::setChecked);
 
     // 表示メニュー追加項目
     auto *themeAction = viewMenu->addAction("テーマ変更...");
@@ -1162,6 +1331,85 @@ void MainWindow::applyProjectConfig(const ProjectConfig &config)
         .arg(config.name).arg(config.resolutionLabel()).arg(config.fps));
 }
 
+void MainWindow::collectAudioState(ProjectData &data)
+{
+    if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
+        const int n = m_timeline ? m_timeline->audioTrackCount() : 0;
+        data.trackEqStates.resize(n);
+        for (int i = 0; i < n; ++i) {
+            AudioEQConfig cfg = mixer->trackEqConfig(i);
+            TrackEqState &s = data.trackEqStates[i];
+            s.trackIdx = i;
+            if (cfg.bands.size() > 0) {
+                s.low = cfg.bands[0].gain;
+                s.lowFreqHz = cfg.bands[0].frequency;
+            }
+            if (cfg.bands.size() > 1) {
+                s.mid = cfg.bands[1].gain;
+                s.midFreqHz = cfg.bands[1].frequency;
+            }
+            if (cfg.bands.size() > 2) {
+                s.high = cfg.bands[2].gain;
+                s.highFreqHz = cfg.bands[2].frequency;
+            }
+            s.qFactor = cfg.bands.isEmpty() ? 1.0 : cfg.bands[0].q;
+            s.enabled = !cfg.isDefault();
+        }
+        const auto &cp = mixer->compressorParams();
+        data.masterCompressor.thresholdDb = cp.thresholdDb;
+        data.masterCompressor.ratio = cp.ratio;
+        data.masterCompressor.attackMs = cp.attackMs;
+        data.masterCompressor.releaseMs = cp.releaseMs;
+        data.masterCompressor.makeupDb = cp.makeupDb;
+        data.masterCompressor.enabled = cp.enabled;
+
+        const auto &adParams = mixer->autoDuckParams();
+        data.autoDuck.thresholdDb = adParams.thresholdDb;
+        data.autoDuck.ratio = adParams.ratio;
+        data.autoDuck.attackMs = adParams.attackMs;
+        data.autoDuck.releaseMs = adParams.releaseMs;
+    }
+    data.audioMetersDockVisible = m_audioMetersDock ? m_audioMetersDock->isVisible() : true;
+}
+
+void MainWindow::applyAudioState(const ProjectData &data)
+{
+    if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
+        for (const auto &s : data.trackEqStates) {
+            AudioEQConfig cfg;
+            cfg.bands.resize(3);
+            cfg.bands[0].frequency = s.lowFreqHz;
+            cfg.bands[0].gain = s.low;
+            cfg.bands[0].q = s.qFactor;
+            cfg.bands[1].frequency = s.midFreqHz;
+            cfg.bands[1].gain = s.mid;
+            cfg.bands[1].q = s.qFactor;
+            cfg.bands[2].frequency = s.highFreqHz;
+            cfg.bands[2].gain = s.high;
+            cfg.bands[2].q = s.qFactor;
+            mixer->setTrackEqConfig(s.trackIdx, cfg);
+            mixer->setTrackEqEnabled(s.trackIdx, s.enabled);
+        }
+        AudioMixer::CompressorParams cp;
+        cp.thresholdDb = data.masterCompressor.thresholdDb;
+        cp.ratio = data.masterCompressor.ratio;
+        cp.attackMs = data.masterCompressor.attackMs;
+        cp.releaseMs = data.masterCompressor.releaseMs;
+        cp.makeupDb = data.masterCompressor.makeupDb;
+        cp.enabled = data.masterCompressor.enabled;
+        mixer->setCompressorParams(cp);
+
+        AudioMixer::AutoDuckParams adParams;
+        adParams.thresholdDb = data.autoDuck.thresholdDb;
+        adParams.ratio = data.autoDuck.ratio;
+        adParams.attackMs = data.autoDuck.attackMs;
+        adParams.releaseMs = data.autoDuck.releaseMs;
+        mixer->setAutoDuckParams(adParams);
+    }
+    if (m_audioMetersDock)
+        m_audioMetersDock->setVisible(data.audioMetersDockVisible);
+}
+
 void MainWindow::newProject()
 {
     ProjectSettingsDialog dialog(this);
@@ -1196,6 +1444,8 @@ void MainWindow::saveProject()
     data.markIn = m_timeline->markedIn();
     data.markOut = m_timeline->markedOut();
     data.zoomLevel = 10; // TODO: expose zoom level getter
+
+    collectAudioState(data);
 
     if (ProjectFile::save(m_projectFilePath, data)) {
         statusBar()->showMessage("Saved: " + m_projectFilePath);
@@ -1235,6 +1485,8 @@ void MainWindow::openProject()
     if (m_timeline)
         m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
             data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
+    rebuildAudioMeters();
+    applyAudioState(data);
     updateTitle();
     hideWelcomeScreen();
     updateStatusInfo();
@@ -1363,6 +1615,7 @@ void MainWindow::addVideoTrack()
 void MainWindow::addAudioTrack()
 {
     m_timeline->addAudioTrack();
+    rebuildAudioMeters();
     statusBar()->showMessage(QString("Added audio track A%1").arg(m_timeline->audioTrackCount()));
 }
 
@@ -3818,6 +4071,8 @@ void MainWindow::openRecentFile(const QString &filePath)
             if (m_timeline)
                 m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
                     data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
+            rebuildAudioMeters();
+            applyAudioState(data);
             m_projectFilePath = filePath;
             if (m_recentFilesManager)
                 m_recentFilesManager->addFile(filePath);
@@ -4029,6 +4284,8 @@ void MainWindow::saveWindowState()
     if (m_mainSplitter)
         settings.setValue("splitterState", m_mainSplitter->saveState());
     settings.setValue("theme", (int)ThemeManager::instance().currentTheme());
+    QSettings uiSettings("VSimpleEditor", "UI");
+    uiSettings.setValue("historyDockVisible", m_historyDock ? m_historyDock->isVisible() : true);
 }
 
 void MainWindow::restoreWindowState()
@@ -4049,6 +4306,10 @@ void MainWindow::restoreWindowState()
     if (settings.contains("theme")) {
         auto themeType = (ThemeType)settings.value("theme").toInt();
         ThemeManager::instance().applyTheme(themeType, this);
+    }
+    if (m_historyDock) {
+        QSettings uiSettings("VSimpleEditor", "UI");
+        m_historyDock->setVisible(uiSettings.value("historyDockVisible", true).toBool());
     }
 }
 
@@ -4087,6 +4348,8 @@ void MainWindow::dropEvent(QDropEvent *event)
                 if (m_timeline)
                     m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
                         data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
+                rebuildAudioMeters();
+                applyAudioState(data);
                 updateTitle();
                 hideWelcomeScreen();
                 updateStatusInfo();
@@ -4122,9 +4385,338 @@ void MainWindow::showEvent(QShowEvent *event)
     }
 }
 
+void MainWindow::rebuildAudioMeters()
+{
+    if (!m_audioMetersDock || !m_player)
+        return;
+
+    // Disconnect all existing meter connections before creating new ones
+    for (const auto &conn : m_meterConnections)
+        QObject::disconnect(conn);
+    m_meterConnections.clear();
+
+    const int n = m_timeline ? m_timeline->audioTrackCount() : 0;
+
+    QWidget *container = new QWidget();
+    QHBoxLayout *layout = new QHBoxLayout(container);
+    layout->setContentsMargins(4, 4, 4, 4);
+    layout->setSpacing(4);
+
+    for (int i = 0; i < n; ++i) {
+        QVBoxLayout *trackLayout = new QVBoxLayout();
+        trackLayout->setSpacing(2);
+
+        QLabel *label = new QLabel(QString("T%1").arg(i + 1));
+        label->setAlignment(Qt::AlignCenter);
+
+        AudioMeterWidget *meter = new AudioMeterWidget();
+        meter->setFixedWidth(20);
+
+        trackLayout->addWidget(label);
+        trackLayout->addWidget(meter);
+        layout->addLayout(trackLayout);
+
+        if (auto *mixer = m_player->audioMixer()) {
+            auto conn = connect(mixer, &AudioMixer::levelChanged, meter,
+                    [meter, i](int trackIdx, float pkL, float pkR, float rmsL, float rmsR) {
+                        if (trackIdx == i)
+                            meter->setLevels(pkL, pkR, rmsL, rmsR);
+                    });
+            m_meterConnections.append(conn);
+        }
+    }
+
+    if (n > 0) {
+        QFrame *sep = new QFrame();
+        sep->setFrameShape(QFrame::VLine);
+        layout->addWidget(sep);
+    }
+
+    // Master meter
+    QVBoxLayout *masterLayout = new QVBoxLayout();
+    masterLayout->setSpacing(2);
+
+    QLabel *masterLabel = new QLabel("Master");
+    masterLabel->setAlignment(Qt::AlignCenter);
+
+    AudioMeterWidget *masterMeter = new AudioMeterWidget();
+    masterMeter->setFixedWidth(20);
+
+    masterLayout->addWidget(masterLabel);
+    masterLayout->addWidget(masterMeter);
+    layout->addLayout(masterLayout);
+
+    if (auto *mixer = m_player->audioMixer()) {
+        auto conn = connect(mixer, &AudioMixer::masterLevelChanged, masterMeter,
+                &AudioMeterWidget::setLevels);
+        m_meterConnections.append(conn);
+    }
+
+    layout->addStretch();
+
+    QWidget *oldWidget = m_audioMetersDock->widget();
+    m_audioMetersDock->setWidget(container);
+    if (oldWidget)
+        oldWidget->deleteLater();
+}
+
 void MainWindow::closeEvent(QCloseEvent *event)
 {
     saveWindowState();
     if (m_autoSave) m_autoSave->markCleanShutdown();
     QMainWindow::closeEvent(event);
+}
+
+// --- Effects menu quick-access for Sharpen / Mosaic / ChromaKey ---
+
+void MainWindow::applySharpenEffect()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Sharpen", "Select a clip first.");
+        return;
+    }
+    auto effects = m_timeline->clipEffects();
+    effects.append(VideoEffect::createSharpen());
+    m_timeline->setClipEffects(effects);
+    if (m_player)
+        m_player->setPreviewEffects(effects, true);
+    statusBar()->showMessage("シャープンを適用しました", 3000);
+}
+
+void MainWindow::applyMosaicEffect()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Mosaic", "Select a clip first.");
+        return;
+    }
+    auto effects = m_timeline->clipEffects();
+    effects.append(VideoEffect::createMosaic());
+    m_timeline->setClipEffects(effects);
+    if (m_player)
+        m_player->setPreviewEffects(effects, true);
+    statusBar()->showMessage("モザイクを適用しました", 3000);
+}
+
+void MainWindow::applyChromaKeyEffect()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Chroma Key", "Select a clip first.");
+        return;
+    }
+    auto effects = m_timeline->clipEffects();
+    effects.append(VideoEffect::createChromaKey());
+    m_timeline->setClipEffects(effects);
+    if (m_player)
+        m_player->setPreviewEffects(effects, true);
+    statusBar()->showMessage("クロマキーを適用しました", 3000);
+}
+
+// --- Master Compressor inline dialog ---
+
+void MainWindow::openMasterCompressor()
+{
+    auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    if (!mixer) {
+        QMessageBox::information(this, "Compressor", "Audio mixer unavailable.");
+        return;
+    }
+
+    const AudioMixer::CompressorParams current = mixer->compressorParams();
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("Master Compressor");
+    auto *form = new QFormLayout(&dlg);
+
+    // Threshold
+    auto *thresholdSlider = new QSlider(Qt::Horizontal, &dlg);
+    thresholdSlider->setRange(-30, 0);
+    thresholdSlider->setValue(static_cast<int>(current.thresholdDb));
+    auto *thresholdSpin = new QSpinBox(&dlg);
+    thresholdSpin->setRange(-30, 0);
+    thresholdSpin->setSuffix(" dB");
+    thresholdSpin->setValue(static_cast<int>(current.thresholdDb));
+    connect(thresholdSlider, &QSlider::valueChanged, thresholdSpin, &QSpinBox::setValue);
+    connect(thresholdSpin, QOverload<int>::of(&QSpinBox::valueChanged),
+            thresholdSlider, &QSlider::setValue);
+    auto *thresholdRow = new QHBoxLayout();
+    thresholdRow->addWidget(thresholdSlider);
+    thresholdRow->addWidget(thresholdSpin);
+    form->addRow("Threshold", thresholdRow);
+
+    // Ratio
+    auto *ratioSlider = new QSlider(Qt::Horizontal, &dlg);
+    ratioSlider->setRange(10, 200); // 1.0–20.0 × 10
+    ratioSlider->setValue(static_cast<int>(current.ratio * 10.0));
+    auto *ratioSpin = new QDoubleSpinBox(&dlg);
+    ratioSpin->setRange(1.0, 20.0);
+    ratioSpin->setSingleStep(0.5);
+    ratioSpin->setDecimals(1);
+    ratioSpin->setSuffix(" :1");
+    ratioSpin->setValue(current.ratio);
+    connect(ratioSlider, &QSlider::valueChanged, this,
+            [ratioSpin](int v) { ratioSpin->setValue(v / 10.0); });
+    connect(ratioSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [ratioSlider](double v) { ratioSlider->setValue(static_cast<int>(v * 10.0)); });
+    auto *ratioRow = new QHBoxLayout();
+    ratioRow->addWidget(ratioSlider);
+    ratioRow->addWidget(ratioSpin);
+    form->addRow("Ratio", ratioRow);
+
+    // Attack
+    auto *attackSlider = new QSlider(Qt::Horizontal, &dlg);
+    attackSlider->setRange(1, 100);
+    attackSlider->setValue(static_cast<int>(current.attackMs));
+    auto *attackSpin = new QDoubleSpinBox(&dlg);
+    attackSpin->setRange(1.0, 100.0);
+    attackSpin->setSingleStep(1.0);
+    attackSpin->setDecimals(1);
+    attackSpin->setSuffix(" ms");
+    attackSpin->setValue(current.attackMs);
+    connect(attackSlider, &QSlider::valueChanged, this,
+            [attackSpin](int v) { attackSpin->setValue(static_cast<double>(v)); });
+    connect(attackSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [attackSlider](double v) { attackSlider->setValue(static_cast<int>(v)); });
+    auto *attackRow = new QHBoxLayout();
+    attackRow->addWidget(attackSlider);
+    attackRow->addWidget(attackSpin);
+    form->addRow("Attack", attackRow);
+
+    // Release
+    auto *releaseSlider = new QSlider(Qt::Horizontal, &dlg);
+    releaseSlider->setRange(10, 1000);
+    releaseSlider->setValue(static_cast<int>(current.releaseMs));
+    auto *releaseSpin = new QDoubleSpinBox(&dlg);
+    releaseSpin->setRange(10.0, 1000.0);
+    releaseSpin->setSingleStep(10.0);
+    releaseSpin->setDecimals(0);
+    releaseSpin->setSuffix(" ms");
+    releaseSpin->setValue(current.releaseMs);
+    connect(releaseSlider, &QSlider::valueChanged, this,
+            [releaseSpin](int v) { releaseSpin->setValue(static_cast<double>(v)); });
+    connect(releaseSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [releaseSlider](double v) { releaseSlider->setValue(static_cast<int>(v)); });
+    auto *releaseRow = new QHBoxLayout();
+    releaseRow->addWidget(releaseSlider);
+    releaseRow->addWidget(releaseSpin);
+    form->addRow("Release", releaseRow);
+
+    // Makeup gain
+    auto *makeupSlider = new QSlider(Qt::Horizontal, &dlg);
+    makeupSlider->setRange(0, 18);
+    makeupSlider->setValue(static_cast<int>(current.makeupDb));
+    auto *makeupSpin = new QDoubleSpinBox(&dlg);
+    makeupSpin->setRange(0.0, 18.0);
+    makeupSpin->setSingleStep(0.5);
+    makeupSpin->setDecimals(1);
+    makeupSpin->setSuffix(" dB");
+    makeupSpin->setValue(current.makeupDb);
+    connect(makeupSlider, &QSlider::valueChanged, this,
+            [makeupSpin](int v) { makeupSpin->setValue(static_cast<double>(v)); });
+    connect(makeupSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [makeupSlider](double v) { makeupSlider->setValue(static_cast<int>(v)); });
+    auto *makeupRow = new QHBoxLayout();
+    makeupRow->addWidget(makeupSlider);
+    makeupRow->addWidget(makeupSpin);
+    form->addRow("Makeup Gain", makeupRow);
+
+    // Enable checkbox
+    auto *enableCheck = new QCheckBox("Enable Compressor", &dlg);
+    enableCheck->setChecked(current.enabled);
+    form->addRow(enableCheck);
+
+    auto *buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+
+    if (dlg.exec() == QDialog::Accepted) {
+        AudioMixer::CompressorParams params;
+        params.thresholdDb = static_cast<double>(thresholdSpin->value());
+        params.ratio = ratioSpin->value();
+        params.attackMs = attackSpin->value();
+        params.releaseMs = releaseSpin->value();
+        params.makeupDb = makeupSpin->value();
+        params.enabled = enableCheck->isChecked();
+        mixer->setCompressorParams(params);
+        statusBar()->showMessage(
+            QString("Compressor %1 (threshold %2 dB, ratio %3:1)")
+                .arg(params.enabled ? "ON" : "OFF")
+                .arg(params.thresholdDb, 0, 'f', 0)
+                .arg(params.ratio, 0, 'f', 1),
+            4000);
+    }
+}
+
+void MainWindow::openAutoDuckSettings()
+{
+    auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    if (!mixer) {
+        QMessageBox::information(this, "Auto-Duck", "Audio mixer unavailable.");
+        return;
+    }
+
+    const AudioMixer::AutoDuckParams current = mixer->autoDuckParams();
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("Auto-Duck Settings");
+    auto *form = new QFormLayout(&dlg);
+
+    // Threshold
+    auto *thresholdSpin = new QDoubleSpinBox(&dlg);
+    thresholdSpin->setRange(-60.0, 0.0);
+    thresholdSpin->setSingleStep(1.0);
+    thresholdSpin->setDecimals(1);
+    thresholdSpin->setSuffix(" dB");
+    thresholdSpin->setValue(current.thresholdDb);
+    form->addRow("Threshold", thresholdSpin);
+
+    // Ratio
+    auto *ratioSpin = new QDoubleSpinBox(&dlg);
+    ratioSpin->setRange(1.0, 20.0);
+    ratioSpin->setSingleStep(0.5);
+    ratioSpin->setDecimals(1);
+    ratioSpin->setSuffix(" :1");
+    ratioSpin->setValue(current.ratio);
+    form->addRow("Ratio", ratioSpin);
+
+    // Attack
+    auto *attackSpin = new QDoubleSpinBox(&dlg);
+    attackSpin->setRange(0.1, 5000.0);
+    attackSpin->setSingleStep(1.0);
+    attackSpin->setDecimals(1);
+    attackSpin->setSuffix(" ms");
+    attackSpin->setValue(current.attackMs);
+    form->addRow("Attack", attackSpin);
+
+    // Release
+    auto *releaseSpin = new QDoubleSpinBox(&dlg);
+    releaseSpin->setRange(1.0, 10000.0);
+    releaseSpin->setSingleStep(10.0);
+    releaseSpin->setDecimals(0);
+    releaseSpin->setSuffix(" ms");
+    releaseSpin->setValue(current.releaseMs);
+    form->addRow("Release", releaseSpin);
+
+    auto *buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+
+    if (dlg.exec() == QDialog::Accepted) {
+        AudioMixer::AutoDuckParams params;
+        params.thresholdDb = thresholdSpin->value();
+        params.ratio = ratioSpin->value();
+        params.attackMs = attackSpin->value();
+        params.releaseMs = releaseSpin->value();
+        mixer->setAutoDuckParams(params);
+        statusBar()->showMessage(
+            QString("Auto-Duck: threshold %1 dB, ratio %2:1, attack %3 ms, release %4 ms")
+                .arg(params.thresholdDb, 0, 'f', 1)
+                .arg(params.ratio, 0, 'f', 1)
+                .arg(params.attackMs, 0, 'f', 1)
+                .arg(params.releaseMs, 0, 'f', 0),
+            4000);
+    }
 }

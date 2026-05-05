@@ -30,7 +30,7 @@ public:
     // 0 = none (SDR sRGB), 1 = PQ (SMPTE ST 2084), 2 = HLG (ARIB STD-B67)
     void setHdrTransfer(int transfer);
     int hdrTransfer() const { return m_hdrTransfer; }
-    // GPU-side stack: handles Blur/Noise/Sepia/Grayscale/Invert/Vignette.
+    // GPU-side stack: handles Blur/Sharpen/Noise/Sepia/Grayscale/Invert/Vignette.
     void setVideoEffects(const QVector<VideoEffect> &effects);
     void setEffectsEnabled(bool enabled) { m_effectsEnabled = enabled; update(); }
     bool effectsEnabled() const { return m_effectsEnabled; }
@@ -273,6 +273,9 @@ private:
     int m_locFxGrayEnable = -1,  m_locFxGrayStrength = -1;
     int m_locFxInvertEnable = -1, m_locFxInvertStrength = -1;
     int m_locFxVignetteEnable = -1, m_locFxVignetteIntensity = -1, m_locFxVignetteRadius = -1;
+    int m_locFxSharpenEnable = -1, m_locFxSharpenAmount = -1;
+    int m_locFxMosaicEnable = -1, m_locFxMosaicSize = -1;
+    int m_locFxChromaKeyEnable = -1, m_locFxChromaKey = -1, m_locFxChromaTolerance = -1;
     int m_locFxTime = -1;
     QImage::Format m_textureFormat = QImage::Format_Invalid;
 

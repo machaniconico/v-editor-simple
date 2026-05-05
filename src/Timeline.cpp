@@ -20,7 +20,35 @@ inline int transBadgeWidth(double durSec, double pps, int clipWidth) {
     return qBound(kTransBadgeMinW, desired,
                   qMin(kTransBadgeMaxW, clipWidth - 4));
 }
+
+// Volume-envelope (rubber-band) overlay state. Process-wide because the
+// MainWindow menu toggle flips every audio row at once. Default OFF — the
+// envelope is only drawn / hit-tested when the user opts in, so existing
+// audio clip interaction (drag, trim, transition badge) is unchanged.
+bool g_envelopeEditMode = false;
+constexpr int kEnvelopePointRadiusPx = 5;
+constexpr double kEnvelopeMaxGain = 2.0;     // matches ClipInfo::volume cap
+constexpr double kEnvelopeHitRadiusPx = 5.0; // mouse hit radius for points
+
+// Map a clip-local time + gain to widget pixel coords. The clipRect's top
+// row is gain=2.0 (max), the bottom row is gain=0.0; gain=1.0 sits at the
+// vertical centre. Time is laid out at the track pps.
+inline double envelopeGainToY(double gain, int rowHeight) {
+    const double clamped = qBound(0.0, gain, kEnvelopeMaxGain);
+    return rowHeight * (1.0 - clamped / kEnvelopeMaxGain);
+}
+inline double envelopeYToGain(double y, int rowHeight) {
+    if (rowHeight <= 0) return 1.0;
+    const double t = qBound(0.0, 1.0 - y / static_cast<double>(rowHeight), 1.0);
+    return t * kEnvelopeMaxGain;
+}
 } // namespace
+
+// Definitions for the static envelope-mode getters declared in Timeline.h.
+// Implemented out-of-line so the anonymous-namespace flag stays a single
+// translation-unit-local symbol.
+void TimelineTrack::setEnvelopeEditMode(bool on) { g_envelopeEditMode = on; }
+bool TimelineTrack::envelopeEditMode() { return g_envelopeEditMode; }
 
 // Small strip drawn above the V/A tracks that visualizes each text
 // overlay's time range as a rounded rectangle with the (truncated) overlay
@@ -946,65 +974,15 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
             }
             return "";
         };
+        // Single colour for every transition type. The badge abbreviation
+        // (Fi / X / WL / ...) already encodes the type, so the colour's job
+        // is to mark the badge as a *transition* and keep it visually
+        // distinct from the effect indicators (purple bar / green clip
+        // body). Amber sits in the warm half of the wheel where neither of
+        // those reside, so transitions read as their own category.
         auto transitionColor = [](TransitionType type) -> QColor {
-            switch (type) {
-                case TransitionType::FadeIn:
-                case TransitionType::FadeOut:
-                    return QColor(255, 200, 80);   // amber
-                case TransitionType::CrossDissolve:
-                case TransitionType::DipToBlack:
-                case TransitionType::DipToWhite:
-                case TransitionType::FilmDissolve:
-                case TransitionType::DitherDissolve:
-                case TransitionType::BlurDissolve:
-                case TransitionType::Pixelate:
-                    return QColor(190, 140, 245);  // purple — dissolves
-                case TransitionType::WipeLeft:
-                case TransitionType::WipeRight:
-                case TransitionType::WipeUp:
-                case TransitionType::WipeDown:
-                case TransitionType::ClockWipe:
-                case TransitionType::ClockWipeCCW:
-                case TransitionType::BarnDoorHorizontal:
-                case TransitionType::BarnDoorVertical:
-                case TransitionType::BarnDoorHClose:
-                case TransitionType::BarnDoorVClose:
-                    return QColor(120, 220, 240);  // cyan — wipes
-                case TransitionType::SlideLeft:
-                case TransitionType::SlideRight:
-                case TransitionType::SlideUp:
-                case TransitionType::SlideDown:
-                    return QColor(255, 140, 200);  // pink — slides
-                case TransitionType::PushLeft:
-                case TransitionType::PushRight:
-                case TransitionType::PushUp:
-                case TransitionType::PushDown:
-                case TransitionType::WhipPanLeft:
-                case TransitionType::WhipPanRight:
-                    return QColor(255, 175, 100); // peach — push / whip (kin to slide)
-                case TransitionType::CrossZoom:
-                    return QColor(255, 110, 110); // red — zoom (energetic)
-                case TransitionType::SpinCW:
-                case TransitionType::SpinCCW:
-                case TransitionType::FlipHorizontal:
-                case TransitionType::FlipVertical:
-                case TransitionType::CameraShake:
-                    return QColor(255, 235, 90); // yellow — spin / flip / shake (motion)
-                case TransitionType::Glitch:
-                case TransitionType::ColorChannelShift:
-                    return QColor(220, 80, 240); // magenta — glitch / channel shift (digital)
-                case TransitionType::LightLeak:
-                case TransitionType::LensFlare:
-                case TransitionType::FilmBurn:
-                    return QColor(255, 200, 120); // amber — leak / flare / burn (warm optical)
-                case TransitionType::IrisRound:
-                case TransitionType::IrisBox:
-                case TransitionType::IrisRoundClose:
-                case TransitionType::IrisBoxClose:
-                    return QColor(150, 230, 150);  // green — iris
-                default:
-                    return QColor(255, 200, 80);
-            }
+            Q_UNUSED(type);
+            return QColor(255, 200, 80);
         };
         auto paintTransitionBadge = [&](const Transition &t, int badgeX, bool handleOnRight) {
             if (t.type == TransitionType::None) return;
@@ -1060,6 +1038,55 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
                                  x + clipWidth - badgeW - 2,
                                  /*handleOnRight*/ false);
         }
+
+        // Volume-envelope (rubber band) overlay. Drawn on top of the
+        // waveform so the line is always legible. Active only on audio
+        // rows when the user has flipped the global edit-mode toggle.
+        if (m_isAudioTrack && g_envelopeEditMode) {
+            const auto &env = m_clips[i].volumeEnvelope;
+            const double effDur = m_clips[i].effectiveDuration();
+            if (effDur > 0.0) {
+                if (env.isEmpty()) {
+                    // No automation yet — show a dashed reference line at
+                    // the static volume so the user can see where a click
+                    // would land.
+                    const double y = envelopeGainToY(m_clips[i].volume, m_rowHeight);
+                    painter.setPen(QPen(QColor(255, 215, 60, 130), 1, Qt::DashLine));
+                    painter.drawLine(QPointF(x, y), QPointF(x + clipWidth, y));
+                } else {
+                    // Polyline through the envelope points, with implicit
+                    // endpoints clamped to the first / last gain so the line
+                    // spans the whole clip even when only interior points
+                    // are authored.
+                    QVector<QPointF> pts;
+                    pts.reserve(env.size() + 2);
+                    pts.append(QPointF(x,
+                                       envelopeGainToY(env.first().gain, m_rowHeight)));
+                    for (const auto &p : env) {
+                        const double frac = qBound(0.0, p.time / effDur, 1.0);
+                        pts.append(QPointF(x + frac * clipWidth,
+                                           envelopeGainToY(p.gain, m_rowHeight)));
+                    }
+                    pts.append(QPointF(x + clipWidth,
+                                       envelopeGainToY(env.last().gain, m_rowHeight)));
+
+                    painter.setPen(QPen(QColor(255, 215, 60, 230), 2));
+                    for (int k = 0; k + 1 < pts.size(); ++k)
+                        painter.drawLine(pts[k], pts[k + 1]);
+
+                    // Solid white circles for each authored point. The two
+                    // synthetic endpoints (indices 0 and last) are not drawn
+                    // because they aren't editable.
+                    painter.setBrush(QColor(255, 255, 255));
+                    painter.setPen(QPen(QColor(40, 30, 0), 1));
+                    for (int k = 1; k + 1 < pts.size(); ++k) {
+                        painter.drawEllipse(pts[k],
+                                            kEnvelopePointRadiusPx,
+                                            kEnvelopePointRadiusPx);
+                    }
+                }
+            }
+        }
         x += clipWidth;
     }
 
@@ -1091,6 +1118,16 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
     // Resize handle hint at the bottom edge of the track. A faint horizontal
     // bar tells the user the row height can be dragged here.
     painter.fillRect(0, height() - 2, width(), 2, QColor(70, 70, 70));
+
+    // Snap line visual feedback — yellow vertical line fading over 200 ms.
+    if (m_timeline) {
+        const int sx = m_timeline->snapLineX();
+        if (sx >= 0) {
+            const int alpha = m_timeline->snapLineAlpha();
+            painter.setPen(QPen(QColor(255, 220, 0, alpha), 1));
+            painter.drawLine(sx, 0, sx, m_rowHeight);
+        }
+    }
 }
 
 void TimelineTrack::mousePressEvent(QMouseEvent *event)
@@ -1114,6 +1151,99 @@ void TimelineTrack::mousePressEvent(QMouseEvent *event)
         grabMouse();
         event->accept();
         return;
+    }
+
+    // Volume-envelope edit mode hijacks audio-row mouse handling so the
+    // existing trim/drag/transition flows aren't shadowed by the rubber
+    // band overlay. Strict opt-in via the audio menu — when OFF this whole
+    // block is skipped and behaviour is identical to before.
+    if (g_envelopeEditMode && m_isAudioTrack
+        && (event->button() == Qt::LeftButton || event->button() == Qt::RightButton)) {
+        const QPoint pos = event->pos();
+        const int idx = clipAtX(pos.x());
+        if (idx >= 0 && idx < m_clips.size()) {
+            ClipInfo &clip = m_clips[idx];
+            const double effDur = clip.effectiveDuration();
+            if (effDur > 0.0) {
+                const int clipStartXpx = clipStartX(idx);
+                const int clipWidth = qMax(20, static_cast<int>(
+                    qMin<double>(2000000.0, effDur * m_pixelsPerSecond)));
+                const double localPx = pos.x() - clipStartXpx;
+                if (localPx >= 0.0 && localPx <= clipWidth) {
+                    int hitPt = -1;
+                    for (int k = 0; k < clip.volumeEnvelope.size(); ++k) {
+                        const auto &pt = clip.volumeEnvelope[k];
+                        const double frac = qBound(0.0, pt.time / effDur, 1.0);
+                        const double px = frac * clipWidth;
+                        const double py = envelopeGainToY(pt.gain, m_rowHeight);
+                        const double dx = localPx - px;
+                        const double dy = pos.y() - py;
+                        if (dx * dx + dy * dy
+                            <= kEnvelopeHitRadiusPx * kEnvelopeHitRadiusPx) {
+                            hitPt = k;
+                            break;
+                        }
+                    }
+                    // Hit on an existing point always wins — that's the
+                    // grab gesture. ADD/DELETE for empty space requires the
+                    // Alt modifier so normal clip drag / context-menu /
+                    // selection still work while the envelope overlay is on.
+                    const bool altHeld = event->modifiers() & Qt::AltModifier;
+                    if (event->button() == Qt::RightButton) {
+                        if (hitPt >= 0) {
+                            clip.volumeEnvelope.remove(hitPt);
+                            update();
+                            emit modified();
+                            event->accept();
+                            return;
+                        }
+                        // No point hit — fall through to the regular
+                        // right-click context-menu path so users can still
+                        // open the clip menu while envelope mode is on.
+                    } else { // Left button
+                        if (hitPt >= 0) {
+                            m_envelopeDragClipIdx = idx;
+                            m_envelopeDragPointIdx = hitPt;
+                            event->accept();
+                            return;
+                        }
+                        if (altHeld) {
+                            // Avoid stealing clicks from the transition badge
+                            // resize handle: the handle hit-test lives in
+                            // the kTransBadgeYTop..YBot Y band, so we only
+                            // ADD when either the click is below that band
+                            // or the clip has no transition badge at all.
+                            const bool inBadgeBand =
+                                (pos.y() >= kTransBadgeYTop
+                                 && pos.y() <= kTransBadgeYBot);
+                            const bool clipHasTrans =
+                                (clip.leadIn.type != TransitionType::None
+                                 || clip.trailOut.type != TransitionType::None);
+                            if (!(inBadgeBand && clipHasTrans)) {
+                                AudioGainPoint np;
+                                np.time = qBound(0.0,
+                                    (localPx / clipWidth) * effDur, effDur);
+                                np.gain = envelopeYToGain(pos.y(), m_rowHeight);
+                                int insertAt = 0;
+                                while (insertAt < clip.volumeEnvelope.size()
+                                       && clip.volumeEnvelope[insertAt].time <= np.time) {
+                                    ++insertAt;
+                                }
+                                clip.volumeEnvelope.insert(insertAt, np);
+                                m_envelopeDragClipIdx = idx;
+                                m_envelopeDragPointIdx = insertAt;
+                                update();
+                                emit modified();
+                                event->accept();
+                                return;
+                            }
+                        }
+                        // No hit, no Alt — fall through to normal clip
+                        // selection / drag so the row remains editable.
+                    }
+                }
+            }
+        }
     }
 
     const bool additive = event->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier);
@@ -1216,6 +1346,7 @@ void TimelineTrack::mousePressEvent(QMouseEvent *event)
             m_dragMode = DragMode::MoveClip; m_dragClipIndex = clickedClip;
             m_dragStartX = event->pos().x();
             m_dragOriginalLeadIn = m_clips[clickedClip].leadInSec;
+            m_dragOriginalClipStartX = clipStartX(clickedClip);
             m_dragOriginalLeadInNext = (clickedClip + 1 < m_clips.size())
                 ? m_clips[clickedClip + 1].leadInSec
                 : -1.0;
@@ -1240,6 +1371,42 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
         if (newH != m_rowHeight) {
             setRowHeight(newH);
             emit rowHeightChanged(newH);
+        }
+        event->accept();
+        return;
+    }
+    if (m_envelopeDragClipIdx >= 0 && m_envelopeDragPointIdx >= 0
+        && m_envelopeDragClipIdx < m_clips.size()) {
+        ClipInfo &clip = m_clips[m_envelopeDragClipIdx];
+        if (m_envelopeDragPointIdx < clip.volumeEnvelope.size()) {
+            const double effDur = clip.effectiveDuration();
+            if (effDur > 0.0) {
+                const int clipStartXpx = clipStartX(m_envelopeDragClipIdx);
+                const int clipWidth = qMax(20, static_cast<int>(
+                    qMin<double>(2000000.0, effDur * m_pixelsPerSecond)));
+                const double localPx = qBound(0.0,
+                    static_cast<double>(event->pos().x() - clipStartXpx),
+                    static_cast<double>(clipWidth));
+                double newTime = qBound(0.0, (localPx / clipWidth) * effDur, effDur);
+                // Clamp to neighbours: cannot cross prev/next keyframe.
+                // Find the closest points on either side (excluding the one
+                // being dragged) and enforce a 1 ms minimum gap.
+                double prevTime = 0.0;
+                double nextTime = effDur;
+                for (int k = 0; k < clip.volumeEnvelope.size(); ++k) {
+                    if (k == m_envelopeDragPointIdx) continue;
+                    const double t = clip.volumeEnvelope[k].time;
+                    if (t <= newTime && t > prevTime) prevTime = t;
+                    if (t >= newTime && t < nextTime) nextTime = t;
+                }
+                if (prevTime > 0.0) prevTime += 0.001; // 1 ms after prev
+                if (nextTime < effDur) nextTime -= 0.001; // 1 ms before next
+                clip.volumeEnvelope[m_envelopeDragPointIdx].time =
+                    qBound(prevTime, newTime, nextTime);
+                clip.volumeEnvelope[m_envelopeDragPointIdx].gain =
+                    envelopeYToGain(event->pos().y(), m_rowHeight);
+                update();
+            }
         }
         event->accept();
         return;
@@ -1307,7 +1474,25 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
         // (including this one) so the V/A pair stays locked together even
         // when each track has different clamp room.
         const int dx = event->pos().x() - m_dragStartX;
-        const double rawDeltaSec = static_cast<double>(dx) / m_pixelsPerSecond;
+        int adjustedDx = dx;
+
+        // Snap: adjust delta so the clip's left edge magnetises to the
+        // nearest target (other clip edges, playhead, t=0).
+        if (m_snapEnabled && m_timeline) {
+            const int candidateX = m_dragOriginalClipStartX + dx;
+            const double candidateSec = static_cast<double>(candidateX) / m_pixelsPerSecond;
+            const qint64 candidateUs = static_cast<qint64>(candidateSec * 1e6);
+            int snapScreenX = 0;
+            const qint64 snappedUs = m_timeline->findSnapTarget(candidateUs, &snapScreenX);
+            if (snappedUs != candidateUs) {
+                const double snappedSec = static_cast<double>(snappedUs) / 1e6;
+                const int snappedX = static_cast<int>(snappedSec * m_pixelsPerSecond);
+                adjustedDx = snappedX - m_dragOriginalClipStartX;
+                m_timeline->triggerSnapLine(snapScreenX);
+            }
+        }
+
+        const double rawDeltaSec = static_cast<double>(adjustedDx) / m_pixelsPerSecond;
         const int linkGroup = m_clips[m_dragClipIndex].linkGroup;
         if (linkGroup > 0) {
             emit linkedDragDelta(m_dragClipIndex, rawDeltaSec);
@@ -1460,14 +1645,39 @@ void TimelineTrack::mouseReleaseEvent(QMouseEvent *event)
         if (event) event->accept();
         return;
     }
+    if (m_envelopeDragClipIdx >= 0 && m_envelopeDragPointIdx >= 0
+        && m_envelopeDragClipIdx < m_clips.size()) {
+        ClipInfo &clip = m_clips[m_envelopeDragClipIdx];
+        if (m_envelopeDragPointIdx < clip.volumeEnvelope.size()) {
+            // The dragged point may have crossed neighbours during the move
+            // — re-sort so the AudioMixer evaluator's monotonic-time
+            // assumption holds.
+            std::sort(clip.volumeEnvelope.begin(), clip.volumeEnvelope.end(),
+                      [](const AudioGainPoint &a, const AudioGainPoint &b) {
+                          return a.time < b.time;
+                      });
+        }
+        m_envelopeDragClipIdx = -1;
+        m_envelopeDragPointIdx = -1;
+        update();
+        emit modified();
+        emit interactionCompleted(QStringLiteral("Move volume keyframe"));
+        if (event) event->accept();
+        return;
+    }
     if (m_dragMode == DragMode::MoveClip
         && m_dragClipIndex >= 0 && m_dragClipIndex < m_clips.size()) {
         // Fire modified() so Timeline saves an undo snapshot and the playback
         // schedule rebuilds with the new leadInSec gaps.
-        if (!qFuzzyCompare(m_clips[m_dragClipIndex].leadInSec, m_dragOriginalLeadIn))
+        if (!qFuzzyCompare(m_clips[m_dragClipIndex].leadInSec, m_dragOriginalLeadIn)) {
             emit modified();
+            emit interactionCompleted(QStringLiteral("Move clip"));
+        }
     }
-    if (m_dragMode == DragMode::TrimLeft || m_dragMode == DragMode::TrimRight) emit modified();
+    if (m_dragMode == DragMode::TrimLeft || m_dragMode == DragMode::TrimRight) {
+        emit modified();
+        emit interactionCompleted(QStringLiteral("Trim clip"));
+    }
     if ((m_dragMode == DragMode::TransitionLeadInResize
          || m_dragMode == DragMode::TransitionTrailOutResize)
         && m_dragClipIndex >= 0 && m_dragClipIndex < m_clips.size()) {
@@ -1477,8 +1687,10 @@ void TimelineTrack::mouseReleaseEvent(QMouseEvent *event)
             : clip.trailOut.duration;
         // Threshold guards against an unintended click-without-drag from
         // emitting modified() and pushing an empty undo entry.
-        if (qAbs(newDur - m_dragOriginalTransitionDuration) > 0.01)
+        if (qAbs(newDur - m_dragOriginalTransitionDuration) > 0.01) {
             emit modified();
+            emit interactionCompleted(QStringLiteral("Resize transition"));
+        }
     }
     m_dragMode = DragMode::None; m_dragClipIndex = -1; m_dropTargetIndex = -1;
     m_dragOriginalLeadInNext = -1.0;
@@ -1739,9 +1951,11 @@ void Timeline::setupUI()
     m_playheadOverlay = new PlayheadOverlay(tracksContainer);
     m_playheadOverlay->setFixedHeight(15);
     m_playheadOverlay->setStyleSheet("background-color: #222;");
-    // Helper that clamps a candidate playhead content-x into the central 70%
+    // Helper that clamps a candidate playhead content-x into the central 50%
     // of the visible viewport. Returns the bar position to draw and updates
     // m_playheadDragViewportX as a side effect (used by the auto-scroll timer).
+    // Tighter than the older 70% so the timeline reveals more upcoming
+    // content before the playhead leaves the comfort zone.
     auto resolvePlayheadDragX = [this](int contentX) -> int {
         int barX = contentX;
         if (m_scrollArea && m_scrollArea->viewport()) {
@@ -1750,8 +1964,8 @@ void Timeline::setupUI()
                 const int viewportW = m_scrollArea->viewport()->width();
                 const int scrollX = hbar->value();
                 const int viewportX = contentX - scrollX;
-                const int leftZone = static_cast<int>(viewportW * 0.15);
-                const int rightZone = static_cast<int>(viewportW * 0.85);
+                const int leftZone = static_cast<int>(viewportW * 0.25);
+                const int rightZone = static_cast<int>(viewportW * 0.75);
                 if (viewportW > 0) {
                     // Only pin the bar at the 15% / 85% boundary if the
                     // timeline can actually keep scrolling in that direction.
@@ -1831,6 +2045,9 @@ void Timeline::setupUI()
     // Create initial V1 and A1.
     m_videoTrack = new TimelineTrack(this);
     m_audioTrack = new TimelineTrack(this);
+    m_audioTrack->setIsAudioTrack(true);
+    m_videoTrack->setTimeline(this);
+    m_audioTrack->setTimeline(this);
     m_videoTracks.append(m_videoTrack);
     m_audioTracks.append(m_audioTrack);
 
@@ -2091,6 +2308,7 @@ void Timeline::addVideoTrack()
     track->setPixelsPerSecond(m_zoomLevel);
     track->setSnapEnabled(snapEnabled());
     track->setRowHeight(m_trackHeight);
+    track->setTimeline(this);
 
     // Young number on top: V1 stays at index 1 in the tracks layout
     // (textStrip occupies index 0), V2 inserts directly after V1, V3 after
@@ -2110,9 +2328,11 @@ void Timeline::addAudioTrack()
 {
     int num = m_audioTracks.size() + 1;
     auto *track = new TimelineTrack(this);
+    track->setIsAudioTrack(true);
     track->setPixelsPerSecond(m_zoomLevel);
     track->setSnapEnabled(snapEnabled());
     track->setRowHeight(m_trackHeight);
+    track->setTimeline(this);
 
     // Insert at the end of the audio block (just before the trailing stretch
     // of each layout). Both layouts have a trailing stretch so count()-1 is
@@ -2126,6 +2346,165 @@ void Timeline::addAudioTrack()
     m_audioTracks.append(track);
     wireTrackSelection(track);
     updateInfoLabel();
+}
+
+void Timeline::repaintAudioTracks()
+{
+    for (auto *t : m_audioTracks)
+        if (t) t->update();
+}
+
+void Timeline::applyDuckingFromTrack(int voiceTrackIdx,
+                                     double duckGain,
+                                     double attackSec,
+                                     double releaseSec)
+{
+    if (voiceTrackIdx < 0 || voiceTrackIdx >= m_audioTracks.size()) return;
+    auto *voice = m_audioTracks[voiceTrackIdx];
+    if (!voice) return;
+
+    // Build the voice timeline footprint as a list of (start, end) seconds.
+    // Each clip lays out sequentially as leadInSec gap + effectiveDuration.
+    QVector<QPair<double, double>> voiceRanges;
+    {
+        double accum = 0.0;
+        for (const auto &c : voice->clips()) {
+            accum += c.leadInSec;
+            const double dur = c.effectiveDuration();
+            if (dur > 0.0) voiceRanges.append({accum, accum + dur});
+            accum += dur;
+        }
+    }
+    if (voiceRanges.isEmpty()) return;
+
+    duckGain = qBound(0.0, duckGain, 2.0);
+    attackSec = qMax(0.0, attackSec);
+    releaseSec = qMax(0.0, releaseSec);
+
+    bool anyChanged = false;
+    for (int t = 0; t < m_audioTracks.size(); ++t) {
+        if (t == voiceTrackIdx) continue;
+        auto *bgm = m_audioTracks[t];
+        if (!bgm) continue;
+
+        auto bgmClips = bgm->clips();
+        bool trackChanged = false;
+        double bgmAccum = 0.0;
+        for (auto &bc : bgmClips) {
+            bgmAccum += bc.leadInSec;
+            const double bgmStart = bgmAccum;
+            const double bgmEnd = bgmAccum + bc.effectiveDuration();
+            const double staticGain = bc.volume;
+            QVector<AudioGainPoint> env;
+
+            for (const auto &vr : voiceRanges) {
+                const double duckStart = vr.first - attackSec;
+                const double duckEnd   = vr.second + releaseSec;
+                if (duckEnd <= bgmStart || duckStart >= bgmEnd) continue;
+
+                // Clip the four envelope anchors to the BGM clip's local
+                // time window (0..effectiveDuration). Any anchor that lands
+                // outside the clip is clamped to the boundary.
+                const double bgmDur = bgmEnd - bgmStart;
+                const double localAttackStart = qBound(0.0,
+                    duckStart - bgmStart, bgmDur);
+                const double localVoiceStart  = qBound(0.0,
+                    vr.first  - bgmStart, bgmDur);
+                const double localVoiceEnd    = qBound(0.0,
+                    vr.second - bgmStart, bgmDur);
+                const double localReleaseEnd  = qBound(0.0,
+                    duckEnd   - bgmStart, bgmDur);
+
+                env.append({localAttackStart, staticGain});
+                env.append({localVoiceStart,  duckGain});
+                env.append({localVoiceEnd,    duckGain});
+                env.append({localReleaseEnd,  staticGain});
+            }
+
+            if (!env.isEmpty()) {
+                std::sort(env.begin(), env.end(),
+                          [](const AudioGainPoint &a, const AudioGainPoint &b) {
+                              return a.time < b.time;
+                          });
+                if (bc.volumeEnvelope.isEmpty()) {
+                    bc.volumeEnvelope = env;
+                } else {
+                    // Merge duck envelope with existing user envelope:
+                    // for each duck point, insert it taking MIN gain so
+                    // user boost points still allow ducking down but don't
+                    // override a manual fade.
+                    QVector<AudioGainPoint> merged = bc.volumeEnvelope;
+                    std::sort(merged.begin(), merged.end(),
+                              [](const AudioGainPoint &a, const AudioGainPoint &b) {
+                                  return a.time < b.time;
+                              });
+                    const int origEnvSize = merged.size();
+                    for (const auto &dp : env) {
+                        // Find the existing gain at this time by linear
+                        // interpolation between adjacent ORIGINAL points
+                        // (search only within the pre-existing envelope).
+                        double existingGain = dp.gain;
+                        if (origEnvSize == 0) {
+                            existingGain = 1.0;
+                        } else if (origEnvSize == 1) {
+                            existingGain = merged[0].gain;
+                        } else {
+                            for (int i = 0; i < origEnvSize; ++i) {
+                                if (merged[i].time >= dp.time) {
+                                    if (i == 0) {
+                                        existingGain = merged[0].gain;
+                                    } else {
+                                        const double t0 = merged[i - 1].time;
+                                        const double t1 = merged[i].time;
+                                        const double g0 = merged[i - 1].gain;
+                                        const double g1 = merged[i].gain;
+                                        if (t1 - t0 > 0.0) {
+                                            const double ratio = (dp.time - t0) / (t1 - t0);
+                                            existingGain = g0 + ratio * (g1 - g0);
+                                        } else {
+                                            existingGain = g0;
+                                        }
+                                    }
+                                    break;
+                                }
+                                if (i == origEnvSize - 1) {
+                                    existingGain = merged[i].gain;
+                                }
+                            }
+                        }
+                        merged.append({dp.time, qMin(existingGain, dp.gain)});
+                    }
+                    std::sort(merged.begin(), merged.end(),
+                              [](const AudioGainPoint &a, const AudioGainPoint &b) {
+                                  return a.time < b.time;
+                              });
+                    // De-duplicate points within 1 ms
+                    QVector<AudioGainPoint> deduped;
+                    for (const auto &p : merged) {
+                        if (!deduped.isEmpty() && qAbs(p.time - deduped.last().time) <= 0.001) {
+                            // Take the min gain at this time cluster
+                            deduped.last().gain = qMin(deduped.last().gain, p.gain);
+                        } else {
+                            deduped.append(p);
+                        }
+                    }
+                    bc.volumeEnvelope = deduped;
+                }
+                trackChanged = true;
+            }
+            bgmAccum += bc.effectiveDuration();
+        }
+        if (trackChanged) {
+            bgm->setClips(bgmClips);
+            anyChanged = true;
+        }
+    }
+
+    if (anyChanged) {
+        saveUndoState(QString("BGM auto-duck (voice = A%1)").arg(voiceTrackIdx + 1));
+        scheduleEmitSequenceChanged();
+        repaintAudioTracks();
+    }
 }
 
 void Timeline::addClip(const QString &filePath)
@@ -3023,6 +3402,94 @@ bool Timeline::snapEnabled() const {
     return m_videoTrack ? m_videoTrack->snapEnabled() : true;
 }
 
+qint64 Timeline::findSnapTarget(qint64 candidateUs, int *outScreenX) const
+{
+    const double candidateSec = static_cast<double>(candidateUs) / 1e6;
+    const int candidateX = static_cast<int>(candidateSec * m_zoomLevel);
+
+    struct Target {
+        int x;
+        int priority; // 1=clip-edge, 2=playhead, 4=t=0
+        int distance;
+    };
+    QVector<Target> targets;
+
+    auto collectClipEdges = [&](const QVector<TimelineTrack*> &tracks) {
+        for (const auto *track : tracks) {
+            if (!track) continue;
+            int x = 0;
+            const double pps = track->pixelsPerSecond();
+            for (int i = 0; i < track->clipCount(); ++i) {
+                const auto &clip = track->clips()[i];
+                x += qMax(0, static_cast<int>(clip.leadInSec * pps));
+                targets.append({x, 1, qAbs(candidateX - x)});
+                const int cw = qMax(20, static_cast<int>(clip.effectiveDuration() * pps));
+                targets.append({x + cw, 1, qAbs(candidateX - (x + cw))});
+                x += cw;
+            }
+        }
+    };
+    collectClipEdges(m_videoTracks);
+    collectClipEdges(m_audioTracks);
+
+    // Playhead
+    const int playheadX = static_cast<int>(m_playheadPos * m_zoomLevel);
+    targets.append({playheadX, 2, qAbs(candidateX - playheadX)});
+
+    // Time origin (t=0)
+    targets.append({0, 4, qAbs(candidateX - 0)});
+
+    // Find best: closest by pixel distance; on tie lower priority wins.
+    Target best{-1, 999, INT_MAX};
+    for (const auto &t : targets) {
+        if (t.distance > TimelineTrack::SNAP_THRESHOLD) continue;
+        if (t.distance < best.distance
+            || (t.distance == best.distance && t.priority < best.priority)) {
+            best = t;
+        }
+    }
+
+    if (best.x >= 0) {
+        *outScreenX = best.x;
+        const double snappedSec = static_cast<double>(best.x) / m_zoomLevel;
+        return static_cast<qint64>(snappedSec * 1e6);
+    }
+    *outScreenX = candidateX;
+    return candidateUs;
+}
+
+void Timeline::triggerSnapLine(int screenX)
+{
+    m_snapLineX = screenX;
+    m_snapLineFadeTimer.restart();
+    // Repaint all tracks so the line appears on every row.
+    for (auto *t : m_videoTracks)
+        if (t) t->update();
+    for (auto *t : m_audioTracks)
+        if (t) t->update();
+    // Schedule a clean-up repaint after the fade window.
+    QTimer::singleShot(kSnapLineFadeMs, this, [this] {
+        m_snapLineX = -1;
+        for (auto *t : m_videoTracks) if (t) t->update();
+        for (auto *t : m_audioTracks) if (t) t->update();
+    });
+}
+
+int Timeline::snapLineX() const
+{
+    if (m_snapLineX < 0) return -1;
+    if (m_snapLineFadeTimer.elapsed() >= kSnapLineFadeMs) return -1;
+    return m_snapLineX;
+}
+
+int Timeline::snapLineAlpha() const
+{
+    if (m_snapLineX < 0) return 0;
+    const qint64 elapsed = m_snapLineFadeTimer.elapsed();
+    if (elapsed >= kSnapLineFadeMs) return 0;
+    return 255 - static_cast<int>(255 * elapsed / kSnapLineFadeMs);
+}
+
 // Zoom
 void Timeline::zoomIn() { setZoomLevel(m_zoomLevel * 1.25); }
 void Timeline::zoomOut() { setZoomLevel(m_zoomLevel / 1.25); }
@@ -3436,6 +3903,36 @@ void Timeline::setPlayheadPosition(double seconds)
 {
     m_playheadPos = qMax(0.0, seconds);
     syncPlayheadOverlay();
+    // Chase mode: when playback or an external seek pushes the playhead
+    // out of the central 50% comfort band, scroll the timeline so the
+    // playhead lands back in the middle. Skipped while the user is
+    // actively dragging — resolvePlayheadDragX handles that case with a
+    // looser pin so a plain click in the outer band still lands the bar
+    // exactly where the user clicked.
+    if (!m_playheadDragging) ensurePlayheadVisible();
+}
+
+void Timeline::ensurePlayheadVisible()
+{
+    if (!m_scrollArea || !m_scrollArea->viewport() || !m_videoTrack) return;
+    QScrollBar *hbar = m_scrollArea->horizontalScrollBar();
+    if (!hbar) return;
+    const int viewportW = m_scrollArea->viewport()->width();
+    if (viewportW <= 0) return;
+    const int playheadX = m_videoTrack->secondsToX(m_playheadPos);
+    const int viewportX = playheadX - hbar->value();
+    const int leftZone  = static_cast<int>(viewportW * 0.25);
+    const int rightZone = static_cast<int>(viewportW * 0.75);
+    if (viewportX >= leftZone && viewportX <= rightZone) return;
+    // Re-centre at the 50% mark so the user has equal forward / backward
+    // headroom after the chase scroll. Clamp so we never push past the
+    // scroll rails (start of timeline at min, last-clip-end + trailing
+    // pad at max).
+    const int target = viewportW / 2;
+    const int newScroll = qBound(hbar->minimum(),
+                                 playheadX - target,
+                                 hbar->maximum());
+    if (newScroll != hbar->value()) hbar->setValue(newScroll);
 }
 
 double Timeline::totalDuration() const
@@ -3526,6 +4023,16 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         clearAllSelections();
     });
     connect(track, &TimelineTrack::modified, this, &Timeline::onTrackModified);
+    connect(track, &TimelineTrack::interactionCompleted, this,
+        [this](const QString &description) {
+            // Discrete user interaction finished — push an undo entry so
+            // Ctrl+Z reverts THIS interaction. Without this, drag/trim/
+            // transition-handle/envelope edits leave no undo record and a
+            // later Ctrl+Z (e.g. from "Add transition") jumps past them
+            // back to the prior explicit-action snapshot, which looks like
+            // unrelated clips disappearing.
+            saveUndoState(description);
+        });
     connect(track, &TimelineTrack::clipContextMenuRequested, this,
         [this, track](int clipIndex, const QPoint &globalPos) {
             showClipContextMenu(track, clipIndex, globalPos);
@@ -3803,6 +4310,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double videoDy = 0.0;
         double opacity = 1.0;
         double volume = 1.0;
+        QVector<AudioGainPoint> volumeEnvelope;
         int clipIdx = -1;
         TransitionType leadInType = TransitionType::None;
         double leadInDuration = 0.0;
@@ -3841,6 +4349,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.videoDy = c.videoDy;
                 iv.opacity = c.opacity;
                 iv.volume = c.volume;
+                iv.volumeEnvelope = c.volumeEnvelope;
                 iv.clipIdx = ci;
                 iv.leadInType = c.leadIn.type;
                 iv.leadInDuration = c.leadIn.duration;
@@ -3970,6 +4479,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.videoDy = iv.videoDy;
         e.opacity = iv.opacity;
         e.volume = iv.volume;
+        e.volumeEnvelope = iv.volumeEnvelope;
         e.sourceClipIndex = iv.clipIdx;
         e.leadInType = iv.leadInType;
         e.leadInDuration = iv.leadInDuration;
@@ -4026,6 +4536,7 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             e.sourceTrack = t;
             e.audioMuted = trackMuted;
             e.volume = c.volume;
+            e.volumeEnvelope = c.volumeEnvelope;
             e.sourceClipIndex = ci;
             e.leadInType = c.leadIn.type;
             e.leadInDuration = c.leadIn.duration;
@@ -4069,8 +4580,12 @@ void Timeline::saveUndoState(const QString &description)
 TimelineState Timeline::currentState() const
 {
     TimelineState state;
-    state.videoClips = m_videoTrack->clips();
-    state.audioClips = m_audioTrack->clips();
+    state.videoTracks.reserve(m_videoTracks.size());
+    for (const auto *t : m_videoTracks)
+        state.videoTracks.append(t ? t->clips() : QVector<ClipInfo>{});
+    state.audioTracks.reserve(m_audioTracks.size());
+    for (const auto *t : m_audioTracks)
+        state.audioTracks.append(t ? t->clips() : QVector<ClipInfo>{});
     state.selectedClip = m_videoTrack->selectedClip();
     state.playheadPos = m_playheadPos;
     return state;
@@ -4078,24 +4593,44 @@ TimelineState Timeline::currentState() const
 
 void Timeline::restoreState(const TimelineState &state)
 {
-    m_videoTrack->setClips(state.videoClips);
-    m_audioTrack->setClips(state.audioClips);
+    // Make sure the editor has at least as many rows as the snapshot. We
+    // only ADD here — never remove — because deleting a track widget
+    // mid-undo invalidates pointers other UI code may already hold (the
+    // undo path is reached from a menu callback, not a clean teardown).
+    while (m_videoTracks.size() < state.videoTracks.size()) addVideoTrack();
+    while (m_audioTracks.size() < state.audioTracks.size()) addAudioTrack();
+
+    for (int i = 0; i < m_videoTracks.size(); ++i) {
+        if (!m_videoTracks[i]) continue;
+        const auto &clips = (i < state.videoTracks.size())
+                            ? state.videoTracks[i]
+                            : QVector<ClipInfo>{};
+        m_videoTracks[i]->setClips(clips);
+        m_videoTracks[i]->update();
+    }
+    for (int i = 0; i < m_audioTracks.size(); ++i) {
+        if (!m_audioTracks[i]) continue;
+        const auto &clips = (i < state.audioTracks.size())
+                            ? state.audioTracks[i]
+                            : QVector<ClipInfo>{};
+        m_audioTracks[i]->setClips(clips);
+        m_audioTracks[i]->update();
+    }
+
     {
         const bool vWas = m_videoTrack->blockSignals(true);
         m_videoTrack->setSelectedClip(state.selectedClip);
         m_videoTrack->blockSignals(vWas);
-        m_videoTrack->update();
         const bool aWas = m_audioTrack->blockSignals(true);
         m_audioTrack->setSelectedClip(state.selectedClip);
         m_audioTrack->blockSignals(aWas);
-        m_audioTrack->update();
     }
     m_playheadPos = state.playheadPos;
     syncPlayheadOverlay();
     emit clipSelected(state.selectedClip);
-    // V3 sprint — track-aware overload. restoreState only touches V1
-    // (m_videoTrack alias) so the resolved track is always V1, or -1
-    // for the deselect case.
+    // V3 sprint — track-aware overload. restoreState's selection still
+    // routes through V1 (the rest of the editor uses V1-relative
+    // selection), so emit -1 / 0 here.
     emit clipSelectedOnTrack(state.selectedClip < 0 ? -1 : 0,
                              state.selectedClip);
     // setClips bypasses the modified() signal path; trigger explicitly so the
@@ -4178,8 +4713,8 @@ void Timeline::onPlayheadAutoScrollTick()
     if (viewportW <= 0)
         return;
     const int scrollX = hbar->value();
-    const int leftZone = static_cast<int>(viewportW * 0.15);
-    const int rightZone = static_cast<int>(viewportW * 0.85);
+    const int leftZone = static_cast<int>(viewportW * 0.25);
+    const int rightZone = static_cast<int>(viewportW * 0.75);
 
     int delta = 0;
     if (m_playheadDragViewportX < leftZone) {

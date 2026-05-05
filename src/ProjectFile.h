@@ -9,6 +9,42 @@
 #include "Keyframe.h"
 #include "Overlay.h"
 
+// --- Audio mixer serialization sub-types ---
+
+struct TrackEqState {
+    int trackIdx = -1;
+    bool enabled = false;
+    double low = 0.0;
+    double mid = 0.0;
+    double high = 0.0;
+    double lowFreqHz = 200.0;
+    double midFreqHz = 1000.0;
+    double highFreqHz = 5000.0;
+    double qFactor = 1.0;
+
+    bool isDefault() const {
+        return low == 0.0 && mid == 0.0 && high == 0.0
+            && qFactor == 1.0 && lowFreqHz == 200.0
+            && midFreqHz == 1000.0 && highFreqHz == 5000.0;
+    }
+};
+
+struct CompressorState {
+    double thresholdDb = -12.0;
+    double ratio = 4.0;
+    double attackMs = 10.0;
+    double releaseMs = 120.0;
+    double makeupDb = 0.0;
+    bool enabled = false;
+};
+
+struct AutoDuckState {
+    double thresholdDb = -20.0;
+    double ratio = 4.0;
+    double attackMs = 5.0;
+    double releaseMs = 250.0;
+};
+
 // Full project state for serialization
 struct ProjectData {
     ProjectConfig config;
@@ -18,6 +54,12 @@ struct ProjectData {
     double markIn = -1.0;
     double markOut = -1.0;
     int zoomLevel = 10;
+
+    // Audio mixer state
+    QVector<TrackEqState> trackEqStates;
+    CompressorState masterCompressor;
+    AutoDuckState autoDuck;
+    bool audioMetersDockVisible = true;
 };
 
 class ProjectFile
@@ -56,4 +98,12 @@ private:
 
     static QJsonArray tracksToJson(const QVector<QVector<ClipInfo>> &tracks);
     static QVector<QVector<ClipInfo>> tracksFromJson(const QJsonArray &arr);
+
+    // Audio mixer serialization
+    static QJsonObject trackEqToJson(const TrackEqState &s);
+    static TrackEqState trackEqFromJson(const QJsonObject &obj);
+    static QJsonObject compressorToJson(const CompressorState &cs);
+    static CompressorState compressorFromJson(const QJsonObject &obj);
+    static QJsonObject autoDuckToJson(const AutoDuckState &ad);
+    static AutoDuckState autoDuckFromJson(const QJsonObject &obj);
 };

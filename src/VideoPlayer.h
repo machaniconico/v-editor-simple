@@ -201,6 +201,10 @@ signals:
     void durationChanged(double durationSeconds);
     void stateChanged(bool playing);
     void playbackSpeedChanged(double speed);
+    // Emitted whenever the composited preview image is refreshed. Hot path
+    // (called from each frame tick), so consumers must rate-limit if they
+    // do non-trivial work — e.g. LumetriScopes throttles to ~10 fps.
+    void frameComposited(const QImage &frame);
     // Emitted when the user clicks the seekbar-left proxy button. MainWindow
     // owns the settings dialog so it can drive both the file-level proxy
     // mode (ProxyManager) and the preview divisor (VideoPlayer) through

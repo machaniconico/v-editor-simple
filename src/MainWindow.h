@@ -55,6 +55,7 @@
 #include "NetworkRender.h"
 #include "RemotionExport.h"
 #include "WelcomeWidget.h"
+#include "HistoryDockWidget.h"
 
 class VideoPlayer;
 class Timeline;
@@ -172,6 +173,13 @@ private slots:
     void openNetworkRender();
     void exportToRemotion();
 
+    // Effects + audio shortcuts
+    void applySharpenEffect();
+    void applyMosaicEffect();
+    void applyChromaKeyEffect();
+    void openMasterCompressor();
+    void openAutoDuckSettings();
+
 protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
@@ -193,6 +201,8 @@ private:
     void updateEditActions();
     void applyProjectConfig(const ProjectConfig &config);
     void updateTitle();
+    void collectAudioState(ProjectData &data);
+    void applyAudioState(const ProjectData &data);
 
     VideoPlayer *m_player;
     Timeline *m_timeline;
@@ -289,4 +299,12 @@ private:
     void onTextOverlayEditCommitted(int overlayIndex, const QString &newText);
     void applyTextToolOverlay();
     void pushTextToolStyleToPreview();
+
+    // Audio meters dock
+    QDockWidget *m_audioMetersDock = nullptr;
+    QList<QMetaObject::Connection> m_meterConnections;
+    void rebuildAudioMeters();
+
+    // History dock
+    HistoryDockWidget *m_historyDock = nullptr;
 };

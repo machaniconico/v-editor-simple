@@ -1788,6 +1788,7 @@ void VideoPlayer::displayFrame(const QImage &image)
     }
 
     m_currentFrameImage = composed;
+    emit frameComposited(composed);
     if (m_useGL && m_glPreview) {
         m_glPreview->setDisplayAspectRatio(effectiveDisplayAspectRatio());
         int hdrTransfer = 0;

@@ -13,6 +13,7 @@
 #include <QAudioDevice>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 
@@ -92,6 +93,111 @@ inline const char *liveData(const AudioDecoderEntry &e) {
     return e.ring.constData() + e.ringHead;
 }
 constexpr int kRingCompactThreshold = 32 * 1024;
+
+// Linear-interpolate the per-clip volume envelope at a given clip-local
+// time (seconds, 0.0 == clip start on the timeline). Empty envelope falls
+// back to the static `volume` field so existing behaviour is preserved
+// when no automation has been authored. Endpoints clamp (no extrapolation).
+inline double evaluateVolumeEnvelope(const QVector<AudioGainPoint> &env,
+                                     double clipLocalSec,
+                                     double fallbackGain) {
+    if (env.isEmpty()) return fallbackGain;
+    if (clipLocalSec <= env.first().time) return env.first().gain;
+    if (clipLocalSec >= env.last().time) return env.last().gain;
+    for (int i = 0; i + 1 < env.size(); ++i) {
+        const double aT = env[i].time;
+        const double bT = env[i + 1].time;
+        if (clipLocalSec >= aT && clipLocalSec <= bT) {
+            const double span = bT - aT;
+            if (span <= 0.0) return env[i + 1].gain;
+            const double u = (clipLocalSec - aT) / span;
+            return env[i].gain + (env[i + 1].gain - env[i].gain) * u;
+        }
+    }
+    return fallbackGain;
+}
+} // namespace
+
+// ---------------------------------------------------------------------------
+// RBJ biquad cookbook — coefficient calculation for per-track realtime EQ.
+// Three filter types: low-shelf (band index 0), peaking (1), high-shelf (2).
+// All use the standard Audio EQ Cookbook formulas with shelf slope S=1.
+// Coefficients are normalized so a0 = 1 and stored in EqBandCoefs.
+// ---------------------------------------------------------------------------
+namespace {
+struct BiquadCoefs { double b0, b1, b2, a1, a2; };
+
+BiquadCoefs calcLowShelf(double freq, double gainDB, double fs) {
+    const double w = 2.0 * M_PI * freq / fs;
+    const double cosW = std::cos(w);
+    const double sinW = std::sin(w);
+    const double A = std::pow(10.0, gainDB / 40.0);
+    const double twoSqrtAalpha = 2.0 * std::sqrt(A) * (sinW * std::sqrt(2.0) / 2.0);
+    const double Ap1 = A + 1.0;
+    const double Am1 = A - 1.0;
+    double b0 = A * (Ap1 - Am1 * cosW + twoSqrtAalpha);
+    double b1 = 2.0 * A * (Am1 - Ap1 * cosW);
+    double b2 = A * (Ap1 - Am1 * cosW - twoSqrtAalpha);
+    double a0 = Ap1 + Am1 * cosW + twoSqrtAalpha;
+    double a1 = -2.0 * (Am1 + Ap1 * cosW);
+    double a2 = Ap1 + Am1 * cosW - twoSqrtAalpha;
+    return {b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0};
+}
+
+BiquadCoefs calcPeaking(double freq, double gainDB, double Q, double fs) {
+    const double w = 2.0 * M_PI * freq / fs;
+    const double cosW = std::cos(w);
+    const double sinW = std::sin(w);
+    const double A = std::pow(10.0, gainDB / 40.0);
+    const double alpha = sinW / (2.0 * Q);
+    double b0 = 1.0 + alpha * A;
+    double b1 = -2.0 * cosW;
+    double b2 = 1.0 - alpha * A;
+    double a0 = 1.0 + alpha / A;
+    double a1 = -2.0 * cosW;
+    double a2 = 1.0 - alpha / A;
+    return {b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0};
+}
+
+BiquadCoefs calcHighShelf(double freq, double gainDB, double fs) {
+    const double w = 2.0 * M_PI * freq / fs;
+    const double cosW = std::cos(w);
+    const double sinW = std::sin(w);
+    const double A = std::pow(10.0, gainDB / 40.0);
+    const double twoSqrtAalpha = 2.0 * std::sqrt(A) * (sinW * std::sqrt(2.0) / 2.0);
+    const double Ap1 = A + 1.0;
+    const double Am1 = A - 1.0;
+    double b0 = A * (Ap1 + Am1 * cosW + twoSqrtAalpha);
+    double b1 = -2.0 * A * (Am1 + Ap1 * cosW);
+    double b2 = A * (Ap1 + Am1 * cosW - twoSqrtAalpha);
+    double a0 = Ap1 - Am1 * cosW + twoSqrtAalpha;
+    double a1 = 2.0 * (Am1 - Ap1 * cosW);
+    double a2 = Ap1 - Am1 * cosW - twoSqrtAalpha;
+    return {b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0};
+}
+
+void recomputeEqCoefficients(AudioMixer::TrackState &ts) {
+    constexpr double fs = AudioMixer::kSampleRateHz;
+    for (int i = 0; i < ts.eq.bands.size() && i < 3; ++i) {
+        const auto &band = ts.eq.bands[i];
+        if (band.isFlat()) {
+            ts.eqCoeffs[i] = {1.0, 0.0, 0.0, 0.0, 0.0};
+            ts.z[i] = {};
+            ts.eqCache[i] = {};
+            continue;
+        }
+        BiquadCoefs c;
+        if (i == 0)      c = calcLowShelf(band.frequency, band.gain, fs);
+        else if (i == 1) c = calcPeaking(band.frequency, band.gain, band.q, fs);
+        else             c = calcHighShelf(band.frequency, band.gain, fs);
+        ts.eqCoeffs[i] = {c.b0, c.b1, c.b2, c.a1, c.a2};
+        if (ts.eqCache[i].frequency != band.frequency || ts.eqCache[i].q != band.q) {
+            ts.z[i] = {};
+            ts.eqCache[i].frequency = band.frequency;
+            ts.eqCache[i].q = band.q;
+        }
+    }
+}
 } // namespace
 
 class MixerIODevice : public QIODevice {
@@ -273,7 +379,19 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // If samples sit in the future the entry shouldn't be mixed yet.
         if (e->ringStartTlUs > cursorUs + maxlenUs / 2) continue;
 
-        double gain = qBound(0.0, e->entry.volume, 4.0);
+        // Per-clip volume automation ("rubber band" envelope). Sampled at
+        // the start of the readData fragment — the existing prevGain ramp
+        // (~5 ms slew, see Iter 14 audio fix) absorbs any step between
+        // fragments so per-sample evaluation is unnecessary for the typical
+        // envelope curve.
+        double clipGain = e->entry.volume;
+        if (!e->entry.volumeEnvelope.isEmpty()) {
+            const double envT = static_cast<double>(cursorUs) / 1e6
+                                - e->entry.timelineStart;
+            clipGain = evaluateVolumeEnvelope(e->entry.volumeEnvelope,
+                                              envT, e->entry.volume);
+        }
+        double gain = qBound(0.0, clipGain, 4.0);
         if (e->entry.audioMuted) gain = 0.0;
         const int trackIdx = e->entry.sourceTrack;
         if (trackIdx >= 0 && trackIdx < m_mixer->m_trackStates.size())
@@ -338,12 +456,115 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // data lifecycle.
         const int rampLen = qMin(copySamples, 240);
         const double gainStep = (rampLen > 0) ? (gain - e->prevGain) / static_cast<double>(rampLen) : 0.0;
-        for (int i = 0; i < rampLen; ++i) {
-            const double g = e->prevGain + gainStep * static_cast<double>(i);
-            accum[i] += static_cast<int32_t>(src[i] * g);
-        }
-        for (int i = rampLen; i < copySamples; ++i) {
-            accum[i] += static_cast<int32_t>(src[i] * gain);
+
+        // Per-track realtime 3-band biquad EQ (applied before effectiveGain so
+        // level meters see post-EQ values). The EQ cascade uses transposed
+        // direct-form-II biquads with zero-allocation inline processing.
+        auto *ts = (trackIdx >= 0 && trackIdx < m_mixer->m_trackStates.size())
+            ? &m_mixer->m_trackStates[trackIdx] : nullptr;
+        const bool eqActive = ts && ts->eqEnabled;
+
+        if (eqActive) {
+            const double preampLin = std::pow(10.0, ts->eq.preamp / 20.0);
+            // Ensure per-track level accum vector is sized
+            if (trackIdx >= 0 && m_mixer->m_trackLevelAccum.size() <= trackIdx)
+                m_mixer->m_trackLevelAccum.resize(trackIdx + 1);
+            auto *tla = (trackIdx >= 0) ? &m_mixer->m_trackLevelAccum[trackIdx] : nullptr;
+            for (int i = 0; i < rampLen; ++i) {
+                const double g = e->prevGain + gainStep * static_cast<double>(i);
+                double s = static_cast<double>(src[i]);
+                const int ch = i & 1;
+                for (int b = 0; b < 3; ++b) {
+                    const auto &c = ts->eqCoeffs[b];
+                    auto &z = ts->z[b];
+                    double w = s - c.a1 * z[ch] - c.a2 * z[ch + 2];
+                    s = c.b0 * w + c.b1 * z[ch] + c.b2 * z[ch + 2];
+                    z[ch + 2] = z[ch];
+                    z[ch] = w;
+                }
+                s *= preampLin;
+                const double sampleVal = s * g;
+                if (tla) {
+                    const double norm = sampleVal / 32768.0;
+                    const double absNorm = std::abs(norm);
+                    if (ch == 0) {
+                        if (absNorm > tla->peakL) tla->peakL = static_cast<float>(absNorm);
+                        tla->sumSqL += norm * norm;
+                        tla->chanCount++;
+                    } else {
+                        if (absNorm > tla->peakR) tla->peakR = static_cast<float>(absNorm);
+                        tla->sumSqR += norm * norm;
+                    }
+                }
+                accum[i] += static_cast<int32_t>(sampleVal);
+            }
+            for (int i = rampLen; i < copySamples; ++i) {
+                double s = static_cast<double>(src[i]);
+                const int ch = i & 1;
+                for (int b = 0; b < 3; ++b) {
+                    const auto &c = ts->eqCoeffs[b];
+                    auto &z = ts->z[b];
+                    double w = s - c.a1 * z[ch] - c.a2 * z[ch + 2];
+                    s = c.b0 * w + c.b1 * z[ch] + c.b2 * z[ch + 2];
+                    z[ch + 2] = z[ch];
+                    z[ch] = w;
+                }
+                s *= preampLin;
+                const double sampleVal = s * gain;
+                if (tla) {
+                    const double norm = sampleVal / 32768.0;
+                    const double absNorm = std::abs(norm);
+                    if (ch == 0) {
+                        if (absNorm > tla->peakL) tla->peakL = static_cast<float>(absNorm);
+                        tla->sumSqL += norm * norm;
+                        tla->chanCount++;
+                    } else {
+                        if (absNorm > tla->peakR) tla->peakR = static_cast<float>(absNorm);
+                        tla->sumSqR += norm * norm;
+                    }
+                }
+                accum[i] += static_cast<int32_t>(sampleVal);
+            }
+        } else {
+            // Ensure per-track level accum vector is sized
+            if (trackIdx >= 0 && m_mixer->m_trackLevelAccum.size() <= trackIdx)
+                m_mixer->m_trackLevelAccum.resize(trackIdx + 1);
+            auto *tla = (trackIdx >= 0) ? &m_mixer->m_trackLevelAccum[trackIdx] : nullptr;
+            for (int i = 0; i < rampLen; ++i) {
+                const double g = e->prevGain + gainStep * static_cast<double>(i);
+                const double sampleVal = static_cast<double>(src[i]) * g;
+                if (tla) {
+                    const double norm = sampleVal / 32768.0;
+                    const double absNorm = std::abs(norm);
+                    const int ch = i & 1;
+                    if (ch == 0) {
+                        if (absNorm > tla->peakL) tla->peakL = static_cast<float>(absNorm);
+                        tla->sumSqL += norm * norm;
+                        tla->chanCount++;
+                    } else {
+                        if (absNorm > tla->peakR) tla->peakR = static_cast<float>(absNorm);
+                        tla->sumSqR += norm * norm;
+                    }
+                }
+                accum[i] += static_cast<int32_t>(sampleVal);
+            }
+            for (int i = rampLen; i < copySamples; ++i) {
+                const double sampleVal = static_cast<double>(src[i]) * gain;
+                if (tla) {
+                    const double norm = sampleVal / 32768.0;
+                    const double absNorm = std::abs(norm);
+                    const int ch = i & 1;
+                    if (ch == 0) {
+                        if (absNorm > tla->peakL) tla->peakL = static_cast<float>(absNorm);
+                        tla->sumSqL += norm * norm;
+                        tla->chanCount++;
+                    } else {
+                        if (absNorm > tla->peakR) tla->peakR = static_cast<float>(absNorm);
+                        tla->sumSqR += norm * norm;
+                    }
+                }
+                accum[i] += static_cast<int32_t>(sampleVal);
+            }
         }
         e->prevGain = gain;
         e->ringHead += copyBytes;
@@ -426,9 +647,80 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         }
     }
 
+    // Master-bus compressor + brick-wall limiter. Stereo-linked envelope
+    // (max of |L|, |R|) drives a standard analog-style feed-forward
+    // compressor. When disabled the block is a bit-exact bypass — the
+    // accumulator is untouched.
+    {
+        const AudioMixer::CompressorParams compressorParams = m_mixer->m_compressorParams;
+        const bool compEnabled = compressorParams.enabled;
+        if (anyMixed && compEnabled) {
+            const double threshLin = std::pow(10.0, compressorParams.thresholdDb / 20.0);
+            const double ratio = compressorParams.ratio;
+            const double attackMs = compressorParams.attackMs;
+            const double releaseMs = compressorParams.releaseMs;
+            const double makeup = std::pow(10.0, compressorParams.makeupDb / 20.0);
+
+            const double fs = static_cast<double>(AudioMixer::kSampleRateHz);
+            const double alphaA = std::exp(-1.0 / (attackMs * fs * 0.001));
+            const double alphaR = std::exp(-1.0 / (releaseMs * fs * 0.001));
+            const double oneOverRMinusOne = 1.0 / ratio - 1.0;
+            constexpr double kLimiterCeil = 0.99;
+
+            double env = m_mixer->m_compressorEnv;
+
+            for (int i = 0; i < sampleCount; i += 2) {
+                const double absL = std::abs(static_cast<double>(accum[i]) / 32768.0);
+                const double absR = std::abs(static_cast<double>(accum[i + 1]) / 32768.0);
+                const double xAbs = (absL >= absR) ? absL : absR;
+
+                if (env >= xAbs)
+                    env = alphaR * env + (1.0 - alphaR) * xAbs;
+                else
+                    env = alphaA * env + (1.0 - alphaA) * xAbs;
+
+                double cGain;
+                if (env > threshLin)
+                    cGain = std::pow(env / threshLin, oneOverRMinusOne) * makeup;
+                else
+                    cGain = makeup;
+
+                accum[i]     = static_cast<int32_t>(static_cast<double>(accum[i]) * cGain);
+                accum[i + 1] = static_cast<int32_t>(static_cast<double>(accum[i + 1]) * cGain);
+
+                // Brick-wall limiter: clamp absolute output to 0.99 * 32768
+                constexpr double kCeilVal = kLimiterCeil * 32768.0;
+                if (accum[i] > static_cast<int32_t>(kCeilVal))
+                    accum[i] = static_cast<int32_t>(kCeilVal);
+                else if (accum[i] < -static_cast<int32_t>(kCeilVal))
+                    accum[i] = -static_cast<int32_t>(kCeilVal);
+                if (accum[i + 1] > static_cast<int32_t>(kCeilVal))
+                    accum[i + 1] = static_cast<int32_t>(kCeilVal);
+                else if (accum[i + 1] < -static_cast<int32_t>(kCeilVal))
+                    accum[i + 1] = -static_cast<int32_t>(kCeilVal);
+            }
+            m_mixer->m_compressorEnv = env;
+        } else if (!compEnabled) {
+            // Reset envelope so re-enabling starts from silence, not a stale
+            // value that could cause a gain step.
+            m_mixer->m_compressorEnv = 0.0;
+        }
+    }
+
     if (anyMixed) {
         int16_t *dst = reinterpret_cast<int16_t *>(data);
+        auto &mla = m_mixer->m_masterLevelAccum;
         for (int i = 0; i < sampleCount; ++i) {
+            const double norm = static_cast<double>(accum[i]) / 32768.0;
+            const double absNorm = std::abs(norm);
+            if ((i & 1) == 0) {
+                if (absNorm > mla.peakL) mla.peakL = static_cast<float>(absNorm);
+                mla.sumSqL += norm * norm;
+                mla.chanCount++;
+            } else {
+                if (absNorm > mla.peakR) mla.peakR = static_cast<float>(absNorm);
+                mla.sumSqR += norm * norm;
+            }
             dst[i] = static_cast<int16_t>(qBound<int32_t>(-32768, accum[i], 32767));
         }
     }
@@ -459,6 +751,46 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
     }
 
     m_mixer->m_writeCursorUs.fetch_add(deltaUs, std::memory_order_release);
+
+    // Throttled level-meter emission (<=30 Hz). Snapshot+reset accumulators
+    // under m_controlMutex, then emit queued (unlocked) to the GUI thread.
+    {
+        const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (nowNs - m_mixer->m_lastLevelEmitNs >= 33'000'000LL) {
+            QVector<AudioMixer::LevelAccum> trackSnapshots;
+            trackSnapshots.reserve(m_mixer->m_trackLevelAccum.size());
+            for (auto &la : m_mixer->m_trackLevelAccum) {
+                trackSnapshots.append(la);
+                la.reset();
+            }
+            AudioMixer::LevelAccum masterSnapshot = m_mixer->m_masterLevelAccum;
+            m_mixer->m_masterLevelAccum.reset();
+            m_mixer->m_lastLevelEmitNs = nowNs;
+
+            lock.unlock();
+
+            for (int ti = 0; ti < trackSnapshots.size(); ++ti) {
+                const auto &la = trackSnapshots[ti];
+                if (la.chanCount <= 0) continue;
+                const double invCount = 1.0 / static_cast<double>(la.chanCount);
+                const float rmsL = static_cast<float>(std::sqrt(la.sumSqL * invCount));
+                const float rmsR = static_cast<float>(std::sqrt(la.sumSqR * invCount));
+                QMetaObject::invokeMethod(m_mixer, "levelChanged", Qt::QueuedConnection,
+                    Q_ARG(int, ti), Q_ARG(float, la.peakL), Q_ARG(float, la.peakR),
+                    Q_ARG(float, rmsL), Q_ARG(float, rmsR));
+            }
+            if (masterSnapshot.chanCount > 0) {
+                const double invCount = 1.0 / static_cast<double>(masterSnapshot.chanCount);
+                const float rmsL = static_cast<float>(std::sqrt(masterSnapshot.sumSqL * invCount));
+                const float rmsR = static_cast<float>(std::sqrt(masterSnapshot.sumSqR * invCount));
+                QMetaObject::invokeMethod(m_mixer, "masterLevelChanged", Qt::QueuedConnection,
+                    Q_ARG(float, masterSnapshot.peakL), Q_ARG(float, masterSnapshot.peakR),
+                    Q_ARG(float, rmsL), Q_ARG(float, rmsR));
+            }
+            return maxlen;
+        }
+    }
 
     return maxlen;
 }
@@ -583,6 +915,8 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
 
         if (m_trackStates.size() < maxTrack + 1)
             m_trackStates.resize(maxTrack + 1);
+        if (m_trackLevelAccum.size() < maxTrack + 1)
+            m_trackLevelAccum.resize(maxTrack + 1);
 
         recomputeEffectiveGainsLocked();
         ensureSinkLocked();
@@ -837,12 +1171,94 @@ void AudioMixer::setTrackGain(int trackIdx, double gain) {
     recomputeEffectiveGainsLocked();
 }
 
+void AudioMixer::setTrackEqConfig(int trackIdx, const AudioEQConfig &cfg) {
+    if (trackIdx < 0 || trackIdx >= kMaxAudioTracks) return;
+
+    // Compute coefficients BEFORE taking the lock so we don't block the audio thread
+    std::array<EqBandCoefs, 3> coefs;
+    constexpr double fs = kSampleRateHz;
+    for (int i = 0; i < cfg.bands.size() && i < 3; ++i) {
+        const auto &band = cfg.bands[i];
+        if (band.isFlat()) {
+            coefs[i] = {1.0, 0.0, 0.0, 0.0, 0.0};
+            continue;
+        }
+        BiquadCoefs c;
+        if (i == 0)      c = calcLowShelf(band.frequency, band.gain, fs);
+        else if (i == 1) c = calcPeaking(band.frequency, band.gain, band.q, fs);
+        else             c = calcHighShelf(band.frequency, band.gain, fs);
+        coefs[i] = {c.b0, c.b1, c.b2, c.a1, c.a2};
+    }
+
+    QMutexLocker lock(&m_controlMutex);
+    if (m_trackStates.size() < trackIdx + 1)
+        m_trackStates.resize(trackIdx + 1);
+    auto &ts = m_trackStates[trackIdx];
+    ts.eq = cfg;
+    ts.eqCoeffs = coefs;
+    ts.z = {};
+    ts.eqCache = {};
+}
+
+AudioEQConfig AudioMixer::trackEqConfig(int trackIdx) const {
+    QMutexLocker lock(&m_controlMutex);
+    if (trackIdx < 0 || trackIdx >= m_trackStates.size())
+        return AudioEQConfig{};
+    return m_trackStates[trackIdx].eq;
+}
+
+void AudioMixer::setTrackEqEnabled(int trackIdx, bool enabled) {
+    QMutexLocker lock(&m_controlMutex);
+    if (trackIdx < 0 || trackIdx >= kMaxAudioTracks) return;
+    if (m_trackStates.size() < trackIdx + 1)
+        m_trackStates.resize(trackIdx + 1);
+    m_trackStates[trackIdx].eqEnabled = enabled;
+}
+
 void AudioMixer::setNormalizerAmount(double amount) {
     m_normalizerAmount.store(qBound(0.0, amount, 1.0), std::memory_order_release);
 }
 
 void AudioMixer::setNormalizerUniformity(double uniformity) {
     m_normalizerUniformity.store(qBound(0.0, uniformity, 1.0), std::memory_order_release);
+}
+
+void AudioMixer::setCompressorParams(const CompressorParams &params) {
+    QMutexLocker lock(&m_controlMutex);
+    m_compressorParams.thresholdDb = qBound(-30.0, params.thresholdDb, 0.0);
+    m_compressorParams.ratio       = qBound(1.0, params.ratio, 20.0);
+    m_compressorParams.attackMs    = qBound(1.0, params.attackMs, 100.0);
+    m_compressorParams.releaseMs   = qBound(10.0, params.releaseMs, 1000.0);
+    m_compressorParams.makeupDb    = qBound(0.0, params.makeupDb, 18.0);
+    m_compressorParams.enabled     = params.enabled;
+}
+
+void AudioMixer::setCompressorEnabled(bool enabled) {
+    QMutexLocker lock(&m_controlMutex);
+    m_compressorParams.enabled = enabled;
+}
+
+AudioMixer::CompressorParams AudioMixer::compressorParams() const {
+    QMutexLocker lock(&m_controlMutex);
+    return m_compressorParams;
+}
+
+bool AudioMixer::compressorEnabled() const {
+    QMutexLocker lock(&m_controlMutex);
+    return m_compressorParams.enabled;
+}
+
+void AudioMixer::setAutoDuckParams(const AutoDuckParams &params) {
+    QMutexLocker lock(&m_controlMutex);
+    m_autoDuckParams.thresholdDb = qBound(-60.0, params.thresholdDb, 0.0);
+    m_autoDuckParams.ratio       = qBound(1.0, params.ratio, 20.0);
+    m_autoDuckParams.attackMs    = qBound(0.1, params.attackMs, 5000.0);
+    m_autoDuckParams.releaseMs   = qBound(1.0, params.releaseMs, 10000.0);
+}
+
+AudioMixer::AutoDuckParams AudioMixer::autoDuckParams() const {
+    QMutexLocker lock(&m_controlMutex);
+    return m_autoDuckParams;
 }
 
 bool AudioMixer::ensureSinkLocked() {

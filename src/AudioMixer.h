@@ -9,9 +9,11 @@
 #include <QAudioSink>
 #include <QAudioFormat>
 #include <QElapsedTimer>
+#include <array>
 #include <atomic>
 
 #include "PlaybackTypes.h"
+#include "AudioEQ.h"
 
 // AudioMixer — sums up to MAX_AUDIO_TRACKS independent FFmpeg-decoded
 // audio streams into a single 48 kHz s16 stereo output via QAudioSink in
@@ -105,6 +107,27 @@ public:
     void setTrackSolo(int trackIdx, bool solo);
     void setTrackGain(int trackIdx, double gain);
 
+    // Per-track realtime EQ (3-band biquad, applied before effectiveGain).
+    void setTrackEqConfig(int trackIdx, const AudioEQConfig &cfg);
+    AudioEQConfig trackEqConfig(int trackIdx) const;
+    void setTrackEqEnabled(int trackIdx, bool enabled);
+
+    // Master-bus compressor + brick-wall limiter, applied to the sum-mixed
+    // master output after per-track EQ/gain and the loudness normalizer,
+    // before s16 clamping. Disabled by default (bit-exact bypass).
+    struct CompressorParams {
+        double thresholdDb = -12;
+        double ratio = 4;
+        double attackMs = 10;
+        double releaseMs = 120;
+        double makeupDb = 0;
+        bool enabled = false;
+    };
+    void setCompressorParams(const CompressorParams &params);
+    void setCompressorEnabled(bool enabled);
+    CompressorParams compressorParams() const;
+    bool compressorEnabled() const;
+
     // Master loudness normalizer (FCP-style Loudness effect, applied to the
     // sum-mixed master output before s16 clamping).
     //   amount     0..1 — 0 bypasses entirely, 1 = full target-gain follow.
@@ -113,19 +136,50 @@ public:
     void setNormalizerAmount(double amount);
     void setNormalizerUniformity(double uniformity);
 
+    // Auto-ducking parameters. Drive the gain reduction applied to BGM
+    // tracks when the voice track is active. Wired into Timeline's
+    // envelope-based applyDuckingFromTrack (duckGain derived from threshold,
+    // attack/release passed as seconds).
+    struct AutoDuckParams {
+        double thresholdDb = -20.0;
+        double ratio = 4.0;
+        double attackMs = 5.0;
+        double releaseMs = 250.0;
+    };
+    void setAutoDuckParams(const AutoDuckParams &params);
+    AutoDuckParams autoDuckParams() const;
+
 signals:
     void decoderError(const QString &message);
+    void levelChanged(int trackIdx, float peakL, float peakR, float rmsL, float rmsR);
+    void masterLevelChanged(float pkL, float pkR, float rmsL, float rmsR);
 
 private:
     friend class MixerIODevice;
     friend class AudioDecodeRunner;
+
+    struct EqBandCoefs {
+        double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
+    };
+
+public:
+    struct EqBandCache {
+        double frequency = 0;
+        double q = 0;
+    };
 
     struct TrackState {
         bool muted = false;
         bool solo = false;
         double gain = 1.0;
         double effectiveGain = 1.0;  // gain * mute factor * solo factor
+        bool eqEnabled = false;
+        AudioEQConfig eq;
+        std::array<EqBandCoefs, 3> eqCoeffs;
+        std::array<std::array<double, 4>, 3> z{}; // per-band: z1_L, z1_R, z2_L, z2_R (transposed DF2)
+        std::array<EqBandCache, 3> eqCache{};
     };
+private:
 
     bool ensureSinkLocked();              // m_controlMutex must be held
     void recomputeEffectiveGainsLocked(); // m_controlMutex must be held
@@ -173,6 +227,18 @@ private:
     std::atomic<int> m_consecutiveStallCallbacks{0};
     std::atomic<bool> m_playing{false};
 
+    // Master compressor state. Params are set from GUI thread under
+    // m_controlMutex; readData reads them under the same mutex. The
+    // envelope follower state (m_compressorEnv) is touched only from
+    // readData on the audio worker thread.
+    CompressorParams m_compressorParams;
+    double m_compressorEnv = 0.0;
+
+    // Auto-ducking parameters. Set from GUI thread under m_controlMutex;
+    // read by ducking menu handler (GUI thread) to drive Timeline's
+    // envelope-based applyDuckingFromTrack.
+    AutoDuckParams m_autoDuckParams;
+
     // Master loudness normalizer state. Atomics are touched from the GUI
     // thread (setters) and the audio worker thread (readData). The mutable
     // RMS / smoothed-gain fields are touched only from readData.
@@ -180,6 +246,21 @@ private:
     std::atomic<double> m_normalizerUniformity{0.5};
     double m_normalizerRmsMeanSq = 0.0;
     double m_normalizerSmoothedGain = 1.0;
+
+    // Per-track + master level-meter accumulators. readData gathers
+    // peak/RMS per fragment and emits levelChanged / masterLevelChanged
+    // throttled to <=30 Hz.
+    struct LevelAccum {
+        float peakL = 0.f;
+        float peakR = 0.f;
+        double sumSqL = 0.0;
+        double sumSqR = 0.0;
+        qint64 chanCount = 0;     // per-channel sample count
+        void reset() { *this = LevelAccum(); }
+    };
+    QVector<LevelAccum> m_trackLevelAccum;
+    LevelAccum m_masterLevelAccum;
+    qint64 m_lastLevelEmitNs = 0;
 
     AudioDecodeRunner *m_decodeRunner = nullptr;
 };

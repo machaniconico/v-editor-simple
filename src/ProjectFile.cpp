@@ -1,6 +1,7 @@
 #include "ProjectFile.h"
 #include <QFile>
 #include <QJsonDocument>
+#include <algorithm>
 
 static const int PROJECT_FORMAT_VERSION = 1;
 
@@ -15,6 +16,27 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     root["markIn"] = data.markIn;
     root["markOut"] = data.markOut;
     root["zoomLevel"] = data.zoomLevel;
+
+    // Audio mixer
+    {
+        QJsonObject am;
+        QJsonArray teArr;
+        for (const auto &s : data.trackEqStates) {
+            if (s.enabled || !s.isDefault())
+                teArr.append(trackEqToJson(s));
+        }
+        am["trackEq"] = teArr;
+        am["compressor"] = compressorToJson(data.masterCompressor);
+        am["autoDuck"] = autoDuckToJson(data.autoDuck);
+        root["audioMixer"] = am;
+    }
+
+    // UI
+    {
+        QJsonObject ui;
+        ui["audioMetersDockVisible"] = data.audioMetersDockVisible;
+        root["ui"] = ui;
+    }
 
     QJsonDocument doc(root);
     QFile file(filePath);
@@ -44,6 +66,27 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.markOut = root["markOut"].toDouble(-1.0);
     data.zoomLevel = root["zoomLevel"].toInt(10);
 
+    // Audio mixer (tolerate missing keys)
+    data.trackEqStates.clear();
+    if (root.contains("audioMixer")) {
+        QJsonObject am = root["audioMixer"].toObject();
+        if (am.contains("trackEq")) {
+            for (const auto &v : am["trackEq"].toArray())
+                data.trackEqStates.append(trackEqFromJson(v.toObject()));
+        }
+        if (am.contains("compressor"))
+            data.masterCompressor = compressorFromJson(am["compressor"].toObject());
+        if (am.contains("autoDuck"))
+            data.autoDuck = autoDuckFromJson(am["autoDuck"].toObject());
+    }
+
+    // UI (tolerate missing keys)
+    if (root.contains("ui")) {
+        QJsonObject ui = root["ui"].toObject();
+        if (ui.contains("audioMetersDockVisible"))
+            data.audioMetersDockVisible = ui["audioMetersDockVisible"].toBool(true);
+    }
+
     return true;
 }
 
@@ -58,6 +101,27 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     root["markIn"] = data.markIn;
     root["markOut"] = data.markOut;
     root["zoomLevel"] = data.zoomLevel;
+
+    // Audio mixer
+    {
+        QJsonObject am;
+        QJsonArray teArr;
+        for (const auto &s : data.trackEqStates) {
+            if (s.enabled || !s.isDefault())
+                teArr.append(trackEqToJson(s));
+        }
+        am["trackEq"] = teArr;
+        am["compressor"] = compressorToJson(data.masterCompressor);
+        am["autoDuck"] = autoDuckToJson(data.autoDuck);
+        root["audioMixer"] = am;
+    }
+
+    // UI
+    {
+        QJsonObject ui;
+        ui["audioMetersDockVisible"] = data.audioMetersDockVisible;
+        root["ui"] = ui;
+    }
 
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
@@ -78,6 +142,27 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.markIn = root["markIn"].toDouble(-1.0);
     data.markOut = root["markOut"].toDouble(-1.0);
     data.zoomLevel = root["zoomLevel"].toInt(10);
+
+    // Audio mixer (tolerate missing keys)
+    data.trackEqStates.clear();
+    if (root.contains("audioMixer")) {
+        QJsonObject am = root["audioMixer"].toObject();
+        if (am.contains("trackEq")) {
+            for (const auto &v : am["trackEq"].toArray())
+                data.trackEqStates.append(trackEqFromJson(v.toObject()));
+        }
+        if (am.contains("compressor"))
+            data.masterCompressor = compressorFromJson(am["compressor"].toObject());
+        if (am.contains("autoDuck"))
+            data.autoDuck = autoDuckFromJson(am["autoDuck"].toObject());
+    }
+
+    // UI (tolerate missing keys)
+    if (root.contains("ui")) {
+        QJsonObject ui = root["ui"].toObject();
+        if (ui.contains("audioMetersDockVisible"))
+            data.audioMetersDockVisible = ui["audioMetersDockVisible"].toBool(true);
+    }
 
     return true;
 }
@@ -121,6 +206,17 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["videoDy"] = clip.videoDy;
     obj["opacity"] = clip.opacity;
 
+    if (!clip.volumeEnvelope.isEmpty()) {
+        QJsonArray envArr;
+        for (const auto &p : clip.volumeEnvelope) {
+            QJsonObject pt;
+            pt["t"] = p.time;
+            pt["g"] = p.gain;
+            envArr.append(pt);
+        }
+        obj["volumeEnvelope"] = envArr;
+    }
+
     if (!clip.colorCorrection.isDefault())
         obj["colorCorrection"] = colorCorrectionToJson(clip.colorCorrection);
 
@@ -156,6 +252,20 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.videoDx = obj["videoDx"].toDouble(0.0);
     clip.videoDy = obj["videoDy"].toDouble(0.0);
     clip.opacity = obj["opacity"].toDouble(1.0);
+
+    if (obj.contains("volumeEnvelope")) {
+        for (const auto &v : obj["volumeEnvelope"].toArray()) {
+            const auto pt = v.toObject();
+            AudioGainPoint p;
+            p.time = pt["t"].toDouble(0.0);
+            p.gain = pt["g"].toDouble(1.0);
+            clip.volumeEnvelope.append(p);
+        }
+        std::sort(clip.volumeEnvelope.begin(), clip.volumeEnvelope.end(),
+                  [](const AudioGainPoint &a, const AudioGainPoint &b) {
+                      return a.time < b.time;
+                  });
+    }
 
     if (obj.contains("colorCorrection"))
         clip.colorCorrection = colorCorrectionFromJson(obj["colorCorrection"].toObject());
@@ -343,4 +453,84 @@ QVector<QVector<ClipInfo>> ProjectFile::tracksFromJson(const QJsonArray &arr)
         tracks.append(clips);
     }
     return tracks;
+}
+
+// --- Audio Mixer: Track EQ ---
+
+QJsonObject ProjectFile::trackEqToJson(const TrackEqState &s)
+{
+    QJsonObject obj;
+    obj["trackIdx"] = s.trackIdx;
+    obj["enabled"] = s.enabled;
+    obj["low"] = s.low;
+    obj["mid"] = s.mid;
+    obj["high"] = s.high;
+    obj["lowFreqHz"] = s.lowFreqHz;
+    obj["midFreqHz"] = s.midFreqHz;
+    obj["highFreqHz"] = s.highFreqHz;
+    obj["qFactor"] = s.qFactor;
+    return obj;
+}
+
+TrackEqState ProjectFile::trackEqFromJson(const QJsonObject &obj)
+{
+    TrackEqState s;
+    s.trackIdx = obj["trackIdx"].toInt(-1);
+    s.enabled = obj["enabled"].toBool(false);
+    s.low = obj["low"].toDouble(0.0);
+    s.mid = obj["mid"].toDouble(0.0);
+    s.high = obj["high"].toDouble(0.0);
+    s.lowFreqHz = obj["lowFreqHz"].toDouble(200.0);
+    s.midFreqHz = obj["midFreqHz"].toDouble(1000.0);
+    s.highFreqHz = obj["highFreqHz"].toDouble(5000.0);
+    s.qFactor = obj["qFactor"].toDouble(1.0);
+    return s;
+}
+
+// --- Audio Mixer: Compressor ---
+
+QJsonObject ProjectFile::compressorToJson(const CompressorState &cs)
+{
+    QJsonObject obj;
+    obj["thresholdDb"] = cs.thresholdDb;
+    obj["ratio"] = cs.ratio;
+    obj["attackMs"] = cs.attackMs;
+    obj["releaseMs"] = cs.releaseMs;
+    obj["makeupDb"] = cs.makeupDb;
+    obj["enabled"] = cs.enabled;
+    return obj;
+}
+
+CompressorState ProjectFile::compressorFromJson(const QJsonObject &obj)
+{
+    CompressorState cs;
+    cs.thresholdDb = obj["thresholdDb"].toDouble(-12.0);
+    cs.ratio = obj["ratio"].toDouble(4.0);
+    cs.attackMs = obj["attackMs"].toDouble(10.0);
+    cs.releaseMs = obj["releaseMs"].toDouble(120.0);
+    cs.makeupDb = obj["makeupDb"].toDouble(0.0);
+    cs.enabled = obj["enabled"].toBool(false);
+    return cs;
+}
+
+// --- Audio Mixer: Auto Ducking ---
+
+QJsonObject ProjectFile::autoDuckToJson(const AutoDuckState &ad)
+{
+    QJsonObject obj;
+    obj["threshold"] = ad.thresholdDb;
+    obj["ratio"] = ad.ratio;
+    obj["attack"] = ad.attackMs;
+    obj["release"] = ad.releaseMs;
+    return obj;
+}
+
+AutoDuckState ProjectFile::autoDuckFromJson(const QJsonObject &obj)
+{
+    AutoDuckState ad;
+    ad.thresholdDb = obj["threshold"].toDouble(-20.0);
+    ad.ratio = obj["ratio"].toDouble(4.0);
+    ad.attackMs = obj["attack"].toDouble(5.0);
+    ad.releaseMs = obj["release"].toDouble(250.0);
+    return ad;
 }

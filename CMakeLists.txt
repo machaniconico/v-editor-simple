@@ -75,6 +75,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ProxyManagementDialog.cpp
     src/DecoderSlotManager.cpp
     src/AudioMixer.cpp
+    src/AudioMeterWidget.cpp
+    src/AudioMeterWidget.h
+    src/HistoryDockWidget.cpp
+    src/HistoryDockWidget.h
     src/LutImporter.cpp
     src/TimelineMarker.cpp
     src/VideoStabilizer.cpp
@@ -100,6 +104,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/NetworkRender.cpp
     src/RemotionExport.cpp
     src/PythonScript.cpp
+    src/LumetriScopes.cpp
     src/SplashScreen.h
     src/WelcomeWidget.h
     resources/resources.qrc
