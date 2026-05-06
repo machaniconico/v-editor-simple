@@ -383,6 +383,12 @@ void MainWindow::setupUI()
             });
     auto *escKey = new QShortcut(QKeySequence(Qt::Key_Escape), this);
     connect(escKey, &QShortcut::activated, this, [this]() {
+        // US-WIRE-3: Esc cancels motion tracking region picker
+        if (m_player && m_player->isRegionPickerActive()) {
+            m_player->exitRegionPickerMode();
+            statusBar()->showMessage(QString());
+            return;
+        }
         if (m_player && m_player->isPreviewMaximized()) {
             m_player->setPreviewMaximized(false);
         }
@@ -2859,35 +2865,57 @@ void MainWindow::trackMotion()
     if (!m_motionTracker)
         m_motionTracker = new MotionTracker(this);
 
-    QProgressDialog *progress = new QProgressDialog("Tracking motion…", "Cancel", 0, 100, this);
-    progress->setWindowTitle("Motion Tracking");
-    progress->setWindowModality(Qt::WindowModal);
-    progress->setMinimumDuration(0);
+    statusBar()->showMessage(
+        QString::fromUtf8("\xE3\x83\x97\xE3\x83\xAC\xE3\x83\x93\xE3\x83\xA5"
+                           "\xE3\x83\xBC\xE3\x81\xA7\xE3\x83\x88\xE3\x83\xA9"
+                           "\xE3\x83\x83\xE3\x82\xAD\xE3\x83\xB3\xE3\x82\xB0"
+                           "\xE9\xA0\x98\xE5\x9F\x9F\xE3\x82\x92\xE3\x83\x89"
+                           "\xE3\x83\xA9\xE3\x83\x83\xE3\x82\xB0\xE3\x81\x97"
+                           "\xE3\x81\xA6\xE9\x81\xB8\xE6\x8A\x9E\xE3\x81\x97"
+                           "\xE3\x81\xA6\xE3\x81\x8F\xE3\x81\xA0\xE3\x81\x95"
+                           "\xE3\x81\x84\xE3\x80\x82 (Esc \xE3\x81\xA7\xE3"
+                           "\x82\xAD\xE3\x83\xA3\xE3\x83\xB3\xE3\x82\xBB\xE3"
+                           "\x83\xAB)"), 0);
 
-    connect(m_motionTracker, &MotionTracker::progressChanged, progress, &QProgressDialog::setValue, Qt::UniqueConnection);
+    // US-WIRE-3: replace hardcoded QRect(100,100,64,64) with a user-driven
+    // rubber-band drag on the preview. The callback receives the rect in
+    // source-frame coords and kicks off the tracking worker + progress UI.
+    m_player->enterRegionPickerMode([this, clip](QRect region) {
+        statusBar()->showMessage(QString());
 
-    connect(m_motionTracker, &MotionTracker::trackingComplete, this,
-        [this, progress](const TrackingResult &result) {
-            progress->close();
-            progress->deleteLater();
-            if (!result.isEmpty()) {
-                QMessageBox::information(this, "Motion Tracking",
-                    QString("Tracking complete: %1 frames tracked.")
-                        .arg(result.regions.size()));
-            } else {
-                QMessageBox::warning(this, "Motion Tracking", "Tracking produced no results.");
-            }
-        }, Qt::UniqueConnection);
+        if (region.isNull() || region.width() <= 0 || region.height() <= 0) {
+            // User cancelled (Esc or too-small drag)
+            return;
+        }
 
-    connect(progress, &QProgressDialog::canceled, this, [this]() {
-        if (m_motionTracker)
-            m_motionTracker->cancel();
+        QProgressDialog *progress = new QProgressDialog("Tracking motion\u2026", "Cancel", 0, 100, this);
+        progress->setWindowTitle("Motion Tracking");
+        progress->setWindowModality(Qt::WindowModal);
+        progress->setMinimumDuration(0);
+
+        connect(m_motionTracker, &MotionTracker::progressChanged, progress, &QProgressDialog::setValue, Qt::UniqueConnection);
+
+        connect(m_motionTracker, &MotionTracker::trackingComplete, this,
+            [this, progress](const TrackingResult &result) {
+                progress->close();
+                progress->deleteLater();
+                if (!result.isEmpty()) {
+                    QMessageBox::information(this, "Motion Tracking",
+                        QString("Tracking complete: %1 frames tracked.")
+                            .arg(result.regions.size()));
+                } else {
+                    QMessageBox::warning(this, "Motion Tracking", "Tracking produced no results.");
+                }
+            }, Qt::UniqueConnection);
+
+        connect(progress, &QProgressDialog::canceled, this, [this]() {
+            if (m_motionTracker)
+                m_motionTracker->cancel();
+        });
+
+        m_motionTracker->startTracking(clip.filePath, region);
+        statusBar()->showMessage("Starting motion tracking\u2026");
     });
-
-    // Default tracking region: centre 64x64 patch
-    QRect region(100, 100, 64, 64);
-    m_motionTracker->startTracking(clip.filePath, region);
-    statusBar()->showMessage("Starting motion tracking…");
 }
 
 void MainWindow::motionTrackSetup()

@@ -109,6 +109,82 @@ bool extractD3D11FrameRef(const AVFrame *frame, D3D11FrameRef *out)
     return out->texture != nullptr;
 }
 
+// US-WIRE-3: transparent overlay for rubber-band region selection on the
+// preview widget. The overlay is a child of VideoPlayer, positioned over
+// GLPreview, and paints a translucent drag rect with 2px white outline.
+class RegionPickerOverlay : public QWidget
+{
+public:
+    using Callback = std::function<void(QRect)>;
+
+    explicit RegionPickerOverlay(QWidget *parent)
+        : QWidget(parent)
+    {
+        setMouseTracking(true);
+        setFocusPolicy(Qt::StrongFocus);
+        setCursor(Qt::CrossCursor);
+        hide();
+    }
+
+    void setCallback(Callback cb) { m_callback = std::move(cb); }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        p.fillRect(rect(), QColor(0, 0, 0, 30));
+        if (m_dragging && m_currentRect.width() > 0 && m_currentRect.height() > 0) {
+            QColor fill(255, 255, 255, 38);
+            p.fillRect(m_currentRect, fill);
+            p.setPen(QPen(Qt::white, 2));
+            p.drawRect(m_currentRect);
+        }
+    }
+
+    void mousePressEvent(QMouseEvent *e) override
+    {
+        if (e->button() == Qt::LeftButton) {
+            m_dragging = true;
+            m_origin = e->pos();
+            m_currentRect = QRect();
+            update();
+        }
+    }
+
+    void mouseMoveEvent(QMouseEvent *e) override
+    {
+        if (m_dragging) {
+            m_currentRect = QRect(m_origin, e->pos()).normalized();
+            update();
+        }
+    }
+
+    void mouseReleaseEvent(QMouseEvent *e) override
+    {
+        if (e->button() == Qt::LeftButton && m_dragging) {
+            m_dragging = false;
+            m_currentRect = QRect(m_origin, e->pos()).normalized();
+            update();
+            if (m_currentRect.width() >= 4 && m_currentRect.height() >= 4 && m_callback) {
+                m_callback(m_currentRect);
+            }
+        }
+    }
+
+    void keyPressEvent(QKeyEvent *e) override
+    {
+        if (e->key() == Qt::Key_Escape) {
+            if (m_callback) m_callback(QRect());
+        }
+    }
+
+private:
+    Callback m_callback;
+    bool m_dragging = false;
+    QPoint m_origin;
+    QRect m_currentRect;
+};
+
 
 // VEDITOR_TICK_TRACE=1 turns on per-tick wall-time accumulators that print a
 // 30-tick rollup line to qInfo. Default off — read once per process so the
@@ -195,6 +271,11 @@ VideoPlayer::~VideoPlayer()
     // handlePlaybackTick doesn't fire on a half-destroyed object.
     if (m_playbackTimer) m_playbackTimer->stop();
     if (m_seekTimer)     m_seekTimer->stop();
+    // US-WIRE-3: clean up region picker overlay if active
+    if (m_regionPickerOverlay) {
+        m_regionPickerOverlay->deleteLater();
+        m_regionPickerOverlay = nullptr;
+    }
     resetDecoder();
     // Tear down V2+ decoder pool after the legacy V1 decoder is gone, then
     // release the shared HW device context. The pool decoders only hold
@@ -2012,6 +2093,71 @@ void VideoPlayer::setHiddenTextOverlayIndex(int index)
     refreshDisplayedFrame();
 }
 
+// US-WIRE-3: enter region picker mode. Creates a transparent overlay on
+// top of GLPreview; the user drags a rectangle on it and the callback
+// receives the QRect in source-frame pixel coordinates.
+void VideoPlayer::enterRegionPickerMode(std::function<void(QRect)> callback)
+{
+    exitRegionPickerMode();
+    if (!callback || !m_glPreview) return;
+    m_regionPickerCallback = std::move(callback);
+    m_regionPickerActive = true;
+
+    // Find the QStackedWidget that parents GLPreview so we can match
+    // the overlay geometry exactly to GLPreview's widget rect.
+    QStackedWidget *stack = qobject_cast<QStackedWidget *>(m_glPreview->parentWidget());
+    QRect overlayGeo = stack ? stack->geometry() : m_glPreview->geometry();
+
+    m_regionPickerOverlay = new RegionPickerOverlay(this);
+    m_regionPickerOverlay->setGeometry(overlayGeo);
+
+    m_regionPickerOverlay->setCallback([this](QRect widgetRect) {
+        if (!m_regionPickerCallback) return;
+
+        if (widgetRect.isNull()) {
+            m_regionPickerCallback = nullptr;
+            exitRegionPickerMode();
+            return;
+        }
+
+        // Map from widget (overlay) coordinates → source-frame pixel
+        // coordinates using GLPreview's letterbox rect.
+        QRectF lb = m_glPreview ? m_glPreview->letterboxRect() : QRectF();
+        int srcW = (m_codecCtx && m_codecCtx->width > 0)
+                       ? m_codecCtx->width : m_canvasWidth;
+        int srcH = (m_codecCtx && m_codecCtx->height > 0)
+                       ? m_codecCtx->height : m_canvasHeight;
+
+        QRect mapped = widgetRect;
+        if (lb.width() > 1.0 && lb.height() > 1.0) {
+            double sx = static_cast<double>(srcW) / lb.width();
+            double sy = static_cast<double>(srcH) / lb.height();
+            int mx = qMax(0, qRound((widgetRect.x() - lb.x()) * sx));
+            int my = qMax(0, qRound((widgetRect.y() - lb.y()) * sy));
+            int mw = qMin(srcW - mx, qMax(1, qRound(widgetRect.width() * sx)));
+            int mh = qMin(srcH - my, qMax(1, qRound(widgetRect.height() * sy)));
+            mapped = QRect(mx, my, mw, mh);
+        }
+
+        m_regionPickerCallback(mapped);
+        exitRegionPickerMode();
+    });
+
+    m_regionPickerOverlay->show();
+    m_regionPickerOverlay->raise();
+    m_regionPickerOverlay->setFocus();
+}
+
+void VideoPlayer::exitRegionPickerMode()
+{
+    m_regionPickerActive = false;
+    m_regionPickerCallback = nullptr;
+    if (m_regionPickerOverlay) {
+        m_regionPickerOverlay->deleteLater();
+        m_regionPickerOverlay = nullptr;
+    }
+}
+
 void VideoPlayer::setColorCorrection(const ColorCorrection &cc)
 {
     if (m_glPreview)
@@ -2896,6 +3042,10 @@ void VideoPlayer::refreshDisplayedFrame()
 void VideoPlayer::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
+    if (m_regionPickerOverlay && m_glPreview) {
+        QStackedWidget *stack = qobject_cast<QStackedWidget *>(m_glPreview->parentWidget());
+        m_regionPickerOverlay->setGeometry(stack ? stack->geometry() : m_glPreview->geometry());
+    }
     refreshDisplayedFrame();
 }
 

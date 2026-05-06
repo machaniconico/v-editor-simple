@@ -13,6 +13,7 @@
 #include <QVector>
 #include <QHash>
 #include <QRectF>
+#include <functional>
 #include "VideoEffect.h"
 #include "PlaybackTypes.h"
 #include "TextManager.h"
@@ -173,6 +174,12 @@ public:
     // show behind the GLPreview inline edit layer (-1 = none). Re-composes
     // the cached source frame so the change is visible while paused.
     void setHiddenTextOverlayIndex(int index);
+    // US-WIRE-3: region picker for motion tracking. The user drags a
+    // rectangle on the preview; the callback receives the mapped rect
+    // in source-frame pixel coordinates.
+    void enterRegionPickerMode(std::function<void(QRect)> callback);
+    void exitRegionPickerMode();
+    bool isRegionPickerActive() const { return m_regionPickerActive; }
 
 public slots:
     void play();
@@ -514,6 +521,10 @@ private:
     int64_t m_sequenceDurationUs = 0;
     QString m_loadedFilePath;
     bool m_textToolActive = false;
+    // US-WIRE-3: region picker for motion tracking
+    bool m_regionPickerActive = false;
+    std::function<void(QRect)> m_regionPickerCallback;
+    class RegionPickerOverlay *m_regionPickerOverlay = nullptr;
     QVector<EnhancedTextOverlay> m_textOverlays;
     // Cached raw source of the most recent frame. Needed so
     // setHiddenTextOverlayIndex can re-compose while paused (the cached
