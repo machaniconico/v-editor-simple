@@ -68,6 +68,7 @@ void MotionTracker::setMinConfidence(double conf)
 void MotionTracker::startTracking(const QString &filePath, const QRect &initialRect)
 {
     m_result = TrackingResult{};
+    m_cancelRequested = false;
 
     auto *thread = QThread::create([this, filePath, initialRect]() {
         decodeAndTrack(filePath, initialRect);
@@ -75,6 +76,11 @@ void MotionTracker::startTracking(const QString &filePath, const QRect &initialR
     });
     connect(thread, &QThread::finished, thread, &QThread::deleteLater);
     thread->start();
+}
+
+void MotionTracker::cancel()
+{
+    m_cancelRequested = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +291,10 @@ bool MotionTracker::decodeAndTrack(const QString &filePath, const QRect &initial
     bool firstFrame = true;
 
     while (av_read_frame(fmtCtx, packet) >= 0) {
+        if (m_cancelRequested) {
+            av_packet_unref(packet);
+            goto cleanup;
+        }
         if (packet->stream_index != videoIdx) {
             av_packet_unref(packet);
             continue;

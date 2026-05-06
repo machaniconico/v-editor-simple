@@ -783,6 +783,13 @@ void MainWindow::setupMenuBar()
 
     effectsMenu->addSeparator();
 
+    // US-FEAT-D: motion tracking UI
+    m_trackMotionAction = effectsMenu->addAction("Track Motion…");
+    m_trackMotionAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_T));
+    connect(m_trackMotionAction, &QAction::triggered, this, &MainWindow::trackMotion);
+
+    effectsMenu->addSeparator();
+
     auto *shaderFxAction = effectsMenu->addAction("GPUシェーダーエフェクト...");
     connect(shaderFxAction, &QAction::triggered, this, &MainWindow::applyShaderEffect);
 
@@ -2793,6 +2800,52 @@ void MainWindow::multiCamSwitch()
     m_multiCam->switchToCamera(idx, m_timeline->playheadPosition());
     statusBar()->showMessage(QString("Switched to %1 at %2s")
         .arg(selected).arg(m_timeline->playheadPosition(), 0, 'f', 1));
+}
+
+// US-FEAT-D: motion tracking UI
+void MainWindow::trackMotion()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Motion Tracking", "Select a clip first.");
+        return;
+    }
+
+    const auto &clips = m_timeline->videoClips();
+    if (clips.isEmpty()) return;
+    const ClipInfo &clip = clips.first();
+
+    if (!m_motionTracker)
+        m_motionTracker = new MotionTracker(this);
+
+    QProgressDialog *progress = new QProgressDialog("Tracking motion…", "Cancel", 0, 100, this);
+    progress->setWindowTitle("Motion Tracking");
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(0);
+
+    connect(m_motionTracker, &MotionTracker::progressChanged, progress, &QProgressDialog::setValue, Qt::UniqueConnection);
+
+    connect(m_motionTracker, &MotionTracker::trackingComplete, this,
+        [this, progress](const TrackingResult &result) {
+            progress->close();
+            progress->deleteLater();
+            if (!result.isEmpty()) {
+                QMessageBox::information(this, "Motion Tracking",
+                    QString("Tracking complete: %1 frames tracked.")
+                        .arg(result.regions.size()));
+            } else {
+                QMessageBox::warning(this, "Motion Tracking", "Tracking produced no results.");
+            }
+        }, Qt::UniqueConnection);
+
+    connect(progress, &QProgressDialog::canceled, this, [this]() {
+        if (m_motionTracker)
+            m_motionTracker->cancel();
+    });
+
+    // Default tracking region: centre 64x64 patch
+    QRect region(100, 100, 64, 64);
+    m_motionTracker->startTracking(clip.filePath, region);
+    statusBar()->showMessage("Starting motion tracking…");
 }
 
 void MainWindow::motionTrackSetup()

@@ -116,6 +116,7 @@ private slots:
     void colorCorrection();
     void videoEffects();
     void pluginEffects();
+    void trackMotion(); // US-FEAT-D: motion tracking UI
     void editKeyframes();
     void autoSilenceDetect();
     void autoJumpCut();
@@ -219,6 +220,7 @@ private:
     QStringList m_supportedFormats;
     ProjectConfig m_projectConfig;
 
+    QAction *m_trackMotionAction = nullptr; // US-FEAT-D: motion tracking UI
     QAction *m_splitAction;
     QAction *m_deleteAction;
     QAction *m_rippleDeleteAction;

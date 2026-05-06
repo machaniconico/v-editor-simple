@@ -6,6 +6,7 @@
 #include <QImage>
 #include <QVector>
 #include <QString>
+#include <atomic>
 
 // --- Tracking region at a single frame ---
 
@@ -48,6 +49,9 @@ public:
     // Start tracking: extract frames via FFmpeg and track the object in initialRect
     void startTracking(const QString &filePath, const QRect &initialRect);
 
+    // Cancel an in-progress tracking operation
+    void cancel();
+
     // Track object in a single frame given a template image
     TrackingRegion trackFrame(const QImage &currentFrame, const QImage &templateImage,
                               const QRect &searchArea);
@@ -83,4 +87,5 @@ private:
     TrackingResult m_result;
     int m_searchMargin = 50;       // pixel margin around last known position
     double m_minConfidence = 0.5;  // minimum NCC score to accept
+    std::atomic<bool> m_cancelRequested{false};
 };
