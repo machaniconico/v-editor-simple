@@ -2213,8 +2213,39 @@ void VideoPlayer::scheduleNextFrame()
     // currently sourcing from), so the J-cut/L-cut filePath-guard the old
     // QMediaPlayer path needed is gone — every active video entry can pace
     // off the same single audio clock.
+    //
+    // US-VFF-009 cold-start warmup: skip audio-paced gating for the first
+    // 200 ms after play(). audibleClockUs can briefly report cursor (write
+    // position, ~50–170 ms ahead of actual audible position) before the
+    // sink's first readData publishes a stable lag. That makes
+    // videoAheadUs deeply negative → waitUs deeply negative → "audio
+    // meaningfully ahead" branch → intervalMs = floorMs (≈ frameInterval/2)
+    // → timer fires at 2x rate → user-visible cold-start fast-forward.
+    constexpr int kAudioPaceWarmupMs = 200;
+    const bool inWarmup = m_lastPlayCallTimer.isValid()
+        && m_lastPlayCallTimer.elapsed() < kAudioPaceWarmupMs;
+    // VEDITOR_FORCE_FRAME_INTERVAL=1: bypass audio-paced gating entirely
+    // (debug switch for cold-start fast-forward bisection). Forces
+    // intervalMs = frameIntervalMs every tick → 1x video pace regardless
+    // of audio clock readings. If the user's reported fast-forward
+    // disappears with this flag set, the bug is in the audio-paced gating;
+    // if it persists, the bug is elsewhere (timer, decode, m_currentPositionUs).
+    // US-VFF-010 (default-on): video timer paces at frameIntervalMs and
+    // skip-decode is disabled. AudioMixer alone owns A/V sync via the
+    // sample-accurate sink output — video chasing the audio clock made
+    // the cold-start audibleClockUs() inaccuracy (cursor reporting as
+    // audible 50–170 ms before sink drains) trigger a 6-frame skip-decode
+    // burst on every play(), the user-visible "early fast-forward" bug.
+    // Empirical bisection (VEDITOR_FORCE_FRAME_INTERVAL=1 fixed the bug
+    // outright) confirmed audio-paced gating was the source. Opt-out via
+    // VEDITOR_FORCE_FRAME_INTERVAL_DISABLE=1 to restore the legacy chase
+    // path for diagnostics.
+    static const bool kForceFrameInterval =
+        qEnvironmentVariableIntValue("VEDITOR_FORCE_FRAME_INTERVAL_DISABLE") == 0;
     if (m_mixer && m_mixer->isPlaying() && m_playbackSpeed >= 0.0
-        && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+        && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()
+        && !inWarmup
+        && !kForceFrameInterval) {
         const int64_t audioTlUs = m_mixer->audibleClockUs();
         const int64_t videoAheadUs = m_timelinePositionUs - audioTlUs;
         const int64_t waitUs = static_cast<int64_t>(videoAheadUs / absSpeed);
@@ -2232,10 +2263,52 @@ void VideoPlayer::scheduleNextFrame()
         // decode loop (and the optional VEDITOR_SEEK_ON_DRIFT seek), not
         // by the timer interval, so we don't need a multi-second ceiling.
         const int floorMs = qMax(1, frameIntervalMs / 2);
-        intervalMs = (waitUs <= 0)
-            ? floorMs
-            : static_cast<int>(qBound<int64_t>(floorMs, waitUs / 1000,
-                                               static_cast<int64_t>(frameIntervalMs)));
+        // Bug fix (V1→V2 sequential boundary): AudioMixer::seekTo resets
+        // m_audibleLagUs to 0, so right after a clip-boundary mixer seek
+        // audibleClockUs == m_timelinePositionUs (both at V2_START) and
+        // videoAheadUs is exactly 0. The previous "waitUs <= 0 → floorMs"
+        // branch then paced video at half the frame interval, causing 2x
+        // playback until the audio buffer's lag re-grew to ~50 ms (V1
+        // steady state hides this because the chronic buffer lag keeps
+        // videoAhead ≈ +50 ms, capping at frameIntervalMs). Use floorMs
+        // only when audio is meaningfully ahead (>1 frame behind in
+        // wait terms); aligned/ahead → frame-interval pace.
+        const int64_t kAlignedThresholdUs = -baseFrameUs;
+        if (waitUs <= kAlignedThresholdUs) {
+            // Audio meaningfully ahead (>1 frame behind): catch up at floor
+            intervalMs = floorMs;
+        } else if (waitUs <= 0) {
+            // Aligned within (-1 frame, 0]: pace at frame interval. AudioMixer
+            // ::seekTo resets m_audibleLagUs to 0 (AudioMixer.cpp:1030,1064),
+            // so right after a clip-boundary mixer seek audibleClockUs ==
+            // m_timelinePositionUs (both V2_START) and waitUs is exactly 0;
+            // the previous "waitUs <= 0 → floorMs" branch then paced video
+            // at half the frame interval, causing 2x playback at V1→V2
+            // sequential boundaries. V1 steady state hides this because the
+            // chronic ~50 ms buffer lag keeps videoAhead positive.
+            intervalMs = frameIntervalMs;
+        } else {
+            // Graduated catchup for waitUs in (0, frameInterval]: original
+            // behaviour preserved so audio buffer lag oscillation can
+            // converge instead of step-changing every tick.
+            intervalMs = static_cast<int>(qBound<int64_t>(
+                static_cast<int64_t>(floorMs),
+                waitUs / 1000,
+                static_cast<int64_t>(frameIntervalMs)));
+        }
+        // DIAG (V2 fast-forward bug investigation): emit one log line per
+        // tick when audio-paced gate is engaged. Will be pruned after empirical.
+        static int s_diagCount = 0;
+        if (s_diagCount++ < 80) {
+            qInfo().nospace() << "[v2diag] entry=" << m_activeEntry
+                              << " baseFrameUs=" << baseFrameUs
+                              << " frameIntervalMs=" << frameIntervalMs
+                              << " audioTlUs=" << audioTlUs
+                              << " timelineUs=" << m_timelinePositionUs
+                              << " videoAheadUs=" << videoAheadUs
+                              << " waitUs=" << waitUs
+                              << " intervalMs=" << intervalMs;
+        }
     }
     // Body-time correction only when the cap actually fired. In the
     // synced case the audio-paced wait already equals frameInterval -
@@ -2266,6 +2339,23 @@ int VideoPlayer::correctVideoDriftAgainstAudioClock()
     if (m_activeEntry < 0 || m_activeEntry >= m_sequence.size())
         return 0;
 
+    // VEDITOR_FORCE_FRAME_INTERVAL=1: also short-circuit drift correction
+    // (debug bisection for cold-start fast-forward).
+    // US-VFF-010 (default-on): video timer paces at frameIntervalMs and
+    // skip-decode is disabled. AudioMixer alone owns A/V sync via the
+    // sample-accurate sink output — video chasing the audio clock made
+    // the cold-start audibleClockUs() inaccuracy (cursor reporting as
+    // audible 50–170 ms before sink drains) trigger a 6-frame skip-decode
+    // burst on every play(), the user-visible "early fast-forward" bug.
+    // Empirical bisection (VEDITOR_FORCE_FRAME_INTERVAL=1 fixed the bug
+    // outright) confirmed audio-paced gating was the source. Opt-out via
+    // VEDITOR_FORCE_FRAME_INTERVAL_DISABLE=1 to restore the legacy chase
+    // path for diagnostics.
+    static const bool kForceFrameInterval =
+        qEnvironmentVariableIntValue("VEDITOR_FORCE_FRAME_INTERVAL_DISABLE") == 0;
+    if (kForceFrameInterval)
+        return 0;
+
     const int64_t audioTlUs = m_mixer->audibleClockUs();
     const int64_t frameUs = (m_frameDurationUs > 0) ? m_frameDurationUs : (AV_TIME_BASE / 30);
 
@@ -2285,6 +2375,22 @@ int VideoPlayer::correctVideoDriftAgainstAudioClock()
         }
     }
 
+    // US-VFF-009 cold-start warmup guard: suppress skip-decode for the
+    // first 200 ms after play() starts. The audio sink takes ~1-3 readData
+    // callbacks to publish a stable lag from real OS-buffer state; before
+    // that, audibleClockUs() can briefly report a position 50–170 ms ahead
+    // of what's physically audible (the sample-write cursor minus a stale
+    // pre-fill lag of 0). This window must NOT trigger the skip-decode
+    // catch-up loop, otherwise video discards 6 frames in one tick and
+    // the user sees the cold-start fast-forward burst, even on single
+    // clip playback. m_lastPlayCallTimer.restart() is invoked in play()
+    // so it tracks "ms since this play started".
+    constexpr int kWarmupSuppressMs = 200;
+    if (m_lastPlayCallTimer.isValid()
+        && m_lastPlayCallTimer.elapsed() < kWarmupSuppressMs) {
+        return 0;
+    }
+
     // Threshold > 1.5 frames avoids skipping on natural scheduler jitter.
     const int64_t catchupThresholdUs = (frameUs * 3) / 2;
     const int maxSkips = 6; // bounded so one tick can't block the UI
@@ -2299,6 +2405,20 @@ int VideoPlayer::correctVideoDriftAgainstAudioClock()
         if (!decodeNextFrame(false))
             break;
         ++skipped;
+    }
+    // [v2ff-skip-probe] log first 30 boundary or fast-forward events so we
+    // can prove whether skip-decode is firing during the empirical reproduction.
+    if (skipped > 0) {
+        static int s_probeCount = 0;
+        if (s_probeCount++ < 30) {
+            qInfo().nospace()
+                << "[v2ff-skip] tick skipped=" << skipped
+                << " audioTl=" << audioTlUs
+                << " timelineUs=" << m_timelinePositionUs
+                << " drift=" << (audioTlUs - m_timelinePositionUs)
+                << " catchupThresholdUs=" << catchupThresholdUs
+                << " entry=" << m_activeEntry;
+        }
     }
     return skipped;
 }
@@ -2381,8 +2501,33 @@ void VideoPlayer::updatePositionUi()
         // Reproject the current file-local position into timeline coordinates
         // so the slider, time label and positionChanged signal all speak the
         // same timeline-space the Timeline widget uses.
-        if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size())
-            m_timelinePositionUs = fileLocalToTimelineUs(m_activeEntry, m_currentPositionUs);
+        // US-VFF-003: reject stale-timelineStart reprojections. v2diag captured
+        // a transient V2 timelineStart=7649.7s that settled to 6386.09s;
+        // reprojecting the same file-local cursor through that stale start
+        // produced the bogus 10628s seekTo leak into AudioMixer (see
+        // .omc/state/v2ff_rca.md). The 2-frame acceptance window admits
+        // decoder-driven progression; explicit seeks bypass via the seek flags.
+        if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+            const int64_t projected =
+                fileLocalToTimelineUs(m_activeEntry, m_currentPositionUs);
+            const int64_t baseFrameUs = (m_frameDurationUs > 0)
+                ? m_frameDurationUs : (AV_TIME_BASE / 30);
+            const int64_t deltaUs = projected - m_timelinePositionUs;
+            const int64_t acceptUs = baseFrameUs * 2;
+            if ((deltaUs >= -acceptUs && deltaUs <= acceptUs)
+                || m_seekInProgress || m_pendingSeekMs >= 0) {
+                m_timelinePositionUs = projected;
+            } else {
+                static QElapsedTimer s_warnThrottle;
+                if (!s_warnThrottle.isValid() || s_warnThrottle.elapsed() > 1000) {
+                    qWarning().nospace()
+                        << "[VFF] rejected stale reprojection: projected=" << projected
+                        << " canonical=" << m_timelinePositionUs
+                        << " delta=" << deltaUs << " entry=" << m_activeEntry;
+                    s_warnThrottle.start();
+                }
+            }
+        }
         displayUs = m_timelinePositionUs;
         totalUs = m_sequenceDurationUs;
     } else {

@@ -295,19 +295,14 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
     QMutexLocker lock(&m_mixer->m_controlMutex);
     std::memset(data, 0, static_cast<size_t>(maxlen));
 
-    // Refresh the audible-lag publication so audibleClockUs() can stay
-    // lock-free. The audio worker thread is the only path that calls into
-    // QAudioSink internals; doing it here avoids the GUI thread blocking on
-    // m_controlMutex (and on Qt sink mutexes) once per video tick — which
-    // was starving the audio worker before this fix and producing silence.
-    if (m_mixer->m_sink) {
-        const qint64 buffered = m_mixer->m_sink->bufferSize() - m_mixer->m_sink->bytesFree();
-        const int64_t lagUs = (buffered > 0)
-            ? buffered * 1'000'000LL
-                  / (static_cast<int64_t>(AudioMixer::kBytesPerFrame) * AudioMixer::kSampleRateHz)
-            : 0;
-        m_mixer->m_audibleLagUs.store(lagUs, std::memory_order_release);
-    }
+    // US-VFF-009: lag is now refreshed AFTER cursor advance at the end of
+    // this function. Publishing it here (before fill) made audibleClockUs()
+    // briefly return cursor + maxlenUs - 0 (cold-start prefill window where
+    // bytesFree==bufferSize so lag=0 was published, then cursor jumped by
+    // ~83 ms when we wrote samples below). Video saw "audio jumped ahead"
+    // and skip-decoded up to 6 frames in one tick → cold-start fast-forward
+    // even on single-track playback. Compute lag once cursor is already
+    // advanced so audibleClockUs() reflects the actual audible position.
 
     if (!m_mixer->m_playing.load(std::memory_order_acquire)) {
         m_mixer->m_consecutiveStallCallbacks.store(0, std::memory_order_release);
@@ -752,6 +747,26 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
 
     m_mixer->m_writeCursorUs.fetch_add(deltaUs, std::memory_order_release);
 
+    // US-VFF-009: publish audible lag AFTER cursor advance.
+    // bufferedUs reflects the post-fill state (samples we just queued plus
+    // anything left over). audibleClockUs() = cursor - lag now equals
+    // (cursor_pre + deltaUs) - bufferedUs_post, which on cold start equals
+    // cursor_pre exactly (the position currently audible — i.e. nothing yet,
+    // since we just queued our first chunk). Steady state is unchanged
+    // because bufferedUs hovers at ~bufferSize and cursor advances at the
+    // sample-write rate. This eliminates the cold-start +50–170 ms jump
+    // that previously triggered correctVideoDriftAgainstAudioClock's
+    // skip-decode loop on every play() (gap-independent fast-forward
+    // observed even on single-clip playback after US-VFF-008 revert).
+    if (m_mixer->m_sink) {
+        const qint64 buffered = m_mixer->m_sink->bufferSize() - m_mixer->m_sink->bytesFree();
+        const int64_t lagUs = (buffered > 0)
+            ? buffered * 1'000'000LL
+                  / (static_cast<int64_t>(AudioMixer::kBytesPerFrame) * AudioMixer::kSampleRateHz)
+            : 0;
+        m_mixer->m_audibleLagUs.store(lagUs, std::memory_order_release);
+    }
+
     // Throttled level-meter emission (<=30 Hz). Snapshot+reset accumulators
     // under m_controlMutex, then emit queued (unlocked) to the GUI thread.
     {
@@ -934,6 +949,28 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
 void AudioMixer::seekTo(int64_t timelineUs) {
     qInfo() << "AudioMixer::seekTo us=" << timelineUs
             << "playing=" << m_playing.load(std::memory_order_acquire);
+    // US-VFF-002: Defensive clamp against out-of-bounds timelineUs.
+    // v2diag log: AudioMixer::seekTo us=10628155000 (total=7540s) leaked from
+    // corrupted m_timelinePositionUs. Clamp prevents bogus values from
+    // corrupting m_writeCursorUs and propagating to the audible clock.
+    {
+        int64_t totalDurationUs = 0;
+        {
+            QMutexLocker lock(&m_controlMutex);
+            for (auto *e : qAsConst(m_entries)) {
+                if (!e) continue;
+                const int64_t endUs = static_cast<int64_t>(e->entry.timelineEnd * 1e6);
+                if (endUs > totalDurationUs) totalDurationUs = endUs;
+            }
+        }
+        if (timelineUs < 0 || timelineUs > totalDurationUs + 100'000) {
+            qWarning().nospace()
+                << "[AudioMixer::seekTo OOB] requested=" << timelineUs
+                << " totalDurationUs=" << totalDurationUs
+                << " clamping to valid range";
+            timelineUs = qBound<int64_t>(0, timelineUs, totalDurationUs);
+        }
+    }
     // De-dup: if we're already at exactly this timeline position with
     // the sink in ActiveState, skip the stop/start cycle. Each
     // QAudioSink restart dispatches synchronously on the main thread
@@ -948,9 +985,17 @@ void AudioMixer::seekTo(int64_t timelineUs) {
         if (cur == timelineUs
             && sinkState == QAudio::ActiveState
             && m_playing.load(std::memory_order_acquire)) {
-            // m_audibleLagUs and per-entry seekPending stay valid here:
-            // the cursor never moved and the sink kept producing samples,
-            // so the prior seek's bookkeeping remains accurate.
+            // US-VFF-008 (revert of US-VFF-007 here): strict-equality
+            // dedup does NOT touch sinkSnap — the OS audio buffer is still
+            // playing pre-seek samples (~50–170 ms behind cursor), so the
+            // existing m_audibleLagUs accurately reflects that lag.
+            // Forcing lag=0 made audibleClockUs() return cursor (sample-
+            // write position), which is 50–170 ms ahead of the actual
+            // audible position; correctVideoDriftAgainstAudioClock then
+            // skip-decoded up to 6 frames/tick → gap-independent fast-
+            // forward (3-agent RCA round 2). The cursor never moved and
+            // the sink kept producing samples, so prior bookkeeping
+            // (including m_audibleLagUs) remains accurate.
             return;
         }
         // Iteration 13 — tolerance-based dedup for clip boundary advance.
@@ -999,6 +1044,16 @@ void AudioMixer::seekTo(int64_t timelineUs) {
                         << "target=" << timelineUs << "delta=" << deltaUs;
                 tolerantLogThrottle.start();
             }
+            // US-VFF-008 (revert of US-VFF-007 here): tolerant-dedup
+            // bumps m_writeCursorUs to timelineUs but does NOT reset the
+            // sink. The OS audio buffer (~50–170 ms ahead of audible
+            // playback) keeps the previous m_audibleLagUs valid for
+            // audibleClockUs() = cursor − lag. Setting lag=0 here was
+            // the dominant fast-forward trigger: skip-decode loop saw
+            // audioTlUs ≈ cursor (write position) instead of audible
+            // position, computed +50–170 ms drift, and discard-decoded
+            // up to 6 frames/tick. Empirical gap-independent reproduction
+            // post-fix confirmed this. Leave m_audibleLagUs untouched.
             return;
         }
         // Phase 1e Win #13 — Fix K: time-based scrub dedup. When the user
