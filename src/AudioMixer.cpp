@@ -1226,6 +1226,14 @@ void AudioMixer::setTrackGain(int trackIdx, double gain) {
     recomputeEffectiveGainsLocked();
 }
 
+double AudioMixer::trackGain(int trackIdx) const
+{
+    QMutexLocker lock(&m_controlMutex);
+    if (trackIdx < 0 || trackIdx >= kMaxAudioTracks) return 1.0;
+    if (trackIdx >= m_trackStates.size()) return 1.0;
+    return m_trackStates[trackIdx].gain;
+}
+
 void AudioMixer::setTrackEqConfig(int trackIdx, const AudioEQConfig &cfg) {
     if (trackIdx < 0 || trackIdx >= kMaxAudioTracks) return;
 

@@ -180,6 +180,14 @@ private slots:
     void openMasterCompressor();
     void openAutoDuckSettings();
 
+    // Audio meter context menu handlers
+    void onMeterRequestEqPresetMenu(int trackIdx, QPoint globalPos);
+    void onMeterRequestCompressorDialog();
+    void onMeterRequestAutoDuckDialog();
+    void onMeterRequestNormalize(int trackIdx, double gainDb);
+    void onMeterRequestNormalizeAll();
+    void onMeterRequestResetAllMeters();
+
 protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
@@ -303,6 +311,8 @@ private:
     // Audio meters dock
     QDockWidget *m_audioMetersDock = nullptr;
     QList<QMetaObject::Connection> m_meterConnections;
+    QList<class AudioMeterWidget *> m_audioMeterWidgets;
+    class AudioMeterWidget *m_masterMeter = nullptr;
     void rebuildAudioMeters();
 
     // History dock

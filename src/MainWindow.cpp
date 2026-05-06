@@ -74,6 +74,7 @@ MainWindow::MainWindow(QWidget *parent)
 
     setupUI();
     qInfo() << "MainWindow::setupUI done";
+    m_timeline->setMarkerManager(&m_markerManager);
     setupMenuBar();
     qInfo() << "MainWindow::setupMenuBar done";
     setupToolBar();
@@ -152,6 +153,8 @@ MainWindow::MainWindow(QWidget *parent)
 
     // Restore saved window state
     restoreWindowState();
+
+    m_timeline->setAudioMixer(m_player->audioMixer());
 
     rebuildAudioMeters();
 
@@ -658,6 +661,16 @@ void MainWindow::setupMenuBar()
             [this](bool on) {
                 TimelineTrack::setEnvelopeEditMode(on);
                 if (m_timeline) m_timeline->repaintAudioTracks();
+                int trackCount = m_timeline ? m_timeline->audioTrackCount() : -1;
+                int clipCount = 0;
+                if (m_timeline) {
+                    for (auto *t : m_timeline->audioTracks())
+                        if (t) clipCount += t->clipCount();
+                }
+                statusBar()->showMessage(
+                    QString("ボリュームエンベロープ %1 (audio tracks=%2, total clips=%3)")
+                        .arg(on ? QStringLiteral("ON") : QStringLiteral("OFF"))
+                        .arg(trackCount).arg(clipCount), 6000);
             });
 
     audioMenu->addSeparator();
@@ -4394,6 +4407,7 @@ void MainWindow::rebuildAudioMeters()
     for (const auto &conn : m_meterConnections)
         QObject::disconnect(conn);
     m_meterConnections.clear();
+    m_audioMeterWidgets.clear();
 
     const int n = m_timeline ? m_timeline->audioTrackCount() : 0;
 
@@ -4411,10 +4425,13 @@ void MainWindow::rebuildAudioMeters()
 
         AudioMeterWidget *meter = new AudioMeterWidget();
         meter->setFixedWidth(20);
+        meter->setTrackIndex(i);
 
         trackLayout->addWidget(label);
         trackLayout->addWidget(meter);
         layout->addLayout(trackLayout);
+
+        m_audioMeterWidgets.append(meter);
 
         if (auto *mixer = m_player->audioMixer()) {
             auto conn = connect(mixer, &AudioMixer::levelChanged, meter,
@@ -4424,6 +4441,15 @@ void MainWindow::rebuildAudioMeters()
                     });
             m_meterConnections.append(conn);
         }
+
+        connect(meter, &AudioMeterWidget::requestEqPresetMenu,
+                this, &MainWindow::onMeterRequestEqPresetMenu);
+        connect(meter, &AudioMeterWidget::requestCompressorDialog,
+                this, &MainWindow::onMeterRequestCompressorDialog);
+        connect(meter, &AudioMeterWidget::requestAutoDuckDialog,
+                this, &MainWindow::onMeterRequestAutoDuckDialog);
+        connect(meter, &AudioMeterWidget::requestNormalize,
+                this, &MainWindow::onMeterRequestNormalize);
     }
 
     if (n > 0) {
@@ -4446,11 +4472,20 @@ void MainWindow::rebuildAudioMeters()
     masterLayout->addWidget(masterMeter);
     layout->addLayout(masterLayout);
 
+    m_masterMeter = masterMeter;
+
     if (auto *mixer = m_player->audioMixer()) {
         auto conn = connect(mixer, &AudioMixer::masterLevelChanged, masterMeter,
                 &AudioMeterWidget::setLevels);
         m_meterConnections.append(conn);
     }
+
+    connect(masterMeter, &AudioMeterWidget::requestCompressorDialog,
+            this, &MainWindow::onMeterRequestCompressorDialog);
+    connect(masterMeter, &AudioMeterWidget::requestNormalizeAll,
+            this, &MainWindow::onMeterRequestNormalizeAll);
+    connect(masterMeter, &AudioMeterWidget::requestResetAllMeters,
+            this, &MainWindow::onMeterRequestResetAllMeters);
 
     layout->addStretch();
 
@@ -4719,4 +4754,122 @@ void MainWindow::openAutoDuckSettings()
                 .arg(params.releaseMs, 0, 'f', 0),
             4000);
     }
+}
+
+// --- Audio meter context menu handlers ---
+
+void MainWindow::onMeterRequestEqPresetMenu(int trackIdx, QPoint globalPos)
+{
+    if (!m_player) return;
+    auto *mixer = m_player->audioMixer();
+    if (!mixer) return;
+
+    QMenu menu;
+    const auto presets = AudioEQProcessor::presets();
+    const int ti = trackIdx;
+    for (const auto &preset : presets) {
+        auto *act = menu.addAction(preset.name);
+        const AudioEQConfig cfg = preset.config;
+        const QString presetName = preset.name;
+        connect(act, &QAction::triggered, this,
+                [this, mixer, ti, cfg, presetName]() {
+            if (mixer) {
+                mixer->setTrackEqEnabled(ti, true);
+                mixer->setTrackEqConfig(ti, cfg);
+            }
+            statusBar()->showMessage(
+                QString("A%1 EQ → %2").arg(ti + 1).arg(presetName), 3000);
+        });
+    }
+    menu.addSeparator();
+    auto *bypassAct = menu.addAction("Bypass / Reset");
+    const int ti2 = trackIdx;
+    connect(bypassAct, &QAction::triggered, this,
+            [this, mixer, ti2]() {
+        if (mixer) {
+            mixer->setTrackEqEnabled(ti2, false);
+        }
+        statusBar()->showMessage(
+            QString("A%1 EQ bypassed").arg(ti2 + 1), 3000);
+    });
+
+    menu.exec(globalPos);
+}
+
+void MainWindow::onMeterRequestCompressorDialog()
+{
+    openMasterCompressor();
+}
+
+void MainWindow::onMeterRequestAutoDuckDialog()
+{
+    openAutoDuckSettings();
+}
+
+void MainWindow::onMeterRequestNormalize(int trackIdx, double gainDb)
+{
+    if (!m_player) return;
+    auto *mixer = m_player->audioMixer();
+    if (!mixer) return;
+
+    if (std::abs(gainDb) < 0.001) {
+        statusBar()->showMessage(
+            QStringLiteral("メーターに信号がありません. 一度再生してから実行してください."), 3000);
+        return;
+    }
+
+    m_timeline->undoManager()->saveState(m_timeline->currentState(), "Normalize audio");
+
+    const double oldGain = mixer->trackGain(trackIdx);
+    const double factor = std::pow(10.0, gainDb / 20.0);
+    const double newGain = std::clamp(oldGain * factor, 0.0, 4.0);
+    mixer->setTrackGain(trackIdx, newGain);
+
+    statusBar()->showMessage(
+        QString("T%1 ノーマライズ: +%2dB (gain %3→%4)")
+            .arg(trackIdx + 1)
+            .arg(gainDb, 0, 'f', 1)
+            .arg(oldGain, 0, 'f', 2)
+            .arg(newGain, 0, 'f', 2),
+        4000);
+}
+
+void MainWindow::onMeterRequestNormalizeAll()
+{
+    if (!m_player) return;
+    auto *mixer = m_player->audioMixer();
+    if (!mixer) return;
+
+    bool anyApplied = false;
+    for (int i = 0; i < m_audioMeterWidgets.size(); ++i) {
+        const double peak = m_audioMeterWidgets[i]->currentPeakHoldDb();
+        if (peak <= -60.0)
+            continue;
+        const double gainDb = std::clamp(-1.0 - peak, -24.0, 12.0);
+        if (std::abs(gainDb) < 0.001)
+            continue;
+        if (!anyApplied)
+            m_timeline->undoManager()->saveState(m_timeline->currentState(), "Normalize all audio");
+        const double oldGain = mixer->trackGain(i);
+        const double factor = std::pow(10.0, gainDb / 20.0);
+        const double newGain = std::clamp(oldGain * factor, 0.0, 4.0);
+        mixer->setTrackGain(i, newGain);
+        anyApplied = true;
+    }
+
+    if (anyApplied) {
+        statusBar()->showMessage(
+            QStringLiteral("全トラックをノーマライズしました"), 4000);
+    } else {
+        statusBar()->showMessage(
+            QStringLiteral("メーターに信号がありません. 一度再生してから実行してください."), 3000);
+    }
+}
+
+void MainWindow::onMeterRequestResetAllMeters()
+{
+    for (auto *meter : m_audioMeterWidgets)
+        meter->resetPeakHold();
+    if (m_masterMeter)
+        m_masterMeter->resetPeakHold();
 }

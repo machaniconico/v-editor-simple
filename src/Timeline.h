@@ -17,6 +17,7 @@
 #include "TextManager.h"
 #include "PlaybackTypes.h"
 #include "Overlay.h"
+#include "SnapEngine.h"
 
 // Where Timeline::addClip drops a freshly-imported clip. Persisted via
 // QSettings('VSimpleEditor','Preferences')/importPlacement; the MainWindow
@@ -36,11 +37,13 @@ enum class AutoProxyMode {
     Always = 2            // Generate on every heavy import regardless of track
 };
 
+class AudioMixer;
 class UndoManager;
 class Timeline;
 class PlayheadOverlay;
 class TextStripWidget;
 struct TimelineState;
+class MarkerManager;
 class QDragEnterEvent;
 class QDragMoveEvent;
 class QDragLeaveEvent;
@@ -231,6 +234,11 @@ protected:
 private:
     void updateMinimumWidth();
     int snapToEdge(int x) const;
+    bool tryHitTrimEdge(QMouseEvent *ev, int clipIndex, const QRectF &clipRect);
+    bool tryHitTransitionDragHandle(QMouseEvent *ev, int clipIndex, const QRectF &clipRect);
+    bool tryHitEnvelopeKeyframe(QMouseEvent *ev, int clipIndex);
+    bool tryHitTransitionBadge(QMouseEvent *ev, int clipIndex);
+    void handleBodyClick(QMouseEvent *ev, int clipIndex);
 
     QVector<ClipInfo> m_clips;
     QList<int> m_selectedClips;
@@ -306,6 +314,22 @@ public:
     int snapLineX() const;
     int snapLineAlpha() const;
 
+    // SnapEngine
+    SnapEngine &snapEngine() { return m_snapEngine; }
+    const SnapEngine &snapEngine() const { return m_snapEngine; }
+
+    // Track access for SnapEngine collection
+    const QVector<TimelineTrack *> &videoTracks() const { return m_videoTracks; }
+    const QVector<TimelineTrack *> &audioTracks() const { return m_audioTracks; }
+
+    // Marker integration
+    void setMarkerManager(MarkerManager *mm) { m_markerManager = mm; }
+    MarkerManager *markerManager() const { return m_markerManager; }
+
+    // AudioMixer integration for undo/restore of track gains
+    void setAudioMixer(AudioMixer *mixer) { m_audioMixer = mixer; }
+    AudioMixer *audioMixer() const { return m_audioMixer; }
+
     // Zoom
     void zoomIn();
     void zoomOut();
@@ -367,6 +391,7 @@ public:
     void addAudioFile(const QString &filePath);
     void toggleMuteTrack(int audioTrackIndex);
     void toggleSoloTrack(int audioTrackIndex);
+    void normalizeAudioClipPeak(int trackIdx, int clipIdx);
 
     void setPlayheadPosition(double seconds);
     // Chase mode — re-centres the viewport on the playhead when it leaves
@@ -454,6 +479,7 @@ signals:
     // a status message ("クロスディゾルブを 1.0s → 0.4s に短縮").
     void transitionShortened(QString transitionTypeName,
                              double askedSec, double effectiveSec);
+    void statusMessageRequested(const QString &message, int timeoutMs);
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -468,8 +494,8 @@ private:
     void saveUndoState(const QString &description);
 public:
     void restoreState(const TimelineState &state);
-private:
     TimelineState currentState() const;
+private:
     void syncPlayheadOverlay();
     void updateInfoLabel();
     void ensureSequenceFitsViewport();
@@ -570,6 +596,15 @@ private:
     int m_snapLineX = -1;
     QElapsedTimer m_snapLineFadeTimer;
     static constexpr int kSnapLineFadeMs = 200;
+
+    // SnapEngine — collects targets once per drag start, binary-search per tick
+    SnapEngine m_snapEngine;
+
+    // MarkerManager pointer — set by MainWindow for snap integration
+    MarkerManager *m_markerManager = nullptr;
+
+    // AudioMixer pointer — set by MainWindow for undo/restore of track gains
+    AudioMixer *m_audioMixer = nullptr;
 };
 
 class PlayheadOverlay : public QWidget

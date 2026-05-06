@@ -1,7 +1,9 @@
 #include "ProjectFile.h"
+#include "AudioMixer.h"
 #include <QFile>
 #include <QJsonDocument>
 #include <algorithm>
+#include <cmath>
 
 static const int PROJECT_FORMAT_VERSION = 1;
 
@@ -477,13 +479,31 @@ TrackEqState ProjectFile::trackEqFromJson(const QJsonObject &obj)
     TrackEqState s;
     s.trackIdx = obj["trackIdx"].toInt(-1);
     s.enabled = obj["enabled"].toBool(false);
-    s.low = obj["low"].toDouble(0.0);
-    s.mid = obj["mid"].toDouble(0.0);
-    s.high = obj["high"].toDouble(0.0);
-    s.lowFreqHz = obj["lowFreqHz"].toDouble(200.0);
-    s.midFreqHz = obj["midFreqHz"].toDouble(1000.0);
-    s.highFreqHz = obj["highFreqHz"].toDouble(5000.0);
-    s.qFactor = obj["qFactor"].toDouble(1.0);
+
+    // Read raw values from JSON (may be NaN, out-of-range, or malicious).
+    double qRaw = obj["qFactor"].toDouble(1.0);
+    double lowGainRaw = obj["low"].toDouble(0.0);
+    double midGainRaw = obj["mid"].toDouble(0.0);
+    double highGainRaw = obj["high"].toDouble(0.0);
+    double lowFreqRaw = obj["lowFreqHz"].toDouble(200.0);
+    double midFreqRaw = obj["midFreqHz"].toDouble(1000.0);
+    double highFreqRaw = obj["highFreqHz"].toDouble(5000.0);
+
+    // --- NaN guard: if ANY field is NaN, fall back to defaults entirely. ---
+    if (std::isnan(qRaw) || std::isnan(lowGainRaw) || std::isnan(midGainRaw)
+        || std::isnan(highGainRaw) || std::isnan(lowFreqRaw)
+        || std::isnan(midFreqRaw) || std::isnan(highFreqRaw)) {
+        return TrackEqState{}; // all defaults
+    }
+
+    // --- Trust-boundary clamp: enforce safe ranges before any DSP path. ---
+    s.qFactor = qBound(AudioMixer::kEqMinQ, qRaw, AudioMixer::kEqMaxQ);
+    s.low = qBound(AudioMixer::kEqMinGainDb, lowGainRaw, AudioMixer::kEqMaxGainDb);
+    s.mid = qBound(AudioMixer::kEqMinGainDb, midGainRaw, AudioMixer::kEqMaxGainDb);
+    s.high = qBound(AudioMixer::kEqMinGainDb, highGainRaw, AudioMixer::kEqMaxGainDb);
+    s.lowFreqHz = qBound(AudioMixer::kEqMinFreqHz, lowFreqRaw, AudioMixer::kEqMaxFreqHz);
+    s.midFreqHz = qBound(AudioMixer::kEqMinFreqHz, midFreqRaw, AudioMixer::kEqMaxFreqHz);
+    s.highFreqHz = qBound(AudioMixer::kEqMinFreqHz, highFreqRaw, AudioMixer::kEqMaxFreqHz);
     return s;
 }
 
@@ -504,33 +524,55 @@ QJsonObject ProjectFile::compressorToJson(const CompressorState &cs)
 CompressorState ProjectFile::compressorFromJson(const QJsonObject &obj)
 {
     CompressorState cs;
-    cs.thresholdDb = obj["thresholdDb"].toDouble(-12.0);
-    cs.ratio = obj["ratio"].toDouble(4.0);
-    cs.attackMs = obj["attackMs"].toDouble(10.0);
-    cs.releaseMs = obj["releaseMs"].toDouble(120.0);
-    cs.makeupDb = obj["makeupDb"].toDouble(0.0);
-    cs.enabled = obj["enabled"].toBool(false);
+    // Trust boundary: clamp + NaN-guard symmetric with US-501 (EQ) and
+    // autoDuckFromJson — biquad/IIR DSP detonates on NaN inputs.
+    auto sanitize = [](double v, double fallback, double lo, double hi) {
+        if (std::isnan(v) || std::isinf(v)) return fallback;
+        return qBound(lo, v, hi);
+    };
+    cs.thresholdDb = sanitize(obj["thresholdDb"].toDouble(-12.0), -12.0, -90.0, 0.0);
+    cs.ratio       = sanitize(obj["ratio"].toDouble(4.0), 4.0, 1.0, 100.0);
+    cs.attackMs    = sanitize(obj["attackMs"].toDouble(10.0), 10.0, 0.1, 1000.0);
+    cs.releaseMs   = sanitize(obj["releaseMs"].toDouble(120.0), 120.0, 1.0, 5000.0);
+    cs.makeupDb    = sanitize(obj["makeupDb"].toDouble(0.0), 0.0, -24.0, 24.0);
+    cs.enabled     = obj["enabled"].toBool(false);
     return cs;
 }
 
 // --- Audio Mixer: Auto Ducking ---
 
+// US-502: suffix-with-unit naming for symmetry with compressor
 QJsonObject ProjectFile::autoDuckToJson(const AutoDuckState &ad)
 {
     QJsonObject obj;
-    obj["threshold"] = ad.thresholdDb;
+    obj["thresholdDb"] = ad.thresholdDb;
     obj["ratio"] = ad.ratio;
-    obj["attack"] = ad.attackMs;
-    obj["release"] = ad.releaseMs;
+    obj["attackMs"] = ad.attackMs;
+    obj["releaseMs"] = ad.releaseMs;
     return obj;
 }
 
 AutoDuckState ProjectFile::autoDuckFromJson(const QJsonObject &obj)
 {
     AutoDuckState ad;
-    ad.thresholdDb = obj["threshold"].toDouble(-20.0);
-    ad.ratio = obj["ratio"].toDouble(4.0);
-    ad.attackMs = obj["attack"].toDouble(5.0);
-    ad.releaseMs = obj["release"].toDouble(250.0);
+    // Trust boundary: .veditor JSON is attacker-controllable. NaN or
+    // out-of-range values reach the IIR/biquad sidechain and explode the
+    // ducking math (negative attack → exp() of negative inf, etc.).
+    // Symmetric with US-501's trackEqFromJson clamp+NaN-guard pattern.
+    auto sanitize = [](double v, double fallback, double lo, double hi) {
+        if (std::isnan(v) || std::isinf(v)) return fallback;
+        return qBound(lo, v, hi);
+    };
+    const double rawThreshold = obj.contains("thresholdDb")
+        ? obj["thresholdDb"].toDouble(-20.0) : obj["threshold"].toDouble(-20.0);
+    const double rawRatio = obj["ratio"].toDouble(4.0);
+    const double rawAttack = obj.contains("attackMs")
+        ? obj["attackMs"].toDouble(5.0) : obj["attack"].toDouble(5.0);
+    const double rawRelease = obj.contains("releaseMs")
+        ? obj["releaseMs"].toDouble(250.0) : obj["release"].toDouble(250.0);
+    ad.thresholdDb = sanitize(rawThreshold, -20.0, -90.0, 0.0);
+    ad.ratio       = sanitize(rawRatio, 4.0, 1.0, 100.0);
+    ad.attackMs    = sanitize(rawAttack, 5.0, 0.1, 1000.0);
+    ad.releaseMs   = sanitize(rawRelease, 250.0, 1.0, 5000.0);
     return ad;
 }

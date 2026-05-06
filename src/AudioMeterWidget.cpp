@@ -5,6 +5,9 @@
 #include <QPainterPath>
 #include <QShowEvent>
 #include <QtMath>
+#include <QMenu>
+#include <QAction>
+#include <QContextMenuEvent>
 
 #include <algorithm>
 #include <array>
@@ -307,4 +310,75 @@ bool AudioMeterWidget::syncPaintState()
     const bool leftChanged = updateLastPainted(m_left);
     const bool rightChanged = updateLastPainted(m_right);
     return leftChanged || rightChanged;
+}
+
+double AudioMeterWidget::currentPeakHoldDb() const
+{
+    return std::max(m_left.holdDb, m_right.holdDb);
+}
+
+void AudioMeterWidget::resetPeakHold()
+{
+    m_left.holdDb = -120.0f;
+    m_right.holdDb = -120.0f;
+    m_left.holdElapsedMs = 0;
+    m_right.holdElapsedMs = 0;
+    update();
+}
+
+void AudioMeterWidget::contextMenuEvent(QContextMenuEvent* event)
+{
+    QMenu menu(this);
+
+    if (m_trackIndex >= 0) {
+        auto* eqAction = menu.addAction(QStringLiteral("EQ \u30D7\u30EA\u30BB\u30C3\u30C8"));
+        connect(eqAction, &QAction::triggered, this, [this, event]() {
+            emit requestEqPresetMenu(m_trackIndex, event->globalPos());
+        });
+
+        auto* compAction = menu.addAction(QStringLiteral("\u30B3\u30F3\u30D7\u30EC\u30C3\u30B5\u30FC\u8A2D\u5B9A..."));
+        connect(compAction, &QAction::triggered, this, [this]() {
+            emit requestCompressorDialog();
+        });
+
+        auto* duckAction = menu.addAction(QStringLiteral("\u30AA\u30FC\u30C8\u30C0\u30C3\u30AF\u8A2D\u5B9A..."));
+        connect(duckAction, &QAction::triggered, this, [this]() {
+            emit requestAutoDuckDialog();
+        });
+
+        auto* normAction = menu.addAction(QStringLiteral("\u30CE\u30FC\u30DE\u30E9\u30A4\u30BA"));
+        connect(normAction, &QAction::triggered, this, [this]() {
+            const double peak = currentPeakHoldDb();
+            if (peak <= kMinDb) {
+                emit requestNormalize(m_trackIndex, 0.0);
+                return;
+            }
+            const double gainDb = std::clamp(-1.0 - peak, -24.0, 12.0);
+            emit requestNormalize(m_trackIndex, gainDb);
+        });
+
+        menu.addSeparator();
+
+        auto* resetAction = menu.addAction(QStringLiteral("\u30E1\u30FC\u30BF\u30FC\u3092\u30EA\u30BB\u30C3\u30C8"));
+        connect(resetAction, &QAction::triggered, this, &AudioMeterWidget::resetPeakHold);
+    } else {
+        auto* compAction = menu.addAction(QStringLiteral("\u30DE\u30B9\u30BF\u30FC\u30B3\u30F3\u30D7\u30EC\u30C3\u30B5\u30FC\u8A2D\u5B9A..."));
+        connect(compAction, &QAction::triggered, this, [this]() {
+            emit requestCompressorDialog();
+        });
+
+        auto* normAllAction = menu.addAction(QStringLiteral("\u30CE\u30FC\u30DE\u30E9\u30A4\u30BA (\u5168\u30C8\u30E9\u30C3\u30AF)"));
+        connect(normAllAction, &QAction::triggered, this, [this]() {
+            emit requestNormalizeAll();
+        });
+
+        menu.addSeparator();
+
+        auto* resetAction = menu.addAction(QStringLiteral("\u30E1\u30FC\u30BF\u30FC\u3092\u30EA\u30BB\u30C3\u30C8"));
+        connect(resetAction, &QAction::triggered, this, [this]() {
+            emit requestResetAllMeters();
+        });
+    }
+
+    menu.exec(event->globalPos());
 }

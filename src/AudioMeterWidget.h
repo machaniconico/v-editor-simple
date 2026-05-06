@@ -2,6 +2,7 @@
 
 #include <QTimer>
 #include <QWidget>
+#include <QContextMenuEvent>
 
 class AudioMeterWidget : public QWidget
 {
@@ -15,13 +16,27 @@ public:
     int peakHoldMs() const { return 1500; }
     QSize sizeHint() const override;
 
+    void setTrackIndex(int idx) { m_trackIndex = idx; }
+    int trackIndex() const { return m_trackIndex; }
+    double currentPeakHoldDb() const;
+
 public slots:
     void setLevels(float pkL, float pkR, float rmsL, float rmsR);
+    void resetPeakHold();
+
+signals:
+    void requestEqPresetMenu(int trackIdx, QPoint globalPos);
+    void requestCompressorDialog();
+    void requestAutoDuckDialog();
+    void requestNormalize(int trackIdx, double gainDb);
+    void requestNormalizeAll();
+    void requestResetAllMeters();
 
 protected:
     void paintEvent(QPaintEvent* event) override;
     void showEvent(QShowEvent* event) override;
     void hideEvent(QHideEvent* event) override;
+    void contextMenuEvent(QContextMenuEvent* event) override;
 
 private slots:
     void onDecayTick();
@@ -57,4 +72,5 @@ private:
     ChannelState m_right;
     float m_minDb = kMinDb;
     float m_maxDb = kMaxDb;
+    int m_trackIndex = -1;
 };

@@ -4,11 +4,13 @@
 #include <QWidget>
 #include <QElapsedTimer>
 #include <QtMath>
+#include <memory>
+#include <vector>
+#include <QHash>
 
 class QCheckBox;
-class HistogramWidget;
-class WaveformWidget;
-class VectorscopeWidget;
+class QPainter;
+class QRect;
 
 // BT.709 Y'CbCr conversion helpers for vectorscope rendering.
 namespace LumetriColor {
@@ -29,11 +31,24 @@ inline void rgbToYCbCr709(int r, int g, int b, int &y, int &cb, int &cr)
 }
 } // namespace LumetriColor
 
+// Abstract interface for a measurement scope (Histogram, Waveform,
+// Vectorscope, ...). Each scope implements its own data-accumulation
+// and painting logic so adding a fourth scope only requires one new
+// class and one push_back.
+class IScope {
+public:
+    virtual ~IScope() = default;
+    virtual QString name() const = 0;
+    virtual void updateFromFrame(const QImage &frame) = 0;
+    virtual void paint(QPainter &p, const QRect &target) = 0;
+    virtual bool isEnabled() const = 0;
+    virtual void setEnabled(bool) = 0;
+};
+
 // Lumetri-style measurement scopes (RGB Histogram + Luma Waveform +
-// Vectorscope). Three internal sub-widgets stacked vertically inside one
-// container. The container exposes a single setFrame() slot that updates
-// all three at once. Frame ingestion is throttled to ~10 fps so a 60 fps
-// preview doesn't burn the GUI thread on histogram math.
+// Vectorscope). Three scopes share a single container widget that
+// exposes a setFrame() slot.  Frame ingestion is throttled to ~10 fps
+// so a 60 fps preview doesn't burn the GUI thread on histogram math.
 class LumetriScopes : public QWidget
 {
     Q_OBJECT
@@ -47,11 +62,9 @@ public slots:
     void setFrame(const QImage &frame);
 
 private:
-    HistogramWidget *m_hist = nullptr;
-    WaveformWidget *m_wave = nullptr;
-    VectorscopeWidget *m_vector = nullptr;
-    QCheckBox *m_vecToggle = nullptr;
+    std::vector<std::unique_ptr<IScope>> m_scopes;
+    QHash<QString, QCheckBox*> m_toggles;
+    QWidget *m_canvas = nullptr;
     QElapsedTimer m_throttle;
-    bool m_showVectorscope = true;
     static constexpr int kThrottleMs = 100;  // ~10 fps refresh
 };

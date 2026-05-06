@@ -69,6 +69,16 @@ public:
     static constexpr int kBytesPerSample = 2;                  // s16
     static constexpr int kBytesPerFrame = kChannels * kBytesPerSample;
     static constexpr int kMaxAudioTracks = 16;
+    // Trust-boundary clamp limits for per-track EQ (US-501).
+    // Applied at ProjectFile JSON deserialization so a malicious .veditor
+    // cannot push NaN or out-of-range values into the biquad coefficient
+    // computation inside setTrackEqConfig.
+    static constexpr double kEqMinQ = 0.1;
+    static constexpr double kEqMaxQ = 18.0;
+    static constexpr double kEqMinGainDb = -24.0;
+    static constexpr double kEqMaxGainDb = 24.0;
+    static constexpr double kEqMinFreqHz = 20.0;
+    static constexpr double kEqMaxFreqHz = 20000.0;
     static constexpr int kRingTargetBytes = 64 * 1024;         // ~340 ms stereo s16 @ 48k
     static constexpr int kPrerollLeadUs = 2'000'000;           // pre-warm 2 s before entry start
 
@@ -106,6 +116,7 @@ public:
     void setTrackMute(int trackIdx, bool muted);
     void setTrackSolo(int trackIdx, bool solo);
     void setTrackGain(int trackIdx, double gain);
+    double trackGain(int trackIdx) const;
 
     // Per-track realtime EQ (3-band biquad, applied before effectiveGain).
     void setTrackEqConfig(int trackIdx, const AudioEQConfig &cfg);

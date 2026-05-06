@@ -7,6 +7,10 @@
 #include <functional>
 #include "Timeline.h"
 
+// ABI note: UndoManager does NOT persist across sessions, so adding fields
+// here is always backward-compatible — no migration needed. New fields
+// default to -1 (no selection) and any stale undo entry that lacks them will
+// simply clear the selection on that axis during restore.
 struct TimelineState {
     // One ClipInfo vector per VIDEO row (videoTracks[0] = V1, [1] = V2, ...)
     // and per AUDIO row (audioTracks[0] = A1, [1] = A2, ...). Earlier
@@ -15,11 +19,17 @@ struct TimelineState {
     // restores the whole timeline state.
     QVector<QVector<ClipInfo>> videoTracks;
     QVector<QVector<ClipInfo>> audioTracks;
-    // Selection is V1-relative for now (matches the rest of the editor's
-    // current selection semantics). Track-aware selection can extend this
-    // later without breaking the persistence shape.
+    // Legacy V1-relative selection (kept for source compatibility).
     int selectedClip = -1;
+    // V2+ track-aware selection: (track index, clip index) — -1 means
+    // no selection. Populated by currentState() and honoured by
+    // restoreState() so Ctrl+Z doesn't clear a selection on V2/V3.
+    int selectedVideoTrackIndex = -1;
+    int selectedVideoClipIndex = -1;
+    int selectedAudioTrackIndex = -1;
+    int selectedAudioClipIndex = -1;
     double playheadPos = 0.0;
+    QVector<double> audioTrackGains;
 };
 
 class UndoManager : public QObject

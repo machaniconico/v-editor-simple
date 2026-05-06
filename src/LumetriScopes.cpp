@@ -43,15 +43,16 @@ inline QImage downsampleForVector(const QImage &src) {
 
 } // namespace
 
-// ----- Histogram -----------------------------------------------------------
+// ----- HistogramScope ------------------------------------------------------
 
-class HistogramWidget : public QWidget
+class HistogramScope : public IScope
 {
 public:
-    explicit HistogramWidget(QWidget *parent = nullptr) : QWidget(parent) {
-        setMinimumHeight(96);
-    }
-    void setFrame(const QImage &frame) {
+    QString name() const override { return QStringLiteral("Histogram"); }
+    bool isEnabled() const override { return m_enabled; }
+    void setEnabled(bool e) override { m_enabled = e; }
+
+    void updateFromFrame(const QImage &frame) override {
         const QImage src = downsampleToBudget(frame).convertToFormat(QImage::Format_RGB32);
         std::fill(std::begin(m_r), std::end(m_r), 0);
         std::fill(std::begin(m_g), std::end(m_g), 0);
@@ -68,22 +69,20 @@ public:
         m_peak = 0;
         for (int i = 0; i < 256; ++i)
             m_peak = qMax(m_peak, qMax(m_r[i], qMax(m_g[i], m_b[i])));
-        update();
     }
-protected:
-    void paintEvent(QPaintEvent *) override {
-        QPainter p(this);
-        p.fillRect(rect(), QColor(20, 20, 22));
+
+    void paint(QPainter &p, const QRect &target) override {
+        p.fillRect(target, QColor(20, 20, 22));
         if (m_peak <= 0) return;
-        const double xs = static_cast<double>(width()) / 256.0;
-        const double ys = static_cast<double>(height()) / static_cast<double>(m_peak);
+        const double xs = static_cast<double>(target.width()) / 256.0;
+        const double ys = static_cast<double>(target.height()) / static_cast<double>(m_peak);
         auto draw = [&](const int *bins, QColor c) {
             c.setAlpha(170);
             p.setPen(QPen(c, 1));
             for (int i = 0; i < 256; ++i) {
                 const int h = static_cast<int>(bins[i] * ys);
                 const int x = static_cast<int>(i * xs);
-                p.drawLine(x, height(), x, height() - h);
+                p.drawLine(x, target.height(), x, target.height() - h);
             }
         };
         draw(m_r, QColor(230,  70,  70));
@@ -92,35 +91,36 @@ protected:
         p.setPen(QColor(180, 180, 180));
         p.drawText(4, 12, "Histogram");
     }
+
 private:
     int m_r[256] = {};
     int m_g[256] = {};
     int m_b[256] = {};
     int m_peak = 0;
+    bool m_enabled = true;
 };
 
-// ----- Luma Waveform -------------------------------------------------------
+// ----- WaveformScope -------------------------------------------------------
 
-class WaveformWidget : public QWidget
+class WaveformScope : public IScope
 {
 public:
-    explicit WaveformWidget(QWidget *parent = nullptr) : QWidget(parent) {
-        setMinimumHeight(120);
-    }
-    void setFrame(const QImage &frame) {
+    QString name() const override { return QStringLiteral("Luma Waveform"); }
+    bool isEnabled() const override { return m_enabled; }
+    void setEnabled(bool e) override { m_enabled = e; }
+
+    void updateFromFrame(const QImage &frame) override {
         m_src = downsampleToBudget(frame).convertToFormat(QImage::Format_RGB32);
-        update();
     }
-protected:
-    void paintEvent(QPaintEvent *) override {
-        QPainter p(this);
-        p.fillRect(rect(), QColor(20, 20, 22));
+
+    void paint(QPainter &p, const QRect &target) override {
+        p.fillRect(target, QColor(20, 20, 22));
         if (m_src.isNull()) return;
         // X axis = source column (mapped to widget width). Y axis = luma
         // 0 (bottom) .. 255 (top). Each pixel of the downsampled source
         // contributes one point.
-        const int W = width();
-        const int H = height();
+        const int W = target.width();
+        const int H = target.height();
         if (W <= 0 || H <= 0) return;
         const double xs = static_cast<double>(W) / static_cast<double>(m_src.width());
         const double ys = static_cast<double>(H) / 255.0;
@@ -145,36 +145,34 @@ protected:
         p.setPen(QColor(180, 180, 180));
         p.drawText(4, 12, "Luma Waveform");
     }
+
 private:
     QImage m_src;
+    bool m_enabled = true;
 };
 
-// ----- Vectorscope ---------------------------------------------------------
+// ----- VectorscopeScope ----------------------------------------------------
 
-class VectorscopeWidget : public QWidget
+class VectorscopeScope : public IScope
 {
 public:
-    explicit VectorscopeWidget(QWidget *parent = nullptr) : QWidget(parent)
-    {
-        setMinimumHeight(160);
-        m_densityBuf = QImage(256, 256, QImage::Format_ARGB32_Premultiplied);
-    }
+    VectorscopeScope()
+        : m_densityBuf(256, 256, QImage::Format_ARGB32_Premultiplied) {}
 
-    void setFrame(const QImage &frame)
-    {
+    QString name() const override { return QStringLiteral("Vectorscope"); }
+    bool isEnabled() const override { return m_enabled; }
+    void setEnabled(bool e) override { m_enabled = e; }
+
+    void updateFromFrame(const QImage &frame) override {
         m_src = downsampleForVector(frame);
-        update();
     }
 
-protected:
-    void paintEvent(QPaintEvent *) override
-    {
-        QPainter p(this);
-        p.fillRect(rect(), QColor(20, 20, 22));
+    void paint(QPainter &p, const QRect &target) override {
+        p.fillRect(target, QColor(20, 20, 22));
         if (m_src.isNull()) return;
 
-        const int W = width();
-        const int H = height();
+        const int W = target.width();
+        const int H = target.height();
         const int sz = qMin(W, H);
         const int cx = W / 2;
         const int cy = H / 2;
@@ -276,37 +274,78 @@ protected:
 private:
     QImage m_src;
     QImage m_densityBuf;
+    bool m_enabled = true;
+};
+
+// ----- ScopeCanvas ----------------------------------------------------------
+
+class ScopeCanvas : public QWidget
+{
+public:
+    ScopeCanvas(QWidget *parent, const std::vector<std::unique_ptr<IScope>> &scopes)
+        : QWidget(parent), m_scopes(scopes)
+    {
+        setMinimumSize(200, 300);
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override {
+        QPainter p(this);
+        p.fillRect(rect(), QColor(20, 20, 22));
+
+        int n = 0;
+        for (const auto &s : m_scopes)
+            if (s->isEnabled()) ++n;
+        if (n == 0) return;
+
+        int y = 0;
+        const int h = height() / n;
+        for (const auto &s : m_scopes) {
+            if (!s->isEnabled()) continue;
+            p.save();
+            p.translate(0, y);
+            s->paint(p, QRect(0, 0, width(), h));
+            p.restore();
+            y += h;
+        }
+    }
+
+private:
+    const std::vector<std::unique_ptr<IScope>> &m_scopes;
 };
 
 // ----- LumetriScopes container --------------------------------------------
 
 LumetriScopes::LumetriScopes(QWidget *parent) : QWidget(parent)
 {
+    m_scopes.push_back(std::make_unique<HistogramScope>());
+    m_scopes.push_back(std::make_unique<WaveformScope>());
+    m_scopes.push_back(std::make_unique<VectorscopeScope>());
+
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(2, 2, 2, 2);
     layout->setSpacing(4);
-    m_hist = new HistogramWidget(this);
-    m_wave = new WaveformWidget(this);
-    m_vector = new VectorscopeWidget(this);
-    layout->addWidget(m_hist);
-    layout->addWidget(m_wave);
 
-    // Toggle row: checkbox + stretch
+    m_canvas = new ScopeCanvas(this, m_scopes);
+    layout->addWidget(m_canvas, 1);
+
+    // Toggle row
     auto *toggleRow = new QHBoxLayout();
     toggleRow->setContentsMargins(4, 0, 4, 0);
-    m_vecToggle = new QCheckBox(QString::fromUtf8("Vectorscope"), this);
-    m_vecToggle->setChecked(m_showVectorscope);
-    toggleRow->addWidget(m_vecToggle);
+
+    for (auto &s : m_scopes) {
+        auto *cb = new QCheckBox(s->name(), this);
+        cb->setChecked(s->isEnabled());
+        toggleRow->addWidget(cb);
+        m_toggles[s->name()] = cb;
+        connect(cb, &QCheckBox::toggled, this,
+                [this, raw = s.get()](bool checked) {
+            raw->setEnabled(checked);
+            m_canvas->update();
+        });
+    }
     toggleRow->addStretch();
     layout->addLayout(toggleRow);
-
-    layout->addWidget(m_vector, 1);
-    m_vector->setVisible(m_showVectorscope);
-
-    connect(m_vecToggle, &QCheckBox::toggled, this, [this](bool checked) {
-        m_showVectorscope = checked;
-        m_vector->setVisible(checked);
-    });
 
     m_throttle.start();
 }
@@ -317,7 +356,9 @@ void LumetriScopes::setFrame(const QImage &frame)
     if (!isVisible()) return;
     if (m_throttle.elapsed() < kThrottleMs) return;
     m_throttle.restart();
-    if (m_hist) m_hist->setFrame(frame);
-    if (m_wave) m_wave->setFrame(frame);
-    if (m_vector && m_showVectorscope) m_vector->setFrame(frame);
+    for (auto &s : m_scopes) {
+        if (s->isEnabled())
+            s->updateFromFrame(frame);
+    }
+    m_canvas->update();
 }

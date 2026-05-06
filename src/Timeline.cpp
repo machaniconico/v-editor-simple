@@ -1,6 +1,7 @@
 #include "Timeline.h"
 #include "ProxyManager.h"
 #include "UndoManager.h"
+#include "AudioMixer.h"
 #include "OverlayDialogs.h"
 
 namespace {
@@ -43,6 +44,53 @@ inline double envelopeYToGain(double y, int rowHeight) {
     return t * kEnvelopeMaxGain;
 }
 } // namespace
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+}
+
+// RAII helper for one-shot FFmpeg audio decoding used by per-clip PCM peak
+// analysis (normalizeAudioClipPeak). Mirrors AudioMixer::openEntry's pattern
+// so we don't introduce a separate FFmpeg open path.
+struct NormalizeDecoderCtx {
+    AVFormatContext *fmt = nullptr;
+    AVCodecContext *codec = nullptr;
+    AVPacket *pkt = nullptr;
+    AVFrame *frame = nullptr;
+
+    bool open(const QString &path) {
+        if (avformat_open_input(&fmt, path.toUtf8().constData(), nullptr, nullptr) < 0)
+            return false;
+        if (avformat_find_stream_info(fmt, nullptr) < 0)
+            return false;
+        const int idx = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+        if (idx < 0) return false;
+        AVCodecParameters *par = fmt->streams[idx]->codecpar;
+        const AVCodec *c = avcodec_find_decoder(par->codec_id);
+        if (!c) return false;
+        codec = avcodec_alloc_context3(c);
+        if (!codec) return false;
+        if (avcodec_parameters_to_context(codec, par) < 0) return false;
+        if (avcodec_open2(codec, c, nullptr) < 0) return false;
+        pkt = av_packet_alloc();
+        frame = av_frame_alloc();
+        if (!pkt || !frame) return false;
+        m_streamIdx = idx;
+        return true;
+    }
+
+    ~NormalizeDecoderCtx() {
+        if (frame) av_frame_free(&frame);
+        if (pkt) av_packet_free(&pkt);
+        if (codec) avcodec_free_context(&codec);
+        if (fmt) avformat_close_input(&fmt);
+    }
+
+    int streamIdx() const { return m_streamIdx; }
+private:
+    int m_streamIdx = -1;
+};
 
 // Definitions for the static envelope-mode getters declared in Timeline.h.
 // Implemented out-of-line so the anonymous-namespace flag stays a single
@@ -327,6 +375,8 @@ private:
 #include <QAction>
 #include <QToolTip>
 #include <QHash>
+#include <QProgressDialog>
+#include <cstdint>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -1051,7 +1101,7 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
                     // the static volume so the user can see where a click
                     // would land.
                     const double y = envelopeGainToY(m_clips[i].volume, m_rowHeight);
-                    painter.setPen(QPen(QColor(255, 215, 60, 130), 1, Qt::DashLine));
+                    painter.setPen(QPen(QColor(255, 215, 60, 230), 2, Qt::DashLine));
                     painter.drawLine(QPointF(x, y), QPointF(x + clipWidth, y));
                 } else {
                     // Polyline through the envelope points, with implicit
@@ -1132,234 +1182,246 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
 
 void TimelineTrack::mousePressEvent(QMouseEvent *event)
 {
-    if (m_locked) {
-        // Let Qt still route scroll/playhead clicks upward if needed, but
-        // block every local edit mode (drag/trim/split). The simplest and
-        // safest way: accept the event and return immediately so no
-        // DragMode / TrimMode is entered.
-        event->accept();
-        return;
-    }
-    // Bottom-edge drag → row height resize. Detected before the seek/click
-    // handling so the user can resize even when clicking inside a clip area.
+    if (m_locked) { event->accept(); return; }
     if (event->button() == Qt::LeftButton
         && event->pos().y() >= m_rowHeight - RESIZE_HANDLE_HEIGHT) {
         m_resizingHeight = true;
         m_resizeStartY = event->globalPosition().toPoint().y();
         m_resizeStartHeight = m_rowHeight;
-        setCursor(Qt::SizeVerCursor);
-        grabMouse();
-        event->accept();
-        return;
+        setCursor(Qt::SizeVerCursor); grabMouse();
+        event->accept(); return;
     }
-
-    // Volume-envelope edit mode hijacks audio-row mouse handling so the
-    // existing trim/drag/transition flows aren't shadowed by the rubber
-    // band overlay. Strict opt-in via the audio menu — when OFF this whole
-    // block is skipped and behaviour is identical to before.
-    if (g_envelopeEditMode && m_isAudioTrack
-        && (event->button() == Qt::LeftButton || event->button() == Qt::RightButton)) {
-        const QPoint pos = event->pos();
-        const int idx = clipAtX(pos.x());
-        if (idx >= 0 && idx < m_clips.size()) {
-            ClipInfo &clip = m_clips[idx];
-            const double effDur = clip.effectiveDuration();
-            if (effDur > 0.0) {
-                const int clipStartXpx = clipStartX(idx);
-                const int clipWidth = qMax(20, static_cast<int>(
-                    qMin<double>(2000000.0, effDur * m_pixelsPerSecond)));
-                const double localPx = pos.x() - clipStartXpx;
-                if (localPx >= 0.0 && localPx <= clipWidth) {
-                    int hitPt = -1;
-                    for (int k = 0; k < clip.volumeEnvelope.size(); ++k) {
-                        const auto &pt = clip.volumeEnvelope[k];
-                        const double frac = qBound(0.0, pt.time / effDur, 1.0);
-                        const double px = frac * clipWidth;
-                        const double py = envelopeGainToY(pt.gain, m_rowHeight);
-                        const double dx = localPx - px;
-                        const double dy = pos.y() - py;
-                        if (dx * dx + dy * dy
-                            <= kEnvelopeHitRadiusPx * kEnvelopeHitRadiusPx) {
-                            hitPt = k;
-                            break;
-                        }
-                    }
-                    // Hit on an existing point always wins — that's the
-                    // grab gesture. ADD/DELETE for empty space requires the
-                    // Alt modifier so normal clip drag / context-menu /
-                    // selection still work while the envelope overlay is on.
-                    const bool altHeld = event->modifiers() & Qt::AltModifier;
-                    if (event->button() == Qt::RightButton) {
-                        if (hitPt >= 0) {
-                            clip.volumeEnvelope.remove(hitPt);
-                            update();
-                            emit modified();
-                            event->accept();
-                            return;
-                        }
-                        // No point hit — fall through to the regular
-                        // right-click context-menu path so users can still
-                        // open the clip menu while envelope mode is on.
-                    } else { // Left button
-                        if (hitPt >= 0) {
-                            m_envelopeDragClipIdx = idx;
-                            m_envelopeDragPointIdx = hitPt;
-                            event->accept();
-                            return;
-                        }
-                        if (altHeld) {
-                            // Avoid stealing clicks from the transition badge
-                            // resize handle: the handle hit-test lives in
-                            // the kTransBadgeYTop..YBot Y band, so we only
-                            // ADD when either the click is below that band
-                            // or the clip has no transition badge at all.
-                            const bool inBadgeBand =
-                                (pos.y() >= kTransBadgeYTop
-                                 && pos.y() <= kTransBadgeYBot);
-                            const bool clipHasTrans =
-                                (clip.leadIn.type != TransitionType::None
-                                 || clip.trailOut.type != TransitionType::None);
-                            if (!(inBadgeBand && clipHasTrans)) {
-                                AudioGainPoint np;
-                                np.time = qBound(0.0,
-                                    (localPx / clipWidth) * effDur, effDur);
-                                np.gain = envelopeYToGain(pos.y(), m_rowHeight);
-                                int insertAt = 0;
-                                while (insertAt < clip.volumeEnvelope.size()
-                                       && clip.volumeEnvelope[insertAt].time <= np.time) {
-                                    ++insertAt;
-                                }
-                                clip.volumeEnvelope.insert(insertAt, np);
-                                m_envelopeDragClipIdx = idx;
-                                m_envelopeDragPointIdx = insertAt;
-                                update();
-                                emit modified();
-                                event->accept();
-                                return;
-                            }
-                        }
-                        // No hit, no Alt — fall through to normal clip
-                        // selection / drag so the row remains editable.
-                    }
-                }
-            }
-        }
-    }
-
+    const int clipIndex = clipAtX(event->pos().x());
+    if (tryHitEnvelopeKeyframe(event, clipIndex)) return;
     const bool additive = event->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier);
-
-    // Right-click on a clip → context menu. We fire the signal and let
-    // Timeline assemble / show the menu so it can coordinate cross-track
-    // operations (delete, unlink, etc.) that can't be done from inside a
-    // single TimelineTrack.
-    if (event->button() == Qt::RightButton) {
-        const int hit = clipAtX(event->pos().x());
-        if (hit >= 0) {
-            emit clipContextMenuRequested(hit, event->globalPosition().toPoint());
-            event->accept();
+    if (event->button() == Qt::RightButton && clipIndex >= 0) {
+        emit clipContextMenuRequested(clipIndex, event->globalPosition().toPoint());
+        event->accept(); return;
+    }
+    QRectF clipRect;
+    if (clipIndex >= 0) {
+        const int cx = clipStartX(clipIndex);
+        const int cw = qMax(20, static_cast<int>(
+            m_clips[clipIndex].effectiveDuration() * m_pixelsPerSecond));
+        clipRect = QRectF(cx, 0, cw, m_rowHeight);
+        if (event->button() == Qt::LeftButton && !additive
+            && tryHitTransitionDragHandle(event, clipIndex, clipRect))
             return;
-        }
     }
-
-    // Transition badge drag handle hit-test. Runs BEFORE the seek/trim/move
-    // detection so clicking the handle starts a duration resize without
-    // jumping the playhead. The handle band is small enough that ordinary
-    // trim clicks (clip outer edge, not badge corner) still route to
-    // TrimLeft / TrimRight when the user lands outside the band.
-    if (event->button() == Qt::LeftButton && !additive) {
-        const int hitClip = clipAtX(event->pos().x());
-        const int cy = event->pos().y();
-        if (hitClip >= 0 && cy >= kTransBadgeYTop && cy <= kTransBadgeYBot) {
-            const int cx = clipStartX(hitClip);
-            const int cw = qMax(20, static_cast<int>(
-                m_clips[hitClip].effectiveDuration() * m_pixelsPerSecond));
-            const auto &clip = m_clips[hitClip];
-            if (clip.leadIn.type != TransitionType::None
-                && clip.leadIn.duration > 0.0) {
-                const int badgeX = cx + 2;
-                const int badgeW = transBadgeWidth(clip.leadIn.duration,
-                                                   m_pixelsPerSecond, cw);
-                const int handleX = badgeX + badgeW - kTransBadgeHandleW;
-                if (event->pos().x() >= handleX
-                    && event->pos().x() <= handleX + kTransBadgeHandleW) {
-                    setSelectedClip(hitClip);
-                    emit clipClicked(hitClip);
-                    m_dragMode = DragMode::TransitionLeadInResize;
-                    m_dragClipIndex = hitClip;
-                    m_dragStartX = event->pos().x();
-                    m_dragOriginalTransitionDuration = clip.leadIn.duration;
-                    setCursor(Qt::SizeHorCursor);
-                    event->accept();
-                    return;
-                }
-            }
-            if (clip.trailOut.type != TransitionType::None
-                && clip.trailOut.duration > 0.0) {
-                const int badgeW = transBadgeWidth(clip.trailOut.duration,
-                                                   m_pixelsPerSecond, cw);
-                const int badgeX = cx + cw - badgeW - 2;
-                if (event->pos().x() >= badgeX
-                    && event->pos().x() <= badgeX + kTransBadgeHandleW) {
-                    setSelectedClip(hitClip);
-                    emit clipClicked(hitClip);
-                    m_dragMode = DragMode::TransitionTrailOutResize;
-                    m_dragClipIndex = hitClip;
-                    m_dragStartX = event->pos().x();
-                    m_dragOriginalTransitionDuration = clip.trailOut.duration;
-                    setCursor(Qt::SizeHorCursor);
-                    event->accept();
-                    return;
-                }
-            }
-        }
-    }
-
     if (event->button() == Qt::LeftButton && !additive)
         emit seekRequested(qMax(0.0, xToSeconds(event->pos().x())));
-
-    int clickedClip = clipAtX(event->pos().x());
-    if (event->button() == Qt::LeftButton && clickedClip >= 0) {
+    if (event->button() == Qt::LeftButton && clipIndex >= 0) {
         if (additive) {
-            toggleClipSelection(clickedClip);
-            emit clipClicked(clickedClip);
-            return;
+            toggleClipSelection(clipIndex); emit clipClicked(clipIndex); return;
         }
-        // Preserve a multi-selection when the user starts a group drag by
-        // clicking (without modifier) on a clip that's already part of it.
-        // Otherwise, replace the selection with the clicked clip.
         const bool partOfMulti = m_selectedClips.size() > 1
-                                 && m_selectedClips.contains(clickedClip);
-        if (!partOfMulti) setSelectedClip(clickedClip);
-        emit clipClicked(clickedClip);
-        int cx = clipStartX(clickedClip);
-        int clipWidth = qMax(20, static_cast<int>(m_clips[clickedClip].effectiveDuration() * m_pixelsPerSecond));
-        int localX = event->pos().x() - cx;
-        if (localX <= TRIM_HANDLE_WIDTH) {
-            m_dragMode = DragMode::TrimLeft; m_dragClipIndex = clickedClip;
-            m_dragStartX = event->pos().x(); m_dragOriginalValue = m_clips[clickedClip].inPoint;
-            m_dragOriginalLeadIn = m_clips[clickedClip].leadInSec;
-        } else if (localX >= clipWidth - TRIM_HANDLE_WIDTH) {
-            m_dragMode = DragMode::TrimRight; m_dragClipIndex = clickedClip;
-            m_dragStartX = event->pos().x();
-            m_dragOriginalValue = m_clips[clickedClip].outPoint > 0 ? m_clips[clickedClip].outPoint : m_clips[clickedClip].duration;
-        } else {
-            m_dragMode = DragMode::MoveClip; m_dragClipIndex = clickedClip;
-            m_dragStartX = event->pos().x();
-            m_dragOriginalLeadIn = m_clips[clickedClip].leadInSec;
-            m_dragOriginalClipStartX = clipStartX(clickedClip);
-            m_dragOriginalLeadInNext = (clickedClip + 1 < m_clips.size())
-                ? m_clips[clickedClip + 1].leadInSec
-                : -1.0;
-            m_dropTargetIndex = -1;
-            // Tell Timeline so it can snapshot every linked partner's
-            // leadInSec state — the drag will stay in sync as long as we
-            // broadcast deltas through linkedDragDelta each move.
-            emit linkedDragStarted(clickedClip);
-        }
-    } else if (clickedClip < 0 && !additive) {
-        setSelectedClip(-1);
-        emit emptyAreaClicked();
+                                  && m_selectedClips.contains(clipIndex);
+        if (!partOfMulti) setSelectedClip(clipIndex);
+        emit clipClicked(clipIndex);
+        if (tryHitTransitionBadge(event, clipIndex)) return;
+        if (tryHitTrimEdge(event, clipIndex, clipRect)) return;
+        handleBodyClick(event, clipIndex);
+    } else if (event->button() == Qt::LeftButton && !additive) {
+        setSelectedClip(-1); emit emptyAreaClicked();
     }
+}
+
+bool TimelineTrack::tryHitEnvelopeKeyframe(QMouseEvent *ev, int clipIndex)
+{
+    if (!g_envelopeEditMode || !m_isAudioTrack)
+        return false;
+    if (ev->button() != Qt::LeftButton && ev->button() != Qt::RightButton)
+        return false;
+    if (clipIndex < 0 || clipIndex >= m_clips.size())
+        return false;
+    ClipInfo &clip = m_clips[clipIndex];
+    const double effDur = clip.effectiveDuration();
+    if (effDur <= 0.0) return false;
+    const QPoint pos = ev->pos();
+    const int clipStartXpx = clipStartX(clipIndex);
+    const int clipWidth = qMax(20, static_cast<int>(
+        qMin<double>(2000000.0, effDur * m_pixelsPerSecond)));
+    const double localPx = pos.x() - clipStartXpx;
+    if (localPx < 0.0 || localPx > clipWidth) return false;
+    int hitPt = -1;
+    for (int k = 0; k < clip.volumeEnvelope.size(); ++k) {
+        const auto &pt = clip.volumeEnvelope[k];
+        const double frac = qBound(0.0, pt.time / effDur, 1.0);
+        const double px = frac * clipWidth;
+        const double py = envelopeGainToY(pt.gain, m_rowHeight);
+        const double dx = localPx - px;
+        const double dy = pos.y() - py;
+        if (dx * dx + dy * dy <= kEnvelopeHitRadiusPx * kEnvelopeHitRadiusPx) {
+            hitPt = k;
+            break;
+        }
+    }
+    const bool altHeld = ev->modifiers() & Qt::AltModifier;
+    if (ev->button() == Qt::RightButton) {
+        if (hitPt >= 0) {
+            clip.volumeEnvelope.remove(hitPt);
+            update();
+            emit modified();
+            ev->accept();
+            return true;
+        }
+        return false;
+    }
+    if (hitPt >= 0) {
+        m_envelopeDragClipIdx = clipIndex;
+        m_envelopeDragPointIdx = hitPt;
+        ev->accept();
+        return true;
+    }
+    if (altHeld) {
+        const bool inBadgeBand = pos.y() >= kTransBadgeYTop
+                                  && pos.y() <= kTransBadgeYBot;
+        const bool clipHasTrans = clip.leadIn.type != TransitionType::None
+                                   || clip.trailOut.type != TransitionType::None;
+        if (!(inBadgeBand && clipHasTrans)) {
+            AudioGainPoint np;
+            np.time = qBound(0.0,
+                (localPx / clipWidth) * effDur, effDur);
+            np.gain = envelopeYToGain(pos.y(), m_rowHeight);
+            int insertAt = 0;
+            while (insertAt < clip.volumeEnvelope.size()
+                   && clip.volumeEnvelope[insertAt].time <= np.time)
+                ++insertAt;
+            clip.volumeEnvelope.insert(insertAt, np);
+            m_envelopeDragClipIdx = clipIndex;
+            m_envelopeDragPointIdx = insertAt;
+            update();
+            emit modified();
+            ev->accept();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TimelineTrack::tryHitTransitionDragHandle(QMouseEvent *ev, int clipIndex, const QRectF &clipRect)
+{
+    if (ev->button() != Qt::LeftButton) return false;
+    const int cy = ev->pos().y();
+    if (cy < kTransBadgeYTop || cy > kTransBadgeYBot) return false;
+    if (clipIndex < 0 || clipIndex >= m_clips.size()) return false;
+    const int cx = static_cast<int>(clipRect.x());
+    const int cw = static_cast<int>(clipRect.width());
+    const auto &clip = m_clips[clipIndex];
+    if (clip.leadIn.type != TransitionType::None && clip.leadIn.duration > 0.0) {
+        const int badgeX = cx + 2;
+        const int badgeW = transBadgeWidth(clip.leadIn.duration, m_pixelsPerSecond, cw);
+        const int handleX = badgeX + badgeW - kTransBadgeHandleW;
+        if (ev->pos().x() >= handleX && ev->pos().x() <= handleX + kTransBadgeHandleW) {
+            setSelectedClip(clipIndex);
+            emit clipClicked(clipIndex);
+            m_dragMode = DragMode::TransitionLeadInResize;
+            m_dragClipIndex = clipIndex;
+            m_dragStartX = ev->pos().x();
+            m_dragOriginalTransitionDuration = clip.leadIn.duration;
+            setCursor(Qt::SizeHorCursor);
+            ev->accept();
+            return true;
+        }
+    }
+    if (clip.trailOut.type != TransitionType::None && clip.trailOut.duration > 0.0) {
+        const int badgeW = transBadgeWidth(clip.trailOut.duration, m_pixelsPerSecond, cw);
+        const int badgeX = cx + cw - badgeW - 2;
+        if (ev->pos().x() >= badgeX && ev->pos().x() <= badgeX + kTransBadgeHandleW) {
+            setSelectedClip(clipIndex);
+            emit clipClicked(clipIndex);
+            m_dragMode = DragMode::TransitionTrailOutResize;
+            m_dragClipIndex = clipIndex;
+            m_dragStartX = ev->pos().x();
+            m_dragOriginalTransitionDuration = clip.trailOut.duration;
+            setCursor(Qt::SizeHorCursor);
+            ev->accept();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TimelineTrack::tryHitTransitionBadge(QMouseEvent *ev, int clipIndex)
+{
+    if (ev->button() != Qt::LeftButton) return false;
+    if (clipIndex < 0 || clipIndex >= m_clips.size()) return false;
+    const int cy = ev->pos().y();
+    if (cy < kTransBadgeYTop || cy > kTransBadgeYBot) return false;
+    const auto &clip = m_clips[clipIndex];
+    const int cx = clipStartX(clipIndex);
+    const int cw = qMax(20, static_cast<int>(
+        clip.effectiveDuration() * m_pixelsPerSecond));
+    const int px = ev->pos().x();
+    if (clip.leadIn.type != TransitionType::None && clip.leadIn.duration > 0.0) {
+        const int badgeW = transBadgeWidth(clip.leadIn.duration, m_pixelsPerSecond, cw);
+        const int badgeX = cx + 2;
+        // Body region of the leadIn badge (between badge start and the
+        // resize handle). Swallow the click so it doesn't fall through to
+        // trim-edge or body-click handling — clicking a transition badge
+        // should never select / drag the clip body.
+        if (px >= badgeX && px < badgeX + badgeW - kTransBadgeHandleW) {
+            ev->accept();
+            return true;
+        }
+    }
+    if (clip.trailOut.type != TransitionType::None && clip.trailOut.duration > 0.0) {
+        const int badgeW = transBadgeWidth(clip.trailOut.duration, m_pixelsPerSecond, cw);
+        const int badgeX = cx + cw - badgeW - 2;
+        if (px >= badgeX + kTransBadgeHandleW && px < badgeX + badgeW) {
+            ev->accept();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TimelineTrack::tryHitTrimEdge(QMouseEvent *ev, int clipIndex, const QRectF &clipRect)
+{
+    if (ev->button() != Qt::LeftButton) return false;
+    if (clipIndex < 0 || clipIndex >= m_clips.size()) return false;
+    const int cx = static_cast<int>(clipRect.x());
+    const int clipWidth = static_cast<int>(clipRect.width());
+    const int localX = ev->pos().x() - cx;
+    if (localX <= TRIM_HANDLE_WIDTH) {
+        m_dragMode = DragMode::TrimLeft;
+        m_dragClipIndex = clipIndex;
+        m_dragStartX = ev->pos().x();
+        m_dragOriginalValue = m_clips[clipIndex].inPoint;
+        m_dragOriginalLeadIn = m_clips[clipIndex].leadInSec;
+        return true;
+    }
+    if (localX >= clipWidth - TRIM_HANDLE_WIDTH) {
+        m_dragMode = DragMode::TrimRight;
+        m_dragClipIndex = clipIndex;
+        m_dragStartX = ev->pos().x();
+        m_dragOriginalValue = m_clips[clipIndex].outPoint > 0
+            ? m_clips[clipIndex].outPoint : m_clips[clipIndex].duration;
+        return true;
+    }
+    return false;
+}
+
+void TimelineTrack::handleBodyClick(QMouseEvent *ev, int clipIndex)
+{
+    if (ev->button() != Qt::LeftButton) return;
+    if (clipIndex < 0 || clipIndex >= m_clips.size()) return;
+    m_dragMode = DragMode::MoveClip;
+    m_dragClipIndex = clipIndex;
+    m_dragStartX = ev->pos().x();
+    m_dragOriginalLeadIn = m_clips[clipIndex].leadInSec;
+    m_dragOriginalClipStartX = clipStartX(clipIndex);
+    m_dragOriginalLeadInNext = (clipIndex + 1 < m_clips.size())
+        ? m_clips[clipIndex + 1].leadInSec : -1.0;
+    m_dropTargetIndex = -1;
+    // Pre-collect snap targets at drag start for O(log n) per-tick lookups.
+    if (m_snapEnabled && m_timeline) {
+        const qint64 playheadUs = static_cast<qint64>(
+            m_timeline->playheadPosition() * 1'000'000.0);
+        m_timeline->snapEngine().collectFromTimeline(
+            *m_timeline, playheadUs, m_timeline->markerManager());
+    }
+    emit linkedDragStarted(clipIndex);
 }
 
 void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
@@ -1477,18 +1539,19 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
         int adjustedDx = dx;
 
         // Snap: adjust delta so the clip's left edge magnetises to the
-        // nearest target (other clip edges, playhead, t=0).
+        // nearest target (other clip edges, playhead, t=0, markers).
         if (m_snapEnabled && m_timeline) {
             const int candidateX = m_dragOriginalClipStartX + dx;
             const double candidateSec = static_cast<double>(candidateX) / m_pixelsPerSecond;
             const qint64 candidateUs = static_cast<qint64>(candidateSec * 1e6);
-            int snapScreenX = 0;
-            const qint64 snappedUs = m_timeline->findSnapTarget(candidateUs, &snapScreenX);
-            if (snappedUs != candidateUs) {
-                const double snappedSec = static_cast<double>(snappedUs) / 1e6;
+            const qint64 toleranceUs = static_cast<qint64>(
+                SNAP_THRESHOLD / m_pixelsPerSecond * 1e6);
+            const auto match = m_timeline->snapEngine().findMatch(candidateUs, toleranceUs);
+            if (match.has_value()) {
+                const double snappedSec = static_cast<double>(match->timeUs) / 1e6;
                 const int snappedX = static_cast<int>(snappedSec * m_pixelsPerSecond);
                 adjustedDx = snappedX - m_dragOriginalClipStartX;
-                m_timeline->triggerSnapLine(snapScreenX);
+                m_timeline->triggerSnapLine(snappedX);
             }
         }
 
@@ -3061,6 +3124,8 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         QAction *aUnlink = aMenu.addAction(QStringLiteral("同期を切る"));
         aUnlink->setEnabled(aLinkGroup > 0);
         aMenu.addSeparator();
+        QAction *aNormalize = aMenu.addAction(QStringLiteral("ノーマライズ"));
+        aMenu.addSeparator();
         QMenu *atMenu = aMenu.addMenu(QStringLiteral("音声トランジション"));
         QAction *aXdAct = atMenu->addAction(QStringLiteral("クロスフェード (1.0s)"));
         QAction *aFiAct = atMenu->addAction(QStringLiteral("フェードイン (0.5s)"));
@@ -3110,6 +3175,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         else if (aChosen == aCopy) copySelectedClip();
         else if (aChosen == aDel) deleteSelectedClip();
         else if (aChosen == aUnlink) unlinkClipGroup(aLinkGroup);
+        else if (aChosen == aNormalize) {
+            const int trackIdx = m_audioTracks.indexOf(track);
+            normalizeAudioClipPeak(trackIdx, clipIndex);
+        }
         else if (aChosen == aXdAct) applyAudioOnly(TransitionType::CrossDissolve, 1.0);
         else if (aChosen == aFiAct) applyAudioOnly(TransitionType::FadeIn, 0.5);
         else if (aChosen == aFoAct) applyAudioOnly(TransitionType::FadeOut, 0.5);
@@ -3899,6 +3968,209 @@ void Timeline::toggleSoloTrack(int audioTrackIndex)
     updateInfoLabel();
 }
 
+void Timeline::normalizeAudioClipPeak(int trackIdx, int clipIdx)
+{
+    if (trackIdx < 0 || trackIdx >= m_audioTracks.size()) return;
+    TimelineTrack *track = m_audioTracks[trackIdx];
+    if (!track || clipIdx < 0 || clipIdx >= track->clips().size()) return;
+
+    const ClipInfo clipSrc = track->clips()[clipIdx];
+    ClipInfo clip = clipSrc;
+    const QString filePath = clip.filePath;
+    if (filePath.isEmpty()) {
+        emit statusMessageRequested(QStringLiteral("ノーマライズ失敗: ファイルを読めません."), 5000);
+        return;
+    }
+
+    NormalizeDecoderCtx dec;
+    if (!dec.open(filePath)) {
+        emit statusMessageRequested(QStringLiteral("ノーマライズ失敗: ファイルを読めません."), 5000);
+        return;
+    }
+
+    const double fileInSec = clip.inPoint;
+    const double fileOutSec = (clip.outPoint > 0.0) ? clip.outPoint : clip.duration;
+    const double searchLenSec = fileOutSec - fileInSec;
+    if (searchLenSec <= 0.0) {
+        emit statusMessageRequested(QStringLiteral("ノーマライズ失敗: 信号が検出されませんでした."), 5000);
+        return;
+    }
+
+    const int channels = dec.codec->ch_layout.nb_channels;
+    const int sampleRate = dec.codec->sample_rate;
+    const int stream = dec.streamIdx();
+    const double timebase = av_q2d(dec.fmt->streams[stream]->time_base);
+
+    // Seek to in-point
+    const int64_t seekTs = static_cast<int64_t>(fileInSec / timebase);
+    av_seek_frame(dec.fmt, stream, seekTs, AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(dec.codec);
+
+    // Progress dialog for clips > 60 seconds (existing pattern from MainWindow)
+    QProgressDialog *progress = nullptr;
+    bool cancelled = false;
+    if (searchLenSec > 60.0) {
+        progress = new QProgressDialog(QStringLiteral("ノーマライズ中..."),
+                                        QStringLiteral("キャンセル"), 0, 100, this);
+        progress->setWindowModality(Qt::WindowModal);
+        progress->setMinimumDuration(0);
+        progress->setValue(0);
+    }
+
+    double maxSampleAbs = 0.0;
+    int64_t lastPts = AV_NOPTS_VALUE;
+
+    while (av_read_frame(dec.fmt, dec.pkt) >= 0) {
+        if (dec.pkt->stream_index != stream) {
+            av_packet_unref(dec.pkt);
+            continue;
+        }
+
+        if (progress && progress->wasCanceled()) {
+            cancelled = true;
+            av_packet_unref(dec.pkt);
+            break;
+        }
+
+        if (avcodec_send_packet(dec.codec, dec.pkt) < 0) {
+            av_packet_unref(dec.pkt);
+            continue;
+        }
+
+        while (avcodec_receive_frame(dec.codec, dec.frame) >= 0) {
+            if (dec.frame->pts != AV_NOPTS_VALUE)
+                lastPts = dec.frame->pts;
+            if (lastPts == AV_NOPTS_VALUE) {
+                av_frame_unref(dec.frame);
+                continue;
+            }
+
+            const double frameTimeSec = static_cast<double>(lastPts) * timebase;
+            const double frameEndSec =
+                frameTimeSec + static_cast<double>(dec.frame->nb_samples) / sampleRate;
+
+            // Entire frame before or after the clip window → skip
+            if (frameEndSec <= fileInSec || frameTimeSec >= fileOutSec) {
+                av_frame_unref(dec.frame);
+                continue;
+            }
+
+            // Clip the sample range to the clip window
+            int sStart = 0;
+            int sEnd = dec.frame->nb_samples;
+            if (frameTimeSec < fileInSec) {
+                sStart = static_cast<int>((fileInSec - frameTimeSec) * sampleRate);
+                if (sStart > dec.frame->nb_samples) sStart = dec.frame->nb_samples;
+            }
+            if (frameEndSec > fileOutSec) {
+                sEnd = dec.frame->nb_samples
+                     - static_cast<int>((frameEndSec - fileOutSec) * sampleRate);
+                if (sEnd < sStart) sEnd = sStart;
+            }
+
+            // Walk every channel's samples and track max |sample|
+            const auto sampleFmt = dec.codec->sample_fmt;
+            const bool planar = av_sample_fmt_is_planar(sampleFmt) != 0;
+            for (int ch = 0; ch < channels; ++ch) {
+                for (int s = sStart; s < sEnd; ++s) {
+                    const int idx = planar ? s : (s * channels + ch);
+                    const uint8_t *buf = planar ? dec.frame->data[ch]
+                                                : dec.frame->data[0];
+                    if (!buf) break;
+                    double val = 0.0;
+                    switch (sampleFmt) {
+                    case AV_SAMPLE_FMT_S16:
+                    case AV_SAMPLE_FMT_S16P:
+                        val = std::abs(static_cast<double>(
+                            reinterpret_cast<const int16_t *>(buf)[idx]));
+                        break;
+                    case AV_SAMPLE_FMT_S32:
+                    case AV_SAMPLE_FMT_S32P:
+                        val = std::abs(static_cast<double>(
+                            reinterpret_cast<const int32_t *>(buf)[idx]))
+                            / 2147483648.0 * 32768.0;
+                        break;
+                    case AV_SAMPLE_FMT_FLT:
+                    case AV_SAMPLE_FMT_FLTP:
+                        val = std::abs(static_cast<double>(
+                            reinterpret_cast<const float *>(buf)[idx]))
+                            * 32768.0;
+                        break;
+                    case AV_SAMPLE_FMT_DBL:
+                    case AV_SAMPLE_FMT_DBLP:
+                        val = std::abs(
+                            reinterpret_cast<const double *>(buf)[idx])
+                            * 32768.0;
+                        break;
+                    default:
+                        break;
+                    }
+                    if (val > maxSampleAbs) maxSampleAbs = val;
+                }
+            }
+
+            av_frame_unref(dec.frame);
+
+            if (progress && !cancelled) {
+                const double pct = (frameTimeSec - fileInSec) / searchLenSec * 100.0;
+                progress->setValue(static_cast<int>(qBound(0.0, pct, 100.0)));
+                QCoreApplication::processEvents();
+            }
+        }
+        av_packet_unref(dec.pkt);
+    }
+
+    if (progress) {
+        progress->close();
+        delete progress;
+    }
+
+    if (cancelled) {
+        emit statusMessageRequested(QStringLiteral("ノーマライズがキャンセルされました."), 3000);
+        return;
+    }
+
+    // Result: peak analysis
+    if (maxSampleAbs < 1e-12) {
+        emit statusMessageRequested(QStringLiteral("ノーマライズ失敗: 信号が検出されませんでした."), 5000);
+        return;
+    }
+
+    const double peakDb = 20.0 * std::log10(maxSampleAbs / 32768.0);
+    if (peakDb < -90.0) {
+        emit statusMessageRequested(QStringLiteral("ノーマライズ失敗: 信号が検出されませんでした."), 5000);
+        return;
+    }
+
+    double gainDb = -1.0 - peakDb;  // target peak = -1 dBFS
+    gainDb = qBound(-24.0, gainDb, 12.0);  // clamp gain to [-24, +12]
+
+    const double oldVol = clip.volume;
+    const double gainLinear = std::pow(10.0, gainDb / 20.0);
+    const double newVol = qBound(0.0, oldVol * gainLinear, 4.0);
+
+    // Snapshot pre-mutation so Ctrl+Z restores the original volume.
+    // Mirrors MainWindow::onMeterRequestNormalize ordering (saveState then
+    // mutate). Must run before track->setClips below.
+    saveUndoState(QStringLiteral("Normalize audio clip"));
+
+    clip.volume = newVol;
+    auto clips = track->clips();
+    clips[clipIdx] = clip;
+    track->setClips(clips);
+
+    scheduleEmitSequenceChanged();
+
+    const QString msg =
+        QStringLiteral("A%1 クリップ %2 ノーマライズ: peak %3dB → gain %4→%5")
+            .arg(trackIdx + 1)
+            .arg(clipIdx + 1)
+            .arg(peakDb, 0, 'f', 1)
+            .arg(oldVol, 0, 'f', 2)
+            .arg(clip.volume, 0, 'f', 2);
+    emit statusMessageRequested(msg, 5000);
+}
+
 void Timeline::setPlayheadPosition(double seconds)
 {
     m_playheadPos = qMax(0.0, seconds);
@@ -4587,7 +4859,35 @@ TimelineState Timeline::currentState() const
     for (const auto *t : m_audioTracks)
         state.audioTracks.append(t ? t->clips() : QVector<ClipInfo>{});
     state.selectedClip = m_videoTrack->selectedClip();
+
+    for (int i = 0; i < m_videoTracks.size(); ++i) {
+        if (!m_videoTracks[i]) continue;
+        const int sel = m_videoTracks[i]->selectedClip();
+        if (sel >= 0) {
+            state.selectedVideoTrackIndex = i;
+            state.selectedVideoClipIndex = sel;
+            break;
+        }
+    }
+    for (int i = 0; i < m_audioTracks.size(); ++i) {
+        if (!m_audioTracks[i]) continue;
+        const int sel = m_audioTracks[i]->selectedClip();
+        if (sel >= 0) {
+            state.selectedAudioTrackIndex = i;
+            state.selectedAudioClipIndex = sel;
+            break;
+        }
+    }
+
     state.playheadPos = m_playheadPos;
+
+    if (m_audioMixer) {
+        const int n = audioTrackCount();
+        state.audioTrackGains.resize(n);
+        for (int i = 0; i < n; ++i)
+            state.audioTrackGains[i] = m_audioMixer->trackGain(i);
+    }
+
     return state;
 }
 
@@ -4617,22 +4917,65 @@ void Timeline::restoreState(const TimelineState &state)
         m_audioTracks[i]->update();
     }
 
-    {
+    // Clear every track's UI selection (via blockSignals so we don't emit
+    // a cascade of intermediate selectionChanged signals from stale tracks).
+    // Then restore the selection on the correct track, letting signals
+    // through so wireTrackSelection can sync linked clips and emit
+    // clipSelected/clipSelectedOnTrack.
+    clearAllSelections();
+
+    bool videoSelSet = false;
+    if (state.selectedVideoTrackIndex >= 0
+        && state.selectedVideoTrackIndex < m_videoTracks.size()) {
+        TimelineTrack *vt = m_videoTracks[state.selectedVideoTrackIndex];
+        if (vt && state.selectedVideoClipIndex >= 0
+            && state.selectedVideoClipIndex < vt->clipCount()) {
+            vt->setSelectedClip(state.selectedVideoClipIndex);
+            videoSelSet = true;
+        }
+    }
+    // Fallback to legacy V1-relative selection for undo entries that
+    // predate the V2 track-aware fields (selectedVideoTrackIndex == -1).
+    if (!videoSelSet) {
         const bool vWas = m_videoTrack->blockSignals(true);
         m_videoTrack->setSelectedClip(state.selectedClip);
         m_videoTrack->blockSignals(vWas);
+        emit clipSelected(state.selectedClip);
+        emit clipSelectedOnTrack(state.selectedClip < 0 ? -1 : 0,
+                                 state.selectedClip);
+    }
+
+    if (state.selectedAudioTrackIndex >= 0
+        && state.selectedAudioTrackIndex < m_audioTracks.size()) {
+        TimelineTrack *at = m_audioTracks[state.selectedAudioTrackIndex];
+        if (at && state.selectedAudioClipIndex >= 0
+            && state.selectedAudioClipIndex < at->clipCount()) {
+            // Block signals so the audio track restore doesn't re-emit
+            // clipSelected/clipSelectedOnTrack (the video path or legacy
+            // fallback already handled those).
+            const bool aWas = at->blockSignals(true);
+            at->setSelectedClip(state.selectedAudioClipIndex);
+            at->blockSignals(aWas);
+        }
+    } else if (state.selectedAudioTrackIndex < 0) {
+        // Legacy fallback: old undo entries predating the V2 track-aware
+        // fields restore selection on A1 the same as V1. If
+        // selectedAudioTrackIndex >= 0 but the track no longer exists,
+        // clear selection silently (no fallback).
         const bool aWas = m_audioTrack->blockSignals(true);
         m_audioTrack->setSelectedClip(state.selectedClip);
         m_audioTrack->blockSignals(aWas);
     }
+
     m_playheadPos = state.playheadPos;
     syncPlayheadOverlay();
-    emit clipSelected(state.selectedClip);
-    // V3 sprint — track-aware overload. restoreState's selection still
-    // routes through V1 (the rest of the editor uses V1-relative
-    // selection), so emit -1 / 0 here.
-    emit clipSelectedOnTrack(state.selectedClip < 0 ? -1 : 0,
-                             state.selectedClip);
+
+    if (m_audioMixer && !state.audioTrackGains.isEmpty()) {
+        const int n = qMin(state.audioTrackGains.size(), audioTrackCount());
+        for (int i = 0; i < n; ++i)
+            m_audioMixer->setTrackGain(i, state.audioTrackGains[i]);
+    }
+
     // setClips bypasses the modified() signal path; trigger explicitly so the
     // VideoPlayer rebuilds its sequence after undo/redo.
     scheduleEmitSequenceChanged();
