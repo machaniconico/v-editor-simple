@@ -45,6 +45,19 @@ struct AutoDuckState {
     double releaseMs = 250.0;
 };
 
+// US-FEAT-A: overlay persistence — unified overlay item for project serialization
+struct OverlayItem {
+    int id = -1;
+    QString type;               // "text", "image", "shape"
+    QRectF bounds;              // normalized (0..1), center-based x/y + width/height
+    double startTimeMs = 0.0;
+    double durationMs = 0.0;
+    QString color;              // #RRGGBBAA hex
+    QString text;
+    double opacity = 1.0;
+    int trackIdx = 0;
+};
+
 // Full project state for serialization
 struct ProjectData {
     ProjectConfig config;
@@ -60,6 +73,9 @@ struct ProjectData {
     CompressorState masterCompressor;
     AutoDuckState autoDuck;
     bool audioMetersDockVisible = true;
+
+    // US-FEAT-A: overlay persistence
+    QList<OverlayItem> overlays;
 };
 
 class ProjectFile
@@ -106,4 +122,8 @@ private:
     static CompressorState compressorFromJson(const QJsonObject &obj);
     static QJsonObject autoDuckToJson(const AutoDuckState &ad);
     static AutoDuckState autoDuckFromJson(const QJsonObject &obj);
+
+    // US-FEAT-A: overlay persistence
+    static QJsonObject overlayToJson(const OverlayItem &o);
+    static OverlayItem overlayFromJson(const QJsonObject &obj);
 };

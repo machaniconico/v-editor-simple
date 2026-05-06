@@ -40,6 +40,14 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["ui"] = ui;
     }
 
+    // US-FEAT-A: overlay persistence
+    {
+        QJsonArray ovArr;
+        for (const auto &o : data.overlays)
+            ovArr.append(overlayToJson(o));
+        root["overlays"] = ovArr;
+    }
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -89,6 +97,13 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             data.audioMetersDockVisible = ui["audioMetersDockVisible"].toBool(true);
     }
 
+    // US-FEAT-A: overlay persistence — backward compat: missing key = empty list
+    data.overlays.clear();
+    if (root.contains("overlays")) {
+        for (const auto &v : root["overlays"].toArray())
+            data.overlays.append(overlayFromJson(v.toObject()));
+    }
+
     return true;
 }
 
@@ -123,6 +138,14 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         QJsonObject ui;
         ui["audioMetersDockVisible"] = data.audioMetersDockVisible;
         root["ui"] = ui;
+    }
+
+    // US-FEAT-A: overlay persistence
+    {
+        QJsonArray ovArr;
+        for (const auto &o : data.overlays)
+            ovArr.append(overlayToJson(o));
+        root["overlays"] = ovArr;
     }
 
     QJsonDocument doc(root);
@@ -164,6 +187,13 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
         QJsonObject ui = root["ui"].toObject();
         if (ui.contains("audioMetersDockVisible"))
             data.audioMetersDockVisible = ui["audioMetersDockVisible"].toBool(true);
+    }
+
+    // US-FEAT-A: overlay persistence — backward compat: missing key = empty list
+    data.overlays.clear();
+    if (root.contains("overlays")) {
+        for (const auto &v : root["overlays"].toArray())
+            data.overlays.append(overlayFromJson(v.toObject()));
     }
 
     return true;
@@ -575,4 +605,43 @@ AutoDuckState ProjectFile::autoDuckFromJson(const QJsonObject &obj)
     ad.attackMs    = sanitize(rawAttack, 5.0, 0.1, 1000.0);
     ad.releaseMs   = sanitize(rawRelease, 250.0, 1.0, 5000.0);
     return ad;
+}
+
+// --- US-FEAT-A: overlay persistence ---
+
+QJsonObject ProjectFile::overlayToJson(const OverlayItem &o)
+{
+    QJsonObject obj;
+    obj["id"] = o.id;
+    obj["type"] = o.type;
+    QJsonObject b;
+    b["x"] = o.bounds.x();
+    b["y"] = o.bounds.y();
+    b["w"] = o.bounds.width();
+    b["h"] = o.bounds.height();
+    obj["bounds"] = b;
+    obj["startTimeMs"] = o.startTimeMs;
+    obj["durationMs"] = o.durationMs;
+    obj["color"] = o.color;
+    obj["text"] = o.text;
+    obj["opacity"] = o.opacity;
+    obj["trackIdx"] = o.trackIdx;
+    return obj;
+}
+
+OverlayItem ProjectFile::overlayFromJson(const QJsonObject &obj)
+{
+    OverlayItem o;
+    o.id = obj["id"].toInt(-1);
+    o.type = obj["type"].toString("text");
+    const QJsonObject b = obj["bounds"].toObject();
+    o.bounds = QRectF(b["x"].toDouble(0.5), b["y"].toDouble(0.5),
+                       b["w"].toDouble(0.3), b["h"].toDouble(0.1));
+    o.startTimeMs = obj["startTimeMs"].toDouble(0.0);
+    o.durationMs = obj["durationMs"].toDouble(0.0);
+    o.color = obj["color"].toString("#FFFFFFFF");
+    o.text = obj["text"].toString();
+    o.opacity = obj["opacity"].toDouble(1.0);
+    o.trackIdx = obj["trackIdx"].toInt(0);
+    return o;
 }
