@@ -9,6 +9,7 @@
 #include <QVector3D>
 #include "VideoEffect.h"
 #include "LutImporter.h"
+#include "CurveEditor.h"
 
 class ColorWheelWidget;
 class QGroupBox;
@@ -47,12 +48,15 @@ public:
     ColorWheels currentWheels() const;
     void setWheels(const ColorWheels &cw);
 
+    void setCurveData(const RgbCurveData &data);
+
 signals:
     void colorCorrectionChanged(const ColorCorrection &cc);
     void colorWheelsChanged(const ColorWheels &cw);
     void lutSelected(const QString &name);
     void lutIntensityChanged(double intensity);
     void resetRequested();
+    void curvesChanged(const RgbCurveData &data);
 
 private slots:
     void onLiftChanged(double r, double g, double b);
@@ -112,6 +116,10 @@ private:
     QComboBox *m_lutCombo;
     QSlider *m_lutIntensitySlider;
     QLabel *m_lutIntensityLabel;
+
+    // Curve controls (US-CG-1)
+    CurveEditor *m_curveEditor = nullptr;
+    QComboBox *m_curveChannelCombo = nullptr;
 
     QPushButton *m_resetButton;
     QTimer *m_wheelDebounce;

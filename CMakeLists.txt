@@ -51,6 +51,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/VideoEffectDialogs.cpp
     src/ColorWheelWidget.cpp
     src/ColorGradingPanel.cpp
+    src/CurveEditor.h
+    src/CurveEditor.cpp
     src/Keyframe.cpp
     src/EffectPlugin.cpp
     src/ProjectFile.cpp
