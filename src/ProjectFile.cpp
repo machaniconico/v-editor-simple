@@ -48,6 +48,14 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["overlays"] = ovArr;
     }
 
+    // Markers
+    {
+        QJsonArray markersArr;
+        for (const auto &m : data.markers)
+            markersArr.append(markerToJsonObject(m));
+        root["markers"] = markersArr;
+    }
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -104,6 +112,15 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             data.overlays.append(overlayFromJson(v.toObject()));
     }
 
+    // Markers
+    data.markers.clear();
+    if (root.contains("markers")) {
+        for (const auto &v : root["markers"].toArray()) {
+            auto m = markerFromJsonObject(v.toObject());
+            if (m.id > 0) data.markers.append(m);
+        }
+    }
+
     return true;
 }
 
@@ -146,6 +163,14 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         for (const auto &o : data.overlays)
             ovArr.append(overlayToJson(o));
         root["overlays"] = ovArr;
+    }
+
+    // Markers
+    {
+        QJsonArray markersArr;
+        for (const auto &m : data.markers)
+            markersArr.append(markerToJsonObject(m));
+        root["markers"] = markersArr;
     }
 
     QJsonDocument doc(root);
@@ -194,6 +219,15 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     if (root.contains("overlays")) {
         for (const auto &v : root["overlays"].toArray())
             data.overlays.append(overlayFromJson(v.toObject()));
+    }
+
+    // Markers
+    data.markers.clear();
+    if (root.contains("markers")) {
+        for (const auto &v : root["markers"].toArray()) {
+            auto m = markerFromJsonObject(v.toObject());
+            if (m.id > 0) data.markers.append(m);
+        }
     }
 
     return true;
