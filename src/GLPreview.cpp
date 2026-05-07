@@ -1,5 +1,7 @@
 #include "GLPreview.h"
+#include "CurveEditor.h"
 #include <cmath>
+#include <vector>
 #include <cstring>
 #include <functional>
 #include <unordered_map>
@@ -127,6 +129,10 @@ uniform float uGainR, uGainG, uGainB;     // -1.0 to 1.0
 uniform sampler3D uLut3D;
 uniform float uLutIntensity;  // 0.0 to 1.0
 uniform bool uLutEnabled;
+
+// RGB Curves (US-CG-1): 256x4 RGBA32F, row 0=R, 1=G, 2=B, 3=Master
+uniform sampler2D uCurveLut;
+uniform bool uCurvesEnabled;
 
 // 0=sRGB, 1=PQ, 2=HLG. Non-zero applies inverse EOTF + Hable tone map before grading.
 uniform int uHdrTransfer;
@@ -386,6 +392,16 @@ void main() {
             vec3 lutColor = texture(uLut3D, clamp(color, 0.0, 1.0)).rgb;
             color = mix(color, lutColor, uLutIntensity);
         }
+
+        // US-CG-1: RGB Curves — per-channel then master pass
+        if (uCurvesEnabled) {
+            color.r = texture(uCurveLut, vec2(color.r, 0.5/4.0)).r;
+            color.g = texture(uCurveLut, vec2(color.g, 1.5/4.0)).g;
+            color.b = texture(uCurveLut, vec2(color.b, 2.5/4.0)).b;
+            color.r = texture(uCurveLut, vec2(color.r, 3.5/4.0)).r;
+            color.g = texture(uCurveLut, vec2(color.g, 3.5/4.0)).g;
+            color.b = texture(uCurveLut, vec2(color.b, 3.5/4.0)).b;
+        }
     }
 
     if (uFxSepiaEnable)    color = fxApplySepia(color, uFxSepiaStrength);
@@ -522,6 +538,10 @@ void GLPreview::cleanupGL()
         delete m_lutTexture;
         m_lutTexture = nullptr;
     }
+    if (m_curvesTexture) {
+        glDeleteTextures(1, &m_curvesTexture);
+        m_curvesTexture = 0;
+    }
     if (m_texture) {
         delete m_texture;
         m_texture = nullptr;
@@ -550,6 +570,19 @@ void GLPreview::initializeGL()
     }
 
     createShaderProgram();
+
+    // RGB Curves texture (US-CG-1): 256x4 RGBA32F, bound at GL_TEXTURE3
+    glGenTextures(1, &m_curvesTexture);
+    glBindTexture(GL_TEXTURE_2D, m_curvesTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    {
+        RgbCurveData identity;
+        uploadCurvesTexture(identity);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
 
     // Fullscreen quad: position(x,y) + texcoord(u,v)
     float vertices[] = {
@@ -836,6 +869,10 @@ void GLPreview::createShaderProgram()
     m_locLut3D         = m_program->uniformLocation("uLut3D");
     m_locLutIntensity  = m_program->uniformLocation("uLutIntensity");
     m_locLutEnabled    = m_program->uniformLocation("uLutEnabled");
+
+    // RGB Curves (US-CG-1)
+    m_locCurveLut      = m_program->uniformLocation("uCurveLut");
+    m_locCurvesEnabled = m_program->uniformLocation("uCurvesEnabled");
 
     // NV12 zero-copy program — only used when the interop fast path engages.
     // Failure to compile/link is non-fatal: callers fall back to the legacy
@@ -1384,6 +1421,13 @@ void GLPreview::paintGL()
         m_program->setUniformValue(m_locLut3D, 1);
     }
 
+    // RGB Curves (US-CG-1)
+    m_program->setUniformValue(m_locCurvesEnabled, m_curvesEnabled);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, m_curvesTexture);
+    m_program->setUniformValue(m_locCurveLut, 3);
+    glActiveTexture(GL_TEXTURE0);
+
     // Draw quad
     m_vao.bind();
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -1394,6 +1438,10 @@ void GLPreview::paintGL()
         m_lutTexture->release();
         glActiveTexture(GL_TEXTURE0);
     }
+
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0);
 
     m_texture->release();
     m_program->release();
@@ -2348,6 +2396,35 @@ void GLPreview::clearLut()
     m_lutEnabled = false;
     // US-FEAT-B: zero intensity so LUT has no residual effect if re-enabled
     m_lutIntensity = 0.0f;
+    doneCurrent();
+    update();
+}
+
+void GLPreview::uploadCurvesTexture(const RgbCurveData &c)
+{
+    // Layout: 256 wide x 4 tall RGBA32F. Row 0=R, 1=G, 2=B, 3=Master.
+    std::vector<float> pixels(256 * 4 * 4, 0.0f);
+    for (int x = 0; x < 256; ++x) {
+        pixels[(0 * 256 + x) * 4 + 0] = c.r[x];
+        pixels[(1 * 256 + x) * 4 + 1] = c.g[x];
+        pixels[(2 * 256 + x) * 4 + 2] = c.b[x];
+        pixels[(3 * 256 + x) * 4 + 0] = c.master[x];
+        pixels[(3 * 256 + x) * 4 + 1] = c.master[x];
+        pixels[(3 * 256 + x) * 4 + 2] = c.master[x];
+    }
+    glBindTexture(GL_TEXTURE_2D, m_curvesTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, 256, 4, 0, GL_RGBA, GL_FLOAT, pixels.data());
+}
+
+void GLPreview::setRgbCurves(const RgbCurveData &curves)
+{
+    m_curvesEnabled = curves.enabled;
+    if (m_curvesTexture == 0) {
+        update();
+        return;
+    }
+    makeCurrent();
+    uploadCurvesTexture(curves);
     doneCurrent();
     update();
 }

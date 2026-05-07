@@ -973,6 +973,8 @@ void MainWindow::setupMenuBar()
             m_player->glPreview()->clearLut();
         }
     });
+    connect(m_colorGradingPanel, &ColorGradingPanel::curvesChanged,
+            m_player->glPreview(), &GLPreview::setRgbCurves);
 
     viewMenu->addSeparator();
     auto *colorPanelAction = viewMenu->addAction("カラーグレーディングパネル(&G)");
