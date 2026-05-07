@@ -15,6 +15,7 @@
 #include <QColor>
 #include "VideoEffect.h"
 #include "LutImporter.h"
+#include "CurveEditor.h"
 
 class GLPreview : public QOpenGLWidget, protected QOpenGLFunctions
 {
@@ -38,6 +39,9 @@ public:
     // US-FEAT-B: LUT 3D-texture blend — upload QImage grid as GL_TEXTURE_3D
     void setLutTexture(const QImage &lutGrid, float intensity);
     void clearLut();
+    // RGB Curves (US-CG-1): 256x4 RGBA float texture, GL_TEXTURE3
+    void setRgbCurves(const RgbCurveData &curves);
+    bool curvesEnabled() const { return m_curvesEnabled; }
 
     // Phase 1e — true only when VEDITOR_GL_INTEROP=1 AND WGL_NV_DX_interop2
     // is supported AND all 6 wglDX*NV procs resolved during initializeGL().
@@ -293,6 +297,13 @@ private:
     QOpenGLTexture *m_lutTexture = nullptr;
     float m_lutIntensity = 1.0f;
     bool m_lutEnabled = false;
+
+    // RGB Curves (US-CG-1): raw GL texture at GL_TEXTURE3
+    GLuint m_curvesTexture = 0;
+    bool m_curvesEnabled = false;
+    int m_locCurveLut = -1;
+    int m_locCurvesEnabled = -1;
+    void uploadCurvesTexture(const RgbCurveData &c);
 
     // Phase 1e — m_interopDevice holds the wglDXOpenDeviceNV HANDLE once
     // Section B opens it lazily in paintGL; void* avoids leaking windows.h.

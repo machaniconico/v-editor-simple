@@ -88,6 +88,35 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
     connect(m_lutIntensitySlider, &QSlider::valueChanged,
             this, &ColorGradingPanel::onLutIntensityChanged);
 
+    // --- Curves Section (US-CG-1) ---
+    {
+        auto *curvesGroup = new QGroupBox(tr("RGBカーブ"));
+        auto *curvesLayout = new QVBoxLayout(curvesGroup);
+        curvesLayout->setSpacing(4);
+
+        auto *topRow = new QHBoxLayout;
+        topRow->addWidget(new QLabel(tr("チャンネル:")));
+        m_curveChannelCombo = new QComboBox;
+        m_curveChannelCombo->addItems({tr("All"), tr("R"), tr("G"), tr("B")});
+        topRow->addWidget(m_curveChannelCombo, 1);
+        auto *resetCurveBtn = new QPushButton(tr("リセット"));
+        topRow->addWidget(resetCurveBtn);
+        curvesLayout->addLayout(topRow);
+
+        m_curveEditor = new CurveEditor(this);
+        curvesLayout->addWidget(m_curveEditor);
+        mainLayout->addWidget(curvesGroup);
+
+        connect(m_curveChannelCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, [this](int idx) {
+            m_curveEditor->setChannel(static_cast<CurveEditor::Channel>(idx));
+        });
+        connect(resetCurveBtn, &QPushButton::clicked,
+                m_curveEditor, &CurveEditor::resetCurrentChannel);
+        connect(m_curveEditor, &CurveEditor::curvesChanged,
+                this, &ColorGradingPanel::curvesChanged);
+    }
+
     // US-FEAT-C: Lift/Gamma/Gain wheels
     {
         // --- Lift Sliders ---
@@ -504,6 +533,12 @@ void ColorGradingPanel::onLutIntensityChanged(int value)
 {
     m_lutIntensityLabel->setText(QString("%1%").arg(value));
     emit lutIntensityChanged(value / 100.0);
+}
+
+void ColorGradingPanel::setCurveData(const RgbCurveData &data)
+{
+    if (m_curveEditor)
+        m_curveEditor->setCurveData(data);
 }
 
 void ColorGradingPanel::onResetClicked()
