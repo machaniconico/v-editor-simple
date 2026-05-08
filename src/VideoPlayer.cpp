@@ -1001,7 +1001,25 @@ int64_t VideoPlayer::fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) co
     const auto &e = m_sequence[entryIdx];
     const double fileLocalSec = static_cast<double>(fileLocalUs) / AV_TIME_BASE;
     const double speed = (e.speed > 0.0) ? e.speed : 1.0;
-    const double offsetIntoEntry = qMax(0.0, (fileLocalSec - e.clipIn) / speed);
+    // US-INT-2 Phase B: ramp-aware inverse. Mirror the entryLocalPositionUs
+    // forward path (offsetIntoEntry * speed → timelineToSourceUs → +clipIn).
+    // Mathematical inverse modulo ~1 us integer truncation; stepForward's
+    // qMax(...+1, projected) floor absorbs that residual on the user surface.
+    // Identity ramps short-circuit to the legacy uniform formula so identity
+    // clips and clips on builds without ramps remain bit-exact unchanged.
+    const bool haveRamp = (entryIdx < m_speedRamps.size())
+                       && !m_speedRamps[entryIdx].isIdentity();
+    if (!haveRamp) {
+        const double offsetIntoEntry = qMax(0.0, (fileLocalSec - e.clipIn) / speed);
+        const double timelineSec = e.timelineStart + offsetIntoEntry;
+        return static_cast<int64_t>(timelineSec * AV_TIME_BASE);
+    }
+    const int64_t clipInUs = static_cast<int64_t>(e.clipIn * AV_TIME_BASE);
+    const qint64 srcOffsetUs = qMax<qint64>(0, fileLocalUs - clipInUs);
+    const qint64 scaledTlUs =
+        m_speedRamps[entryIdx].sourceToTimelineUs(srcOffsetUs);
+    const double offsetIntoEntry =
+        qMax(0.0, static_cast<double>(scaledTlUs) / speed / AV_TIME_BASE);
     const double timelineSec = e.timelineStart + offsetIntoEntry;
     return static_cast<int64_t>(timelineSec * AV_TIME_BASE);
 }
@@ -1554,7 +1572,35 @@ void VideoPlayer::stepForward()
     // forward-step revert path).
     const int64_t maxUs = m_sequenceDurationUs > 0
         ? m_sequenceDurationUs - 1 : INT64_MAX;
-    const int64_t newPos = qMin(maxUs, m_timelinePositionUs + step);
+    // US-INT-2 Phase B: under a non-identity ramp, advancing the playhead
+    // by `step` (= source-frame duration) in TIMELINE space does not land
+    // on the next decoded source frame — a 2x ramp puts the next decoded
+    // frame only step/2 timeline-us away, while a 0.5x ramp puts it 2*step
+    // away. Walk through source space (entryLocalPositionUs → +step →
+    // fileLocalToTimelineUs) so 1F→ matches the visible decoder advance for
+    // ramped clips. Identity ramps short-circuit to the legacy timeline
+    // arithmetic so the historic non-ramp invariants ("never stuck at
+    // boundary", gap-cross behaviour) stay bit-exact.
+    int64_t newPos;
+    {
+        const bool haveRampHere = (m_activeEntry >= 0
+                && m_activeEntry < static_cast<int>(m_speedRamps.size()))
+            && !m_speedRamps[m_activeEntry].isIdentity();
+        if (haveRampHere) {
+            const int64_t curSrc =
+                entryLocalPositionUs(m_activeEntry, m_timelinePositionUs);
+            const int64_t projected =
+                fileLocalToTimelineUs(m_activeEntry, curSrc + step);
+            // qMax(...+1, projected): the inverse-then-forward round trip
+            // through SpeedRamp can land on the same us as m_timelinePositionUs
+            // for sub-microsecond ramp+truncation residuals — guarantee at
+            // least 1us forward progress so the user is never frame-stuck.
+            newPos = qMin(maxUs,
+                qMax<int64_t>(m_timelinePositionUs + 1, projected));
+        } else {
+            newPos = qMin(maxUs, m_timelinePositionUs + step);
+        }
+    }
     if (newPos == m_timelinePositionUs) return; // at end of sequence
 
     const int idx = findActiveEntryAt(newPos);
@@ -1613,7 +1659,31 @@ void VideoPlayer::stepBackward()
     m_pendingSeekPrecise = false;
     const int64_t step = m_frameDurationUs > 0 ? m_frameDurationUs : AV_TIME_BASE / 30;
     if (sequenceActive()) {
-        const int64_t target = qMax<int64_t>(0, m_timelinePositionUs - step);
+        // US-INT-2 Phase B: ramp-aware backward step. Walk one source-frame
+        // back through entryLocalPositionUs → -step → fileLocalToTimelineUs
+        // so 1F← matches the previous decoded frame on ramped clips.
+        // Identity ramps and entries outside m_speedRamps fall back to the
+        // legacy timeline arithmetic for bit-exact compatibility.
+        int64_t target;
+        {
+            const bool haveRampHere = (m_activeEntry >= 0
+                    && m_activeEntry < static_cast<int>(m_speedRamps.size()))
+                && !m_speedRamps[m_activeEntry].isIdentity();
+            if (haveRampHere) {
+                const int64_t curSrc =
+                    entryLocalPositionUs(m_activeEntry, m_timelinePositionUs);
+                const int64_t prevSrc = qMax<int64_t>(0, curSrc - step);
+                const int64_t projected =
+                    fileLocalToTimelineUs(m_activeEntry, prevSrc);
+                // Mirror of stepForward's +1 floor: under near-zero local
+                // speed the backward project can land on the same us; force
+                // at least 1us regress so the user doesn't get stuck.
+                target = qMax<int64_t>(0,
+                    qMin<int64_t>(m_timelinePositionUs - 1, projected));
+            } else {
+                target = qMax<int64_t>(0, m_timelinePositionUs - step);
+            }
+        }
         if (target == m_timelinePositionUs) return; // at start
         seekToTimelineUs(target, /*precise=*/true);
         // Symmetric force: ensure m_timelinePositionUs ends at target even

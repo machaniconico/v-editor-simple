@@ -332,6 +332,14 @@ private:
     QHash<AudioTrackKey, AudioDecoderEntry *> m_entries;
     QVector<TrackState> m_trackStates;
     QVector<speedramp::SpeedRamp> m_speedRamps;  // parallel to setSequence entries
+    // US-INT-2 Phase B: hash side-channel for O(1) lookup inside the audio
+    // worker's per-fragment loop. m_speedRampKeyOrder is captured during
+    // setSequence (in input-vector order); setSpeedRamps walks both vectors
+    // in lockstep and rebuilds m_speedRampByKey under m_controlMutex. The
+    // QVector m_speedRamps is retained as the storage backing the hash so
+    // the existing public API stays QVector-shaped (Phase A compat).
+    QVector<AudioTrackKey> m_speedRampKeyOrder;
+    QHash<AudioTrackKey, speedramp::SpeedRamp> m_speedRampByKey;
 
     // 4-band parametric EQ — separate path from TrackState's legacy 3-band.
     // Per-track config + per-channel biquad history (4 bands x 2 channels x

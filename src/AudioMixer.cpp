@@ -92,6 +92,18 @@ inline int liveBytes(const AudioDecoderEntry &e) {
 inline const char *liveData(const AudioDecoderEntry &e) {
     return e.ring.constData() + e.ringHead;
 }
+
+// US-INT-2 Phase B: per-fragment atempo gate. Default OFF preserves the
+// Phase A bit-identical path; VEDITOR_AUDIO_ATEMPO=1 opts into nearest-
+// neighbor source-pointer drift on non-identity ramps (PRD permits
+// uncorrected pitch for v1). Static-cached since qgetenv is per-fragment.
+inline bool audioAtempoEnabledCached() {
+    static const bool enabled = []() {
+        const QByteArray v = qgetenv("VEDITOR_AUDIO_ATEMPO");
+        return !v.isEmpty() && v != "0" && v != "false" && v != "FALSE";
+    }();
+    return enabled;
+}
 constexpr int kRingCompactThreshold = 32 * 1024;
 
 // Linear-interpolate the per-clip volume envelope at a given clip-local
@@ -438,9 +450,92 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             continue;
         }
 
-        const int copyBytes = static_cast<int>(qMin<qint64>(maxlen, liveBytes(*e)));
-        const int copySamples = copyBytes / static_cast<int>(sizeof(int16_t));
+        // US-INT-2 Phase B: per-fragment ramp-aware atempo (envvar-gated).
+        // Default path (no atempo / identity ramp): copyBytes is bounded by
+        // ring availability and maxlen; src points at the ring directly;
+        // sourceBytesConsumed == copyBytes. Atempo path: speed-multiplier
+        // is sampled from the ramp at fragment start, output samples are
+        // staged via nearest-neighbor pick from the ring (no pitch
+        // correction — sprint description explicitly permits resample-only
+        // for v1), and ringHead advances by speedMul * copyBytes while
+        // ringStartTlUs still advances by bytesToUs(copyBytes) so the entry
+        // stays in time with the master cursor. Identity-only sequences
+        // never populate m_speedRampByKey so this branch is unreachable
+        // unless the user has authored a ramp.
+        QVarLengthArray<int16_t, 16384> stagedSamples;
+        int copyBytes = static_cast<int>(qMin<qint64>(maxlen, liveBytes(*e)));
+        int sourceBytesConsumed = copyBytes;
         const int16_t *src = reinterpret_cast<const int16_t *>(liveData(*e));
+        const speedramp::SpeedRamp *atempoRamp = nullptr;
+        if (audioAtempoEnabledCached()
+            && !m_mixer->m_speedRampByKey.isEmpty()) {
+            const AudioTrackKey atempoKey{
+                e->entry.filePath,
+                qRound64(e->entry.clipIn * 1000.0),
+                e->entry.sourceTrack,
+                e->entry.sourceClipIndex
+            };
+            const auto rampIt = m_mixer->m_speedRampByKey.constFind(atempoKey);
+            if (rampIt != m_mixer->m_speedRampByKey.constEnd())
+                atempoRamp = &rampIt.value();
+        }
+        if (atempoRamp) {
+            // Sample instantaneous d(src)/d(timeline) at the fragment start
+            // by finite difference of timelineToSourceUs over a 1 ms tick.
+            // Compose with the legacy uniform e.entry.speed (mirrors the
+            // VideoPlayer entryLocalPositionUs path: ramp input is in
+            // scaled-clip-relative timeline space, output is source-us).
+            const int64_t localTlUs = cursorUs
+                - static_cast<int64_t>(e->entry.timelineStart * 1e6);
+            const double uniSpeed = (e->entry.speed > 0.0) ? e->entry.speed : 1.0;
+            const qint64 scaledLocalTlUs = static_cast<qint64>(
+                qMax<int64_t>(0, localTlUs) * uniSpeed);
+            // 1ms tick — short enough to read per-keyframe slope, long
+            // enough to dodge integer-us truncation noise.
+            constexpr qint64 kSlopeTickUs = 1000;
+            const qint64 srcA = atempoRamp->timelineToSourceUs(scaledLocalTlUs);
+            const qint64 srcB =
+                atempoRamp->timelineToSourceUs(scaledLocalTlUs + kSlopeTickUs);
+            const double instSrcPerTl =
+                static_cast<double>(srcB - srcA) / kSlopeTickUs;
+            const double speedMul = qBound(speedramp::SpeedRamp::kMinSpeed,
+                instSrcPerTl * uniSpeed,
+                speedramp::SpeedRamp::kMaxSpeed);
+            const int liveB = liveBytes(*e);
+            // Cap output by what the ring can supply at speedMul.
+            const int maxOutputByRing = static_cast<int>(
+                static_cast<double>(liveB) / speedMul);
+            const int outputBound = qMin<int>(static_cast<int>(maxlen),
+                qMax<int>(0, maxOutputByRing));
+            const int outputFrames = outputBound / AudioMixer::kBytesPerFrame;
+            if (outputFrames <= 0) {
+                // Atempo wants more source than the ring holds — flag stalled
+                // so the cursor freezes for a few callbacks while the decoder
+                // catches up (mirrors the empty-ring stall above).
+                entryActiveButStalled = true;
+                continue;
+            }
+            copyBytes = outputFrames * AudioMixer::kBytesPerFrame;
+            sourceBytesConsumed = qMin<int>(liveB, qMax<int>(0,
+                static_cast<int>(outputFrames * speedMul)
+                    * AudioMixer::kBytesPerFrame));
+            const int outputSamples = copyBytes
+                / static_cast<int>(sizeof(int16_t));
+            stagedSamples.resize(outputSamples);
+            const int16_t *ringSrc = reinterpret_cast<const int16_t *>(liveData(*e));
+            const int liveFrames = liveB / AudioMixer::kBytesPerFrame;
+            for (int frame = 0; frame < outputFrames; ++frame) {
+                int srcFrameIdx = static_cast<int>(frame * speedMul);
+                if (srcFrameIdx >= liveFrames) srcFrameIdx = liveFrames - 1;
+                if (srcFrameIdx < 0) srcFrameIdx = 0;
+                for (int ch = 0; ch < AudioMixer::kChannels; ++ch) {
+                    stagedSamples[frame * AudioMixer::kChannels + ch] =
+                        ringSrc[srcFrameIdx * AudioMixer::kChannels + ch];
+                }
+            }
+            src = stagedSamples.data();
+        }
+        const int copySamples = copyBytes / static_cast<int>(sizeof(int16_t));
 
         // Per-track noise reduction (Audition Voice Isolation / Resolve
         // Fairlight noise gate parity, simplified expander). Runs FIRST in
@@ -983,7 +1078,13 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             }
         }
         e->prevGain = gain;
-        e->ringHead += copyBytes;
+        // Phase B: under atempo, ringHead advances by SOURCE bytes consumed
+        // (= speedMul * copyBytes) while ringStartTlUs advances by TIMELINE
+        // us (= bytesToUs(copyBytes)) — the entry stays in time with the
+        // master cursor while consuming the ring at variable rate. Default
+        // (atempo off / identity ramp) keeps sourceBytesConsumed == copyBytes
+        // so the existing path is unchanged.
+        e->ringHead += sourceBytesConsumed;
         e->ringStartTlUs += bytesToUs(copyBytes);
         anyMixed = true;
     }
@@ -1291,6 +1392,13 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
         int maxTrack = -1;
         QSet<int> uniqueTracks;
 
+        // US-INT-2 Phase B: capture the input-vector order of AudioTrackKeys
+        // so a subsequent setSpeedRamps call (parallel-array contract from
+        // MainWindow) can rebuild m_speedRampByKey in lockstep. Cleared each
+        // call — stale keys from a previous sequence would silently mismap.
+        m_speedRampKeyOrder.clear();
+        m_speedRampKeyOrder.reserve(entries.size());
+
         for (const auto &e : entries) {
             // Cap on UNIQUE source tracks, not total entry count, so a
             // single track with many clips doesn't get its trailing entries
@@ -1308,6 +1416,12 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
                 e.sourceTrack,
                 e.sourceClipIndex
             };
+            // Phase B: append BEFORE the dup-skip below so m_speedRampKeyOrder
+            // matches the input vector index-for-index. Dup keys still exist
+            // in the order array but their slot in m_speedRampByKey will be
+            // overwritten by the later one (deterministic for our purposes —
+            // duplicates are already a logged error condition).
+            m_speedRampKeyOrder.append(key);
             if (e.sourceTrack > maxTrack) maxTrack = e.sourceTrack;
 
             // Defensive: if the same key appears twice in one batch the
@@ -1367,21 +1481,34 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
     if (m_decodeRunner) m_decodeRunner->wake();
 }
 
-// US-INT-2 Phase A: stub — store per-entry speed ramps; the audio worker
-// thread does not yet consume them (variable-speed atempo deferred to
-// Phase B to avoid regressing the just-stabilised US-FIX-3 砂嵐ノイズ
-// fix — introducing real-time time-stretch into the per-track DSP chain
-// needs separate noise testing). The vector is held under m_controlMutex
-// so a future Phase B audio-side reader can take the same lock without
-// races against the GUI-thread setter.
+// US-INT-2 Phase B: store per-entry ramps AND rebuild the (AudioTrackKey →
+// SpeedRamp) hash for O(1) lookup inside the audio worker's per-fragment
+// loop. The QVector continues to be the storage of record so the public
+// API stays Phase-A compatible; the hash is a pure side-channel rebuilt
+// here under m_controlMutex. Identity-only sequences leave m_speedRampByKey
+// empty (entries with no hash hit fall through to the legacy resample-only
+// path → bit-exact unchanged when atempo is off OR all ramps are identity).
 void AudioMixer::setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps)
 {
+    int hashedCount = 0;
     {
         QMutexLocker lock(&m_controlMutex);
         m_speedRamps = ramps;
+        m_speedRampByKey.clear();
+        const int n = qMin(m_speedRamps.size(), m_speedRampKeyOrder.size());
+        m_speedRampByKey.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            // Skip identity ramps so the hot-path lookup short-circuits on
+            // "key not found" instead of having to ask isIdentity() per
+            // fragment.
+            if (m_speedRamps[i].isIdentity()) continue;
+            m_speedRampByKey.insert(m_speedRampKeyOrder[i], m_speedRamps[i]);
+            ++hashedCount;
+        }
     }
     qInfo() << "AudioMixer::setSpeedRamps count=" << ramps.size()
-            << "(Phase A: stored only; per-fragment atempo deferred to Phase B)";
+            << "non-identity-hashed=" << hashedCount
+            << "atempoEnvvar=" << audioAtempoEnabledCached();
 }
 
 void AudioMixer::seekTo(int64_t timelineUs) {
