@@ -9,6 +9,7 @@
 #include <QAudioSink>
 #include <QAudioFormat>
 #include <QElapsedTimer>
+#include "SpeedRampData.h"
 #include <array>
 #include <atomic>
 
@@ -89,6 +90,8 @@ public:
     // and releases decoders for entries no longer present. Safe from GUI
     // thread; locks m_controlMutex briefly.
     void setSequence(const QVector<PlaybackEntry> &entries);
+    // Parallel speed-ramp array aligned to setSequence entries.
+    void setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps);
 
     // Jump the audible playhead. Resyncs FFmpeg seek inside every active
     // entry (lazily on next refill) and flushes ring buffers so the next
@@ -122,6 +125,126 @@ public:
     void setTrackEqConfig(int trackIdx, const AudioEQConfig &cfg);
     AudioEQConfig trackEqConfig(int trackIdx) const;
     void setTrackEqEnabled(int trackIdx, bool enabled);
+
+    // Per-track 4-band parametric EQ (Premiere/Audition parity). Independent
+    // of the legacy 3-band path above; cascaded BEFORE volume/pan stages
+    // (signal flow: 4-band EQ → existing 3-band EQ → preamp → gain).
+    // trackId convention: 0 = master, 1 = A1, 2 = A2, ... (the audio mix
+    // path uses sourceTrack which is 1-based for tracks; trackId=0 is
+    // reserved for a future master-bus EQ and currently no-ops in the
+    // mix loop, so it is safe to call with 0 from the panel).
+    struct EqBand {
+        double freq;
+        double gainDb;
+        double q;
+        bool enabled = true;
+    };
+    struct EqSettings {
+        EqBand low{80.0, 0.0, 0.7};
+        EqBand lowMid{250.0, 0.0, 1.0};
+        EqBand highMid{3000.0, 0.0, 1.0};
+        EqBand high{10000.0, 0.0, 0.7};
+    };
+    void setEqForTrack(int trackId, const EqSettings &eq);
+    EqSettings eqForTrack(int trackId) const;
+
+    // Cached biquad coefficients for the 4-band path. Kept public so the
+    // namespace-scoped computeEqBand helper in AudioMixer.cpp can return it
+    // before the GUI thread takes m_controlMutex.
+    struct EqBandCoefsParam {
+        double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
+        bool active = false; // false = pass-through (skip math, keep history pristine)
+    };
+
+    // Per-track feed-forward compressor / limiter (Audition / Resolve
+    // Fairlight parity). Cascaded AFTER the 4-band EQ stage and BEFORE the
+    // legacy 3-band / preamp / gain stages, so meters and the master bus
+    // see post-compression peaks. Stereo-link detector (max(|L|, |R|))
+    // drives a transposed envelope follower with separate attack / release
+    // coefficients. Static curve uses Cherny-style soft knee (quadratic
+    // spline between threshold ± knee/2). Disabled = bit-exact bypass
+    // (skip the entire envelope + curve math; do not touch state).
+    //
+    // Limiter mode contract: when ratio >= 20 the path uses an effective
+    // 1000:1 ratio and forces attack to 0.5 ms regardless of attackMs, so
+    // any ratio knob value of 20+ becomes a brick-wall limit at threshold
+    // (overshoot bounded by the 0.5 ms attack, ≤0.5 dB at typical material).
+    struct CompressorSettings {
+        double thresholdDb = 0.0;     // 0 = no compression at any signal level
+        double ratio = 1.0;           // 1:1 = no compression (pass-through)
+        double attackMs = 5.0;
+        double releaseMs = 100.0;
+        double kneeDb = 2.0;
+        double makeupDb = 0.0;
+        bool enabled = false;
+    };
+    struct CompressorState {
+        double env = 0.0;        // envelope follower (linear amplitude)
+        double currentGrDb = 0.0;// last gain reduction in dB (for meter)
+    };
+    void setCompressorForTrack(int trackId, const CompressorSettings &c);
+    CompressorSettings compressorForTrack(int trackId) const;
+    double currentGainReductionDb(int trackId) const;
+
+    // Per-track reverb (Audition / Fairlight Multitap parity, simplified).
+    // Schroeder topology: pre-delay → 4 parallel comb filters → 2 series
+    // allpass filters → wet/dry mix. Cascaded AFTER the compressor stage
+    // and BEFORE the legacy 3-band / preamp / gain stages so meters and
+    // the master bus see the post-reverb signal. Disabled or mixRatio=0
+    // = bit-exact bypass (skip the entire DSP path; do not touch state).
+    //
+    // Comb delays (Freeverb defaults @ 44.1 kHz, scaled to actual sample
+    // rate): 1116 / 1188 / 1277 / 1356 samples. Allpass delays: 556 /
+    // 441 samples (g = 0.5). Comb feedback gain g = 0.7 * decaySeconds /
+    // 1.0 sec reference. High-freq damping = LP coefficient inside the
+    // comb feedback loop (0=none, 1=heavy damping). Width controls
+    // stereo cross-feed (0=mono sum, 100=fully decorrelated channels).
+    struct ReverbSettings {
+        double mixRatio = 0.0;       // 0.0..1.0  (UI 0..100 / 100)
+        double decaySeconds = 1.0;   // 0.1..5.0
+        double preDelayMs = 20.0;    // 0..200
+        double dampingHF = 30.0;     // 0..100
+        double widthPercent = 50.0;  // 0..100
+        bool enabled = false;
+    };
+    void setReverbForTrack(int trackId, const ReverbSettings &r);
+    ReverbSettings reverbForTrack(int trackId) const;
+
+    // Per-track noise reduction (Audition Voice Isolation / Resolve
+    // Fairlight noise gate parity, simplified expander). Cascaded FIRST in
+    // the per-track effect chain — BEFORE the 4-band EQ, compressor, and
+    // reverb stages — so the cleanup runs on the rawest signal and downstream
+    // effects amplify the de-noised material. Stereo-link detector
+    // (max(|L|, |R|)) drives a transposed envelope follower with separate
+    // attack / release coefficients; the static curve compares the envelope
+    // to a noise-floor estimate and applies a smooth ramp between full
+    // pass-through and reductionDb of attenuation. Auto-floor mode tracks a
+    // running 5th-percentile of the envelope (in dBFS) over the last
+    // ~5 seconds; manual mode uses manualFloorDb directly.
+    //
+    // Disabled = bit-exact bypass (skip the entire envelope + curve math
+    // and do not touch state, mirroring the compressor / reverb stages).
+    struct NoiseReductionSettings {
+        double thresholdDb = -20.0;   // gate engages this many dB above floor
+        double reductionDb = 12.0;    // max attenuation when fully gated
+        double attackMs = 5.0;        // envelope attack
+        double releaseMs = 200.0;     // envelope release
+        double manualFloorDb = -50.0; // used when autoFloor == false
+        bool autoFloor = true;
+        bool enabled = false;
+    };
+    // Per-track NR DSP state. recentEnvs is a rolling-window envelope
+    // history (in dBFS) used to compute the 5th-percentile auto-floor;
+    // capacity is sized to ~5 seconds at the readData fragment cadence.
+    struct NRState {
+        double env = 0.0;                  // envelope follower (linear amplitude)
+        double estimatedFloorDb = -60.0;   // last computed auto-floor
+        QVector<double> recentEnvs;        // rolling-window dBFS samples
+        int recentEnvsHead = 0;            // circular write index
+    };
+    void setNoiseReductionForTrack(int trackId, const NoiseReductionSettings &nr);
+    NoiseReductionSettings noiseReductionForTrack(int trackId) const;
+    double estimatedNoiseFloorDb(int trackId) const;
 
     // Master-bus compressor + brick-wall limiter, applied to the sum-mixed
     // master output after per-track EQ/gain and the loudness normalizer,
@@ -208,6 +331,71 @@ private:
 
     QHash<AudioTrackKey, AudioDecoderEntry *> m_entries;
     QVector<TrackState> m_trackStates;
+    QVector<speedramp::SpeedRamp> m_speedRamps;  // parallel to setSequence entries
+
+    // 4-band parametric EQ — separate path from TrackState's legacy 3-band.
+    // Per-track config + per-channel biquad history (4 bands x 2 channels x
+    // 2 history samples = 16 doubles). Coefs cached in m_trackEqCoefs to
+    // avoid recomputing inside readData.
+    QHash<int, EqSettings> m_trackEq;
+    QHash<int, std::array<double, 16>> m_trackEqHist;
+    QHash<int, std::array<EqBandCoefsParam, 4>> m_trackEqCoefs;
+
+    // Per-track compressor settings (touched on GUI thread under
+    // m_controlMutex) and envelope state (touched on audio worker thread
+    // inside readData; the envelope value persists across atomic settings
+    // swaps so changing a knob never produces a transient).
+    QHash<int, CompressorSettings> m_trackComp;
+    QHash<int, CompressorState> m_trackCompState;
+
+    // Per-track reverb settings (touched on GUI thread under
+    // m_controlMutex) and DSP state (touched on audio worker thread
+    // inside readData; buffers persist across atomic settings swaps so
+    // changing a knob never produces a transient).
+    //
+    // ReverbState layout per track (stereo, kChannels = 2):
+    //   preDelay[ch]  — circular buffer, kPreDelayMaxSamples entries
+    //   comb[ch][b]   — circular comb buffer (b = 0..3), sized at
+    //                   construction from kCombDelays44k1 scaled to
+    //                   kSampleRateHz.
+    //   combLP[ch][b] — single-sample LP history for HF damping
+    //   ap[ch][a]     — circular allpass buffer (a = 0..1)
+    // All write indices live in *Idx fields and wrap modulo buffer size.
+    static constexpr int kReverbCombCount = 4;
+    static constexpr int kReverbAllpassCount = 2;
+    static constexpr int kReverbPreDelayMaxSamples = 9600; // 200 ms @ 48k
+    struct ReverbState {
+        // Per-channel pre-delay buffer (linear, fixed max size).
+        std::array<std::array<float, kReverbPreDelayMaxSamples>, kChannels> preDelay{};
+        std::array<int, kChannels> preDelayIdx{};
+        // Per-channel comb buffers + indices + LP histories.
+        std::array<std::array<QVector<float>, kReverbCombCount>, kChannels> comb{};
+        std::array<std::array<int, kReverbCombCount>, kChannels> combIdx{};
+        std::array<std::array<float, kReverbCombCount>, kChannels> combLP{};
+        // Per-channel allpass buffers + indices.
+        std::array<std::array<QVector<float>, kReverbAllpassCount>, kChannels> ap{};
+        std::array<std::array<int, kReverbAllpassCount>, kChannels> apIdx{};
+        bool initialized = false;
+    };
+    QHash<int, ReverbSettings> m_trackReverb;
+    QHash<int, ReverbState> m_trackReverbState;
+
+    // Per-track noise reduction settings (touched on GUI thread under
+    // m_controlMutex) and DSP state (touched on audio worker thread inside
+    // readData; envelope + recent-envs history persist across atomic
+    // settings swaps so live tweaking is glitch-free, mirroring the
+    // compressor / reverb stages).
+    //
+    // Auto-floor uses a rolling 5-second window of envelope-in-dBFS
+    // samples; the 5th-percentile of that window becomes the noise-floor
+    // estimate. The window is sampled once per readData fragment (≈340 ms
+    // worth of audio per kRingTargetBytes), so kAutoFloorWindowSize = 256
+    // covers ~85 seconds at the worst case and ~5 seconds at the typical
+    // 32-frame fragment cadence — capped on the upper end so memory
+    // doesn't grow unbounded.
+    static constexpr int kAutoFloorWindowSize = 256;
+    QHash<int, NoiseReductionSettings> m_trackNoiseReduction;
+    QHash<int, NRState> m_trackNoiseReductionState;
 
     mutable QMutex m_controlMutex;
     std::atomic<int64_t> m_writeCursorUs{0};
