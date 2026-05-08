@@ -22,6 +22,21 @@ struct TextOverlay {
     double endTime = 0.0; // 0 = until end of clip
     int alignment = Qt::AlignCenter;
     bool visible = true;
+
+    // Drop shadow (rendered behind the text). Disabled by default — when
+    // shadow=false the renderer must skip the offscreen buffer entirely.
+    bool   shadow = false;
+    double shadowOffsetX = 4.0;
+    double shadowOffsetY = 4.0;
+    double shadowBlur    = 6.0;
+    QColor shadowColor   = QColor(0, 0, 0, 200);
+    double shadowOpacity = 0.8;
+
+    // Outer glow (rendered behind shadow). Disabled by default.
+    bool   glow = false;
+    double glowRadius  = 8.0;
+    QColor glowColor   = QColor(255, 255, 0, 255);
+    double glowOpacity = 0.9;
 };
 
 // --- Transition ---

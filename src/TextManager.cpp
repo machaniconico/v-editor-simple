@@ -49,6 +49,7 @@ TextTemplate TextTemplate::fromOverlay(const EnhancedTextOverlay &o, const QStri
     t.outline2Color = o.outline2Color;
     t.outline2Width = o.outline2Width;
     t.shadow = o.shadow;
+    t.glow = o.glow;
     t.animIn = o.animIn;
     t.animOut = o.animOut;
     t.opacity = o.opacity;
@@ -65,6 +66,7 @@ EnhancedTextOverlay TextTemplate::applyTo(const EnhancedTextOverlay &o) const {
     result.outline2Color = outline2Color;
     result.outline2Width = outline2Width;
     result.shadow = shadow;
+    result.glow = glow;
     result.animIn = animIn;
     result.animOut = animOut;
     result.opacity = opacity;
@@ -124,6 +126,11 @@ save:
         obj["shadowOffY"] = t.shadow.offsetY;
         obj["shadowBlur"] = t.shadow.blur;
         obj["shadowColor"] = t.shadow.color.name(QColor::HexArgb);
+        obj["shadowOpacity"] = t.shadow.opacity;
+        obj["glowEnabled"] = t.glow.enabled;
+        obj["glowRadius"] = t.glow.radius;
+        obj["glowColor"] = t.glow.color.name(QColor::HexArgb);
+        obj["glowOpacity"] = t.glow.opacity;
         obj["animInType"] = static_cast<int>(t.animIn.type);
         obj["animInDur"] = t.animIn.duration;
         obj["animOutType"] = static_cast<int>(t.animOut.type);
@@ -175,6 +182,11 @@ QVector<TextTemplate> TextManager::loadTemplates() {
         t.shadow.offsetY = obj["shadowOffY"].toDouble(3);
         t.shadow.blur = obj["shadowBlur"].toDouble(4);
         t.shadow.color = QColor(obj["shadowColor"].toString("#b4000000"));
+        t.shadow.opacity = obj["shadowOpacity"].toDouble(1.0);
+        t.glow.enabled = obj["glowEnabled"].toBool(false);
+        t.glow.radius = obj["glowRadius"].toDouble(8.0);
+        t.glow.color = QColor(obj["glowColor"].toString("#ffffff00"));
+        t.glow.opacity = obj["glowOpacity"].toDouble(0.9);
         t.animIn.type = static_cast<TextAnimationType>(obj["animInType"].toInt());
         t.animIn.duration = obj["animInDur"].toDouble(0.5);
         t.animOut.type = static_cast<TextAnimationType>(obj["animOutType"].toInt());
@@ -431,6 +443,11 @@ QJsonArray TextManager::toJson(const QVector<EnhancedTextOverlay> &overlays) {
         obj["shadowOffY"] = o.shadow.offsetY;
         obj["shadowBlur"] = o.shadow.blur;
         obj["shadowColor"] = o.shadow.color.name(QColor::HexArgb);
+        obj["shadowOpacity"] = o.shadow.opacity;
+        obj["glowEnabled"] = o.glow.enabled;
+        obj["glowRadius"] = o.glow.radius;
+        obj["glowColor"] = o.glow.color.name(QColor::HexArgb);
+        obj["glowOpacity"] = o.glow.opacity;
         obj["animInType"] = static_cast<int>(o.animIn.type);
         obj["animInDur"] = o.animIn.duration;
         obj["animOutType"] = static_cast<int>(o.animOut.type);
@@ -438,6 +455,18 @@ QJsonArray TextManager::toJson(const QVector<EnhancedTextOverlay> &overlays) {
         obj["alignment"] = o.alignment;
         obj["wordWrap"] = o.wordWrap;
         obj["templateName"] = o.templateName;
+
+        if (!o.positionKeyframes.isEmpty()) {
+            QJsonArray pkArr;
+            for (const auto &pk : o.positionKeyframes) {
+                QJsonObject pkObj;
+                pkObj["time"] = pk.time;
+                pkObj["cx"] = pk.cx;
+                pkObj["cy"] = pk.cy;
+                pkArr.append(pkObj);
+            }
+            obj["positionKeyframes"] = pkArr;
+        }
 
         if (!o.rubyAnnotations.isEmpty()) {
             QJsonArray rubyArr;
@@ -499,6 +528,11 @@ QVector<EnhancedTextOverlay> TextManager::fromJson(const QJsonArray &arr) {
         o.shadow.offsetY = obj["shadowOffY"].toDouble(3);
         o.shadow.blur = obj["shadowBlur"].toDouble(4);
         o.shadow.color = QColor(obj["shadowColor"].toString("#b4000000"));
+        o.shadow.opacity = obj["shadowOpacity"].toDouble(1.0);
+        o.glow.enabled = obj["glowEnabled"].toBool(false);
+        o.glow.radius = obj["glowRadius"].toDouble(8.0);
+        o.glow.color = QColor(obj["glowColor"].toString("#ffffff00"));
+        o.glow.opacity = obj["glowOpacity"].toDouble(0.9);
         o.animIn.type = static_cast<TextAnimationType>(obj["animInType"].toInt());
         o.animIn.duration = obj["animInDur"].toDouble(0.5);
         o.animOut.type = static_cast<TextAnimationType>(obj["animOutType"].toInt());
@@ -506,6 +540,18 @@ QVector<EnhancedTextOverlay> TextManager::fromJson(const QJsonArray &arr) {
         o.alignment = obj["alignment"].toInt(Qt::AlignCenter);
         o.wordWrap = obj["wordWrap"].toBool(true);
         o.templateName = obj["templateName"].toString();
+
+        if (obj.contains("positionKeyframes")) {
+            const QJsonArray pkArr = obj["positionKeyframes"].toArray();
+            for (const auto &v : pkArr) {
+                const QJsonObject pkObj = v.toObject();
+                PositionKeyframe pk;
+                pk.time = pkObj["time"].toDouble(0.0);
+                pk.cx = pkObj["cx"].toDouble(0.5);
+                pk.cy = pkObj["cy"].toDouble(0.5);
+                o.positionKeyframes.append(pk);
+            }
+        }
 
         if (obj.contains("ruby")) {
             for (const auto &rv : obj["ruby"].toArray()) {
@@ -565,6 +611,31 @@ void EnhancedTextRenderer::render(QImage &frame, const EnhancedTextOverlay &over
 
     // Calculate text bounds
     QFont scaledFont = overlay.font;
+
+    // Resolve position from keyframes if present
+    double posX = overlay.x;
+    double posY = overlay.y;
+    const double relTime = currentTime - overlay.startTime;
+    if (!overlay.positionKeyframes.isEmpty()) {
+        const auto &kfs = overlay.positionKeyframes;
+        if (relTime <= kfs.first().time) {
+            posX = kfs.first().cx;
+            posY = kfs.first().cy;
+        } else if (relTime >= kfs.last().time) {
+            posX = kfs.last().cx;
+            posY = kfs.last().cy;
+        } else {
+            for (int i = 0; i < kfs.size() - 1; ++i) {
+                if (relTime >= kfs[i].time && relTime <= kfs[i + 1].time) {
+                    double t = (relTime - kfs[i].time) / (kfs[i + 1].time - kfs[i].time);
+                    posX = kfs[i].cx + (kfs[i + 1].cx - kfs[i].cx) * t;
+                    posY = kfs[i].cy + (kfs[i + 1].cy - kfs[i].cy) * t;
+                    break;
+                }
+            }
+        }
+    }
+
     scaledFont.setPointSizeF(overlay.font.pointSizeF() * animScale);
     painter.setFont(scaledFont);
     QFontMetrics fm(scaledFont);
@@ -573,8 +644,8 @@ void EnhancedTextRenderer::render(QImage &frame, const EnhancedTextOverlay &over
     int flags = overlay.alignment | (overlay.wordWrap ? Qt::TextWordWrap : 0);
     QRect textBounds = fm.boundingRect(QRect(0, 0, frame.width() - 40, 0), flags, displayText);
 
-    int px = static_cast<int>((overlay.x + animX) * frame.width()) - textBounds.width() / 2;
-    int py = static_cast<int>((overlay.y + animY) * frame.height()) - textBounds.height() / 2;
+    int px = static_cast<int>((posX + animX) * frame.width()) - textBounds.width() / 2;
+    int py = static_cast<int>((posY + animY) * frame.height()) - textBounds.height() / 2;
     QRect drawRect(px, py, textBounds.width(), textBounds.height());
 
     painter.setOpacity(animOpacity);
@@ -591,9 +662,15 @@ void EnhancedTextRenderer::render(QImage &frame, const EnhancedTextOverlay &over
     if (overlay.backgroundColor.alpha() > 0)
         painter.fillRect(drawRect.adjusted(-8, -4, 8, 4), overlay.backgroundColor);
 
-    // Shadow
+    // Order: shadow (deepest) -> glow -> outline -> fill. Each effect skips
+    // its offscreen buffer entirely when disabled so unused effects cost
+    // nothing. Outline is drawn last-but-one so it sits on top of the glow
+    // halo but below the fill; the existing dual-outline path is reused.
     if (overlay.shadow.enabled)
         renderShadow(painter, displayText, drawRect, overlay);
+
+    if (overlay.glow.enabled)
+        renderGlow(painter, displayText, drawRect, overlay);
 
     // Outline (second/outer first, then inner)
     renderOutline(painter, displayText, drawRect, overlay);
@@ -665,14 +742,136 @@ void EnhancedTextRenderer::applyAnimation(const TextAnimation &anim, double prog
     }
 }
 
+// Cheap separable box blur on the alpha channel. Used for both drop shadow
+// and outer glow. radius is clamped to a sane upper bound so a slider misuse
+// never triggers a many-second stall. Blurs the alpha plane only and keeps
+// the source colour, which matches how Photoshop layer styles render.
+static void boxBlurAlphaInPlace(QImage &img, int radius)
+{
+    if (radius <= 0 || img.isNull()) return;
+    const int r = qMin(radius, 32);
+    const int w = img.width();
+    const int h = img.height();
+    if (w == 0 || h == 0) return;
+    if (img.format() != QImage::Format_ARGB32_Premultiplied)
+        img = img.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+
+    // Single-pass per axis. Two passes total, each O(w*h). Cheap enough
+    // to run once per frame for a single overlay.
+    QVector<int> tmp(w * h);
+    auto idx = [w](int x, int y) { return y * w + x; };
+
+    // Horizontal pass: read alpha from img, write into tmp
+    for (int y = 0; y < h; ++y) {
+        const QRgb *row = reinterpret_cast<const QRgb*>(img.constScanLine(y));
+        int sum = 0;
+        for (int x = -r; x <= r; ++x) {
+            const int cx = qBound(0, x, w - 1);
+            sum += qAlpha(row[cx]);
+        }
+        const int span = 2 * r + 1;
+        for (int x = 0; x < w; ++x) {
+            tmp[idx(x, y)] = sum / span;
+            const int xOut = qBound(0, x - r, w - 1);
+            const int xIn  = qBound(0, x + r + 1, w - 1);
+            sum += qAlpha(row[xIn]) - qAlpha(row[xOut]);
+        }
+    }
+
+    // Vertical pass: read tmp, write back into img alpha (RGB stays black=0
+    // — caller composites with a colour pen via SourceIn).
+    for (int x = 0; x < w; ++x) {
+        int sum = 0;
+        for (int y = -r; y <= r; ++y) {
+            const int cy = qBound(0, y, h - 1);
+            sum += tmp[idx(x, cy)];
+        }
+        const int span = 2 * r + 1;
+        for (int y = 0; y < h; ++y) {
+            const int a = sum / span;
+            QRgb *row = reinterpret_cast<QRgb*>(img.scanLine(y));
+            row[x] = qRgba(0, 0, 0, a);
+            const int yOut = qBound(0, y - r, h - 1);
+            const int yIn  = qBound(0, y + r + 1, h - 1);
+            sum += tmp[idx(x, yIn)] - tmp[idx(x, yOut)];
+        }
+    }
+}
+
+// Build an alpha mask of the text path at the given rect, padded by
+// padPx on every side so the blur kernel has room. Returns the buffer
+// plus the top-left offset (in frame coords) where it should be drawn.
+static QImage rasterTextAlpha(const QString &text, const QRect &rect,
+                              const QFont &font, int alignFlags, int padPx)
+{
+    const int W = qMax(1, rect.width()  + padPx * 2);
+    const int H = qMax(1, rect.height() + padPx * 2);
+    QImage buf(W, H, QImage::Format_ARGB32_Premultiplied);
+    buf.fill(Qt::transparent);
+    QPainter p(&buf);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setRenderHint(QPainter::TextAntialiasing);
+    p.setFont(font);
+    p.setPen(Qt::black); // alpha-only — colour is replaced by caller via SourceIn
+    p.drawText(QRect(padPx, padPx, rect.width(), rect.height()),
+               alignFlags, text);
+    p.end();
+    return buf;
+}
+
 void EnhancedTextRenderer::renderShadow(QPainter &painter, const QString &text,
                                           const QRect &rect, const EnhancedTextOverlay &overlay)
 {
-    QRect shadowRect = rect.translated(
-        static_cast<int>(overlay.shadow.offsetX),
-        static_cast<int>(overlay.shadow.offsetY));
-    painter.setPen(overlay.shadow.color);
-    painter.drawText(shadowRect, overlay.alignment | Qt::TextWordWrap, text);
+    const double blur = qMax(0.0, overlay.shadow.blur);
+    const int pad = qMax(8, static_cast<int>(blur * 2.0) + 4);
+    const int alignFlags = overlay.alignment | Qt::TextWordWrap;
+
+    QImage buf = rasterTextAlpha(text, rect, painter.font(), alignFlags, pad);
+    boxBlurAlphaInPlace(buf, static_cast<int>(blur));
+
+    // Tint the blurred alpha mask with the shadow colour using SourceIn.
+    {
+        QPainter pp(&buf);
+        pp.setCompositionMode(QPainter::CompositionMode_SourceIn);
+        pp.fillRect(buf.rect(), overlay.shadow.color);
+    }
+
+    const double opacity = qBound(0.0, overlay.shadow.opacity, 1.0);
+    const double prevOp = painter.opacity();
+    painter.setOpacity(prevOp * opacity);
+    painter.drawImage(rect.left() - pad + static_cast<int>(overlay.shadow.offsetX),
+                      rect.top()  - pad + static_cast<int>(overlay.shadow.offsetY),
+                      buf);
+    painter.setOpacity(prevOp);
+}
+
+void EnhancedTextRenderer::renderGlow(QPainter &painter, const QString &text,
+                                       const QRect &rect, const EnhancedTextOverlay &overlay)
+{
+    const double radius = qMax(0.0, overlay.glow.radius);
+    const int pad = qMax(8, static_cast<int>(radius * 2.0) + 4);
+    const int alignFlags = overlay.alignment | Qt::TextWordWrap;
+
+    QImage buf = rasterTextAlpha(text, rect, painter.font(), alignFlags, pad);
+    boxBlurAlphaInPlace(buf, static_cast<int>(radius));
+
+    // Tint the blurred mask with the glow colour. Draw it twice with
+    // CompositionMode_Plus so the halo intensifies near the text edges,
+    // matching Photoshop's "Outer Glow" Screen blend behaviour cheaply.
+    {
+        QPainter pp(&buf);
+        pp.setCompositionMode(QPainter::CompositionMode_SourceIn);
+        pp.fillRect(buf.rect(), overlay.glow.color);
+    }
+
+    const double opacity = qBound(0.0, overlay.glow.opacity, 1.0);
+    const double prevOp = painter.opacity();
+    const QPainter::CompositionMode prevMode = painter.compositionMode();
+    painter.setOpacity(prevOp * opacity);
+    painter.setCompositionMode(QPainter::CompositionMode_Plus);
+    painter.drawImage(rect.left() - pad, rect.top() - pad, buf);
+    painter.setCompositionMode(prevMode);
+    painter.setOpacity(prevOp);
 }
 
 void EnhancedTextRenderer::renderOutline(QPainter &painter, const QString &text,

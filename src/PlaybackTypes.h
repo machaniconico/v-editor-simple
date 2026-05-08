@@ -4,6 +4,7 @@
 #include <QMetaType>
 #include <QVector>
 #include "Overlay.h"
+#include "MotionStabilizer.h"
 
 // Volume automation point.
 //   time = clip-local TIMELINE-display seconds (0.0 == the entry's
@@ -55,6 +56,12 @@ struct PlaybackEntry {
     // in pro NLEs). Empty = use static `volume` for the whole clip; non-empty
     // = AudioMixer interpolates between points using clip-local time.
     QVector<AudioGainPoint> volumeEnvelope;
+
+    // US-INT-4: per-clip stabilizer keyframes copied from
+    // ClipInfo::stabilizerKeyframes by Timeline::buildPlaybackEntries. Empty
+    // = identity (no stabilization). VideoPlayer pushes the active entry's
+    // vector to GLPreview so the inverse 2D affine pre-warp can run.
+    QVector<StabilizerKeyframe> stabilizerKeyframes;
 };
 
 Q_DECLARE_METATYPE(AudioGainPoint)

@@ -111,8 +111,50 @@ void TrackerLink::removeLink(int index)
 }
 
 // ---------------------------------------------------------------------------
-// TrackerLink — position interpolation
+// TrackerLink — apply tracking result as per-frame position keyframes
 // ---------------------------------------------------------------------------
+
+void TrackerLink::applyToOverlay(EnhancedTextOverlay *overlay,
+                                 const TrackingResult &result,
+                                 double frameRate)
+{
+    if (!overlay || result.isEmpty())
+        return;
+
+    // US-WIRE-4 MEDIUM-1: prefer the fps embedded in the tracking result over
+    // the caller-supplied project frameRate so reimported tracker JSON keeps
+    // its original sample rate. Falls back to the caller-supplied rate.
+    const double effectiveFps = (result.fps > 0.0) ? result.fps : frameRate;
+
+    // US-WIRE-4 MEDIUM-2: guard against a zero or negative effective fps —
+    // dividing by it would produce NaN/Inf in kf.time and corrupt the bake.
+    if (effectiveFps <= 0.0)
+        return;
+
+    const int srcW = result.srcWidth > 0 ? result.srcWidth : 1920;
+    const int srcH = result.srcHeight > 0 ? result.srcHeight : 1080;
+    overlay->positionKeyframes.clear();
+
+    for (const auto &region : result.regions) {
+        PositionKeyframe kf;
+        kf.time = (region.frameNumber - result.startFrame) / effectiveFps;
+
+        // US-MT-1: prefer the sub-pixel-refined center when the tracker
+        // produced one; the integer rect.center() path is the degenerate
+        // case (boundary frames or refinement skipped).
+        double centerX, centerY;
+        if (!region.subPixelCenter.isNull()) {
+            centerX = region.subPixelCenter.x();
+            centerY = region.subPixelCenter.y();
+        } else {
+            centerX = region.rect.x() + region.rect.width() / 2.0;
+            centerY = region.rect.y() + region.rect.height() / 2.0;
+        }
+        kf.cx = centerX / srcW;
+        kf.cy = centerY / srcH;
+        overlay->positionKeyframes.append(kf);
+    }
+}
 
 QPointF TrackerLink::interpolatePosition(const TrackingResult &result, double time) const
 {

@@ -1,9 +1,46 @@
 #include "ProjectFile.h"
 #include "AudioMixer.h"
+#include "MarkerData.h"
+#include "AdjustmentLayer.h"
 #include <QFile>
 #include <QJsonDocument>
 #include <algorithm>
 #include <cmath>
+
+// --- Timeline marker serialization (Premiere/Resolve parity) ---
+// Free, externally-linked helpers so a follow-up story can wire MainWindow
+// to round-trip markers through .veditor save/load without expanding the
+// scope of *this* story (ProjectFile.h is locked, ProjectData currently has
+// no markers field). Each Marker is serialized as
+//   { id, timeUs, label, color: "#RRGGBB", note }
+// per spec acceptance #5. Schema mirrors MarkerData.h's markerToJsonObject /
+// markerFromJsonObject so a future story can swap to those directly with no
+// JSON-format churn.
+QJsonArray projectFileMarkersToJson(const QVector<Marker> &markers)
+{
+    return markersToJsonArray(markers);
+}
+
+QVector<Marker> projectFileMarkersFromJson(const QJsonArray &arr)
+{
+    return markersFromJsonArray(arr);
+}
+
+// --- Adjustment layer serialization (Premiere/Photoshop parity) ---
+// Same rationale as the marker helpers above: ProjectFile.h is locked for
+// this story so ProjectData has no `adjustmentLayers` field yet. The schema
+// key is still reserved in save/toJsonString below so loaders never trip
+// the "missing version" branch on a project that grew the field later.
+// A follow-up MainWindow story will wire the helpers into the round-trip.
+QJsonArray projectFileAdjustmentLayersToJson(const QVector<AdjustmentLayer> &layers)
+{
+    return adjustmentLayersToJsonArray(layers);
+}
+
+QVector<AdjustmentLayer> projectFileAdjustmentLayersFromJson(const QJsonArray &arr)
+{
+    return adjustmentLayersFromJsonArray(arr);
+}
 
 static const int PROJECT_FORMAT_VERSION = 1;
 
@@ -47,6 +84,20 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
             ovArr.append(overlayToJson(o));
         root["overlays"] = ovArr;
     }
+
+    // Timeline markers — schema reserved here so loaders never see a
+    // missing key and trip the "unknown project version" branch. ProjectData
+    // does not yet carry a markers field (out of this story's scope), so the
+    // array stays empty until a follow-up wires MainWindow through the
+    // projectFileMarkersToJson helper. Round-trip is verified via the
+    // helper's own tests; reading is tolerant on the load side.
+    root["markers"] = QJsonArray{};
+
+    // Adjustment layers — schema reserved with the same rationale as
+    // markers. ProjectData has no `adjustmentLayers` field yet (ProjectFile.h
+    // is locked for this story); a follow-up will wire MainWindow through
+    // projectFileAdjustmentLayersToJson() once the UI lands.
+    root["adjustmentLayers"] = QJsonArray{};
 
     QJsonDocument doc(root);
     QFile file(filePath);
@@ -147,6 +198,12 @@ QString ProjectFile::toJsonString(const ProjectData &data)
             ovArr.append(overlayToJson(o));
         root["overlays"] = ovArr;
     }
+
+    // Timeline markers — see save() above for rationale (schema reserved).
+    root["markers"] = QJsonArray{};
+
+    // Adjustment layers — see save() above for rationale (schema reserved).
+    root["adjustmentLayers"] = QJsonArray{};
 
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));

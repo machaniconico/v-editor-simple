@@ -8,6 +8,7 @@
 #include <QVector>
 
 #include "MotionTracker.h"
+#include "TextManager.h"
 
 // --- Link target type ---
 
@@ -66,6 +67,11 @@ public:
     const QVector<TrackerLinkConfig> &links() const { return m_links; }
 
     // --- Position / value queries ---
+
+    // Apply motion tracking result as per-frame position keyframes on an overlay
+    static void applyToOverlay(EnhancedTextOverlay *overlay,
+                               const TrackingResult &result,
+                               double frameRate);
 
     // Get smoothed tracked position at a given time
     QPointF getLinkedPosition(const TrackingResult &result, double time) const;

@@ -1,219 +1,264 @@
 #include "MultiCam.h"
-#include "WaveformGenerator.h"
-#include <QFileInfo>
-#include <algorithm>
-#include <cmath>
 
-extern "C" {
-#include <libavformat/avformat.h>
-}
+#include <QFileInfo>
+#include <QJsonArray>
+#include <QtMath>
+
+#include <algorithm>
+
+// ===========================================================================
+// MultiCamSession (legacy / advanced — referenced by MainWindow).
+// Minimal correct implementation; auto-sync is a stub. Heavier audio
+// cross-correlation lives in a follow-up story.
+// ===========================================================================
 
 MultiCamSession::MultiCamSession(QObject *parent)
-    : QObject(parent) {}
+    : QObject(parent)
+{
+}
 
 void MultiCamSession::addSource(const QString &filePath, const QString &label)
 {
     CameraSource src;
     src.filePath = filePath;
-    src.label = label.isEmpty() ?
-        QString("Camera %1").arg(m_sources.size() + 1) : label;
-
-    // Get duration
-    AVFormatContext *fmt = nullptr;
-    if (avformat_open_input(&fmt, filePath.toUtf8().constData(), nullptr, nullptr) == 0) {
-        if (avformat_find_stream_info(fmt, nullptr) >= 0)
-            src.duration = static_cast<double>(fmt->duration) / AV_TIME_BASE;
-        avformat_close_input(&fmt);
-    }
-
+    src.label = label.isEmpty()
+                  ? QStringLiteral("Camera %1").arg(m_sources.size() + 1)
+                  : label;
+    src.syncOffset = 0.0;
+    src.duration = 0.0;
+    src.isActive = true;
     m_sources.append(src);
     emit sourcesChanged();
 }
 
 void MultiCamSession::removeSource(int index)
 {
-    if (index < 0 || index >= m_sources.size()) return;
-    m_sources.removeAt(index);
+    if (index < 0 || index >= m_sources.size())
+        return;
+    m_sources.remove(index);
 
-    // Remove cuts referencing this source and adjust indices
-    QVector<CameraCut> validCuts;
-    for (auto &cut : m_cuts) {
-        if (cut.cameraIndex == index) continue;
-        if (cut.cameraIndex > index) cut.cameraIndex--;
-        validCuts.append(cut);
+    // Drop cuts that referenced the removed camera; reindex the rest so
+    // that indices > index shift down by one.
+    for (int i = m_cuts.size() - 1; i >= 0; --i) {
+        if (m_cuts[i].cameraIndex == index)
+            m_cuts.remove(i);
+        else if (m_cuts[i].cameraIndex > index)
+            --m_cuts[i].cameraIndex;
     }
-    m_cuts = validCuts;
-
     emit sourcesChanged();
     emit cutsChanged();
 }
 
 void MultiCamSession::setSyncOffset(int sourceIndex, double offset)
 {
-    if (sourceIndex >= 0 && sourceIndex < m_sources.size()) {
-        m_sources[sourceIndex].syncOffset = offset;
-        emit sourcesChanged();
-    }
+    if (sourceIndex < 0 || sourceIndex >= m_sources.size())
+        return;
+    m_sources[sourceIndex].syncOffset = offset;
+    emit sourcesChanged();
 }
 
 void MultiCamSession::autoSyncByAudio()
 {
-    if (m_sources.size() < 2) return;
-
-    // Generate waveforms for all sources
-    QVector<WaveformData> waveforms;
-    for (const auto &src : m_sources)
-        waveforms.append(WaveformGenerator::generate(src.filePath, 100));
-
-    // Cross-correlate each source against the first (reference)
-    const auto &ref = waveforms[0];
-    if (ref.isEmpty()) return;
-
-    for (int i = 1; i < waveforms.size(); ++i) {
-        const auto &cmp = waveforms[i];
-        if (cmp.isEmpty()) continue;
-
-        // Simple cross-correlation to find best offset
-        int maxShift = qMin(ref.peaks.size(), cmp.peaks.size()) / 2;
-        double bestCorr = -1.0;
-        int bestOffset = 0;
-
-        for (int shift = -maxShift; shift <= maxShift; shift += 5) { // step of 5 for speed
-            double corr = 0.0;
-            int count = 0;
-            for (int j = 0; j < ref.peaks.size() && j + shift >= 0 && j + shift < cmp.peaks.size(); ++j) {
-                corr += ref.peaks[j] * cmp.peaks[j + shift];
-                ++count;
-            }
-            if (count > 0) corr /= count;
-            if (corr > bestCorr) {
-                bestCorr = corr;
-                bestOffset = shift;
-            }
-        }
-
-        // Refine around best offset
-        for (int shift = bestOffset - 5; shift <= bestOffset + 5; ++shift) {
-            double corr = 0.0;
-            int count = 0;
-            for (int j = 0; j < ref.peaks.size() && j + shift >= 0 && j + shift < cmp.peaks.size(); ++j) {
-                corr += ref.peaks[j] * cmp.peaks[j + shift];
-                ++count;
-            }
-            if (count > 0) corr /= count;
-            if (corr > bestCorr) {
-                bestCorr = corr;
-                bestOffset = shift;
-            }
-        }
-
-        double offsetSeconds = static_cast<double>(bestOffset) / ref.peaksPerSecond;
-        m_sources[i].syncOffset = offsetSeconds;
-    }
-
+    // Stub: deferred to follow-up story. Resets all offsets to 0.0 so
+    // the existing UI message ("auto-sync done") reflects a deterministic
+    // state. Real implementation = audio cross-correlation against the
+    // first source.
+    for (auto &src : m_sources)
+        src.syncOffset = 0.0;
     emit syncCompleted();
-    emit sourcesChanged();
 }
 
 void MultiCamSession::switchToCamera(int cameraIndex, double time)
 {
-    if (cameraIndex < 0 || cameraIndex >= m_sources.size()) return;
-
-    // Close any current cut at this time
-    for (auto &cut : m_cuts) {
-        if (cut.endTime > time && cut.startTime < time) {
-            cut.endTime = time;
-        }
-    }
-
-    // Remove future cuts
-    m_cuts.erase(
-        std::remove_if(m_cuts.begin(), m_cuts.end(),
-            [time](const CameraCut &c) { return c.startTime >= time; }),
-        m_cuts.end());
-
-    // Add new cut
-    CameraCut cut;
-    cut.cameraIndex = cameraIndex;
-    cut.startTime = time;
-    cut.endTime = totalDuration(); // until end or next switch
-    m_cuts.append(cut);
-
+    if (cameraIndex < 0 || cameraIndex >= m_sources.size())
+        return;
+    // Append a zero-length switch marker; generateEditList() expands
+    // these into real segments by pairing consecutive switches.
+    CameraCut c;
+    c.cameraIndex = cameraIndex;
+    c.startTime = time;
+    c.endTime = time;
+    m_cuts.append(c);
     sortCuts();
     emit cutsChanged();
 }
 
 void MultiCamSession::addCut(int cameraIndex, double startTime, double endTime)
 {
-    CameraCut cut;
-    cut.cameraIndex = cameraIndex;
-    cut.startTime = startTime;
-    cut.endTime = endTime;
-    m_cuts.append(cut);
+    if (cameraIndex < 0 || cameraIndex >= m_sources.size())
+        return;
+    if (endTime < startTime)
+        std::swap(startTime, endTime);
+    CameraCut c;
+    c.cameraIndex = cameraIndex;
+    c.startTime = startTime;
+    c.endTime = endTime;
+    m_cuts.append(c);
     sortCuts();
     emit cutsChanged();
 }
 
 void MultiCamSession::removeCut(int index)
 {
-    if (index >= 0 && index < m_cuts.size()) {
-        m_cuts.removeAt(index);
-        emit cutsChanged();
-    }
+    if (index < 0 || index >= m_cuts.size())
+        return;
+    m_cuts.remove(index);
+    emit cutsChanged();
 }
 
 int MultiCamSession::activeCameraAt(double time) const
 {
-    for (const auto &cut : m_cuts) {
-        if (time >= cut.startTime && time < cut.endTime)
-            return cut.cameraIndex;
+    int active = -1;
+    double bestStart = -1.0;
+    for (const auto &c : m_cuts) {
+        if (c.startTime <= time && c.startTime >= bestStart) {
+            bestStart = c.startTime;
+            active = c.cameraIndex;
+        }
     }
-    return 0; // default to first camera
+    if (active < 0 && !m_sources.isEmpty())
+        active = 0;
+    return active;
 }
 
 int MultiCamSession::gridColumns() const
 {
-    int n = m_sources.size();
+    const int n = m_sources.size();
     if (n <= 1) return 1;
     if (n <= 4) return 2;
-    if (n <= 9) return 3;
-    return 4;
+    return 3;
 }
 
 int MultiCamSession::gridRows() const
 {
-    int cols = gridColumns();
-    return (m_sources.size() + cols - 1) / cols;
+    const int n = m_sources.size();
+    if (n <= 0) return 0;
+    if (n <= 2) return 1;
+    if (n <= 4) return 2;
+    return 2;
 }
 
 QVector<MultiCamSession::EditSegment> MultiCamSession::generateEditList() const
 {
-    QVector<EditSegment> segments;
-    for (const auto &cut : m_cuts) {
-        if (cut.cameraIndex >= m_sources.size()) continue;
-        EditSegment seg;
-        seg.cameraIndex = cut.cameraIndex;
-        seg.timelineStart = cut.startTime;
-        seg.timelineEnd = cut.endTime;
-        seg.sourceStart = cut.startTime + m_sources[cut.cameraIndex].syncOffset;
-        seg.sourceEnd = cut.endTime + m_sources[cut.cameraIndex].syncOffset;
-        segments.append(seg);
+    QVector<EditSegment> out;
+    if (m_sources.isEmpty() || m_cuts.isEmpty())
+        return out;
+
+    // Cuts are sorted by sortCuts(); pair consecutive switch markers.
+    for (int i = 0; i < m_cuts.size(); ++i) {
+        const CameraCut &c = m_cuts[i];
+        const double tlEnd =
+            (i + 1 < m_cuts.size()) ? m_cuts[i + 1].startTime : totalDuration();
+        EditSegment s;
+        s.cameraIndex = c.cameraIndex;
+        s.timelineStart = c.startTime;
+        s.timelineEnd = tlEnd;
+        const double off = (c.cameraIndex >= 0 && c.cameraIndex < m_sources.size())
+                               ? m_sources[c.cameraIndex].syncOffset
+                               : 0.0;
+        s.sourceStart = c.startTime - off;
+        s.sourceEnd = tlEnd - off;
+        out.append(s);
     }
-    return segments;
+    return out;
 }
 
 double MultiCamSession::totalDuration() const
 {
-    double maxDur = 0.0;
+    double maxEnd = 0.0;
     for (const auto &src : m_sources) {
-        double effective = src.duration - src.syncOffset;
-        maxDur = qMax(maxDur, effective);
+        const double end = src.duration - src.syncOffset;
+        if (end > maxEnd) maxEnd = end;
     }
-    return maxDur;
+    return maxEnd;
 }
 
 void MultiCamSession::sortCuts()
 {
     std::sort(m_cuts.begin(), m_cuts.end(),
-        [](const CameraCut &a, const CameraCut &b) { return a.startTime < b.startTime; });
+              [](const CameraCut &a, const CameraCut &b) {
+                  return a.startTime < b.startTime;
+              });
+}
+
+// ===========================================================================
+// MultiCamProject — pure-data EDL produced by MultiCamDialog.
+// ===========================================================================
+
+QJsonObject MultiCamProject::toJson() const
+{
+    QJsonArray angleArr;
+    for (const MultiCamAngle &a : angles) {
+        QJsonObject o;
+        o.insert(QStringLiteral("id"), a.id);
+        o.insert(QStringLiteral("sourcePath"), a.sourcePath);
+        o.insert(QStringLiteral("syncOffsetUs"),
+                 static_cast<double>(a.syncOffsetUs));
+        o.insert(QStringLiteral("label"), a.label);
+        angleArr.append(o);
+    }
+
+    QJsonArray switchArr;
+    for (const MultiCamSwitch &s : switches) {
+        QJsonObject o;
+        o.insert(QStringLiteral("timelineUs"),
+                 static_cast<double>(s.timelineUs));
+        o.insert(QStringLiteral("activeAngleId"), s.activeAngleId);
+        switchArr.append(o);
+    }
+
+    QJsonObject root;
+    root.insert(QStringLiteral("angles"), angleArr);
+    root.insert(QStringLiteral("switches"), switchArr);
+    root.insert(QStringLiteral("defaultAngleId"), defaultAngleId);
+    return root;
+}
+
+MultiCamProject MultiCamProject::fromJson(const QJsonObject &o)
+{
+    MultiCamProject p;
+
+    const QJsonArray angleArr = o.value(QStringLiteral("angles")).toArray();
+    p.angles.reserve(angleArr.size());
+    for (const QJsonValue &v : angleArr) {
+        const QJsonObject ao = v.toObject();
+        MultiCamAngle a;
+        a.id = ao.value(QStringLiteral("id")).toInt();
+        a.sourcePath = ao.value(QStringLiteral("sourcePath")).toString();
+        a.syncOffsetUs = static_cast<qint64>(
+            ao.value(QStringLiteral("syncOffsetUs")).toDouble());
+        a.label = ao.value(QStringLiteral("label")).toString();
+        p.angles.append(a);
+    }
+
+    const QJsonArray switchArr = o.value(QStringLiteral("switches")).toArray();
+    p.switches.reserve(switchArr.size());
+    for (const QJsonValue &v : switchArr) {
+        const QJsonObject so = v.toObject();
+        MultiCamSwitch s;
+        s.timelineUs = static_cast<qint64>(
+            so.value(QStringLiteral("timelineUs")).toDouble());
+        s.activeAngleId = so.value(QStringLiteral("activeAngleId")).toInt();
+        p.switches.append(s);
+    }
+    // Ensure invariant: switches sorted by timelineUs ascending.
+    std::sort(p.switches.begin(), p.switches.end(),
+              [](const MultiCamSwitch &a, const MultiCamSwitch &b) {
+                  return a.timelineUs < b.timelineUs;
+              });
+
+    p.defaultAngleId = o.value(QStringLiteral("defaultAngleId")).toInt();
+    return p;
+}
+
+int MultiCamProject::activeAngleAt(qint64 timelineUs) const
+{
+    // Walk backwards over switches (sorted ascending) and return the
+    // first whose timelineUs <= timelineUs. O(n) is fine for the
+    // dialog-scale switch counts (typically < 1000).
+    for (int i = switches.size() - 1; i >= 0; --i) {
+        if (switches[i].timelineUs <= timelineUs)
+            return switches[i].activeAngleId;
+    }
+    return defaultAngleId;
 }

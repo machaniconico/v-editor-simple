@@ -42,6 +42,16 @@ struct TextShadow {
     double offsetY = 3.0;
     double blur = 4.0;
     QColor color = QColor(0, 0, 0, 180);
+    double opacity = 1.0; // multiplied with color.alpha at render time
+};
+
+// --- Outer Glow ---
+
+struct TextGlow {
+    bool enabled = false;
+    double radius = 8.0;
+    QColor color = QColor(255, 255, 0, 255);
+    double opacity = 0.9;
 };
 
 // --- Rich Text Segment ---
@@ -68,6 +78,14 @@ struct GradientStop {
     double position = 0.0; // 0.0 - 1.0
     QColor color = Qt::white;
     double opacity = 1.0;  // 0.0 - 1.0, multiplied into color alpha at render time
+};
+
+// --- Position keyframe for motion-tracked overlays ---
+
+struct PositionKeyframe {
+    double time = 0.0;  // time offset in seconds from overlay start
+    double cx = 0.5;    // normalized center x (0.0-1.0)
+    double cy = 0.5;    // normalized center y (0.0-1.0)
 };
 
 // --- Enhanced Text Overlay ---
@@ -115,6 +133,10 @@ struct EnhancedTextOverlay {
     // Shadow
     TextShadow shadow;
 
+    // Outer glow (rendered behind text/outline, in front of shadow). Skipped
+    // entirely when glow.enabled=false so disabled overlays incur no cost.
+    TextGlow glow;
+
     // Animation
     TextAnimation animIn;
     TextAnimation animOut;
@@ -132,6 +154,9 @@ struct EnhancedTextOverlay {
 
     // Template name (if saved from template)
     QString templateName;
+
+    // Motion-tracking position keyframes (per-frame normalized center)
+    QVector<PositionKeyframe> positionKeyframes;
 };
 
 // --- Text Template ---
@@ -146,6 +171,7 @@ struct TextTemplate {
     QColor outline2Color;
     int outline2Width;
     TextShadow shadow;
+    TextGlow glow;
     TextAnimation animIn;
     TextAnimation animOut;
     double opacity;
@@ -209,6 +235,8 @@ private:
                                 int textLen, int &visibleChars);
     static void renderShadow(QPainter &painter, const QString &text, const QRect &rect,
                               const EnhancedTextOverlay &overlay);
+    static void renderGlow(QPainter &painter, const QString &text, const QRect &rect,
+                            const EnhancedTextOverlay &overlay);
     static void renderOutline(QPainter &painter, const QString &text, const QRect &rect,
                                const EnhancedTextOverlay &overlay);
     static void renderRuby(QPainter &painter, const QString &baseText, const QRect &rect,

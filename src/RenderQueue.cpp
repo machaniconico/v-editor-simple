@@ -4,6 +4,13 @@
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QRegularExpression>
+#include <QUuid>
+
+namespace {
+QString makeUuid() {
+    return QUuid::createUuid().toString(QUuid::WithoutBraces);
+}
+} // namespace
 
 RenderQueue::RenderQueue(QObject *parent)
     : QObject(parent)
@@ -24,15 +31,53 @@ int RenderQueue::addJob(const QString &name, const QString &projectFilePath,
 {
     RenderJob job;
     job.id = m_nextId++;
+    job.uuid = makeUuid();
     job.name = name;
     job.projectFilePath = projectFilePath;
     job.outputPath = outputPath;
     job.exportConfig = exportConfig;
     job.status = RenderJobStatus::Pending;
     job.progress = 0;
+    job.progressPercent = 0;
+
+    // Mirror legacy exportConfig into flat fields so spec API can read them.
+    job.width = exportConfig.value("width").toInt(1920);
+    job.height = exportConfig.value("height").toInt(1080);
+    job.codec = exportConfig.value("videoCodec").toString("h264");
+    // exportConfig stored bitrate in kbps; flat field uses bps.
+    job.bitrateBps = exportConfig.value("videoBitrate").toInt(10000) * 1000;
+    job.preset = exportConfig.value("preset").toString();
 
     m_jobs.append(job);
+    emit jobsChanged();
     return job.id;
+}
+
+void RenderQueue::addJob(const RenderJob &job)
+{
+    RenderJob copy = job;
+    if (copy.uuid.isEmpty())
+        copy.uuid = makeUuid();
+    if (copy.id == 0)
+        copy.id = m_nextId++;
+    if (copy.status == RenderJobStatus::Pending && copy.progress == 0)
+        copy.progress = copy.progressPercent;
+    if (copy.errorMessage.isEmpty())
+        copy.errorMessage = copy.error;
+
+    // Mirror flat fields into exportConfig so the FFmpeg arg builder picks
+    // them up without a separate code path.
+    QJsonObject cfg = copy.exportConfig;
+    cfg["width"] = copy.width;
+    cfg["height"] = copy.height;
+    cfg["videoCodec"] = mapCodecToFFmpeg(copy.codec);
+    cfg["videoBitrate"] = copy.bitrateBps / 1000;  // ffmpeg arg builder expects kbps
+    if (!copy.preset.isEmpty())
+        cfg["preset"] = copy.preset;
+    copy.exportConfig = cfg;
+
+    m_jobs.append(copy);
+    emit jobsChanged();
 }
 
 void RenderQueue::removeJob(int id)
@@ -52,6 +97,42 @@ void RenderQueue::removeJob(int id)
         m_currentJobIndex--;
     else if (m_currentJobIndex == idx)
         m_currentJobIndex = -1;
+
+    emit jobsChanged();
+}
+
+void RenderQueue::removeJob(const QString &uuid)
+{
+    int idx = findJobIndexByUuid(uuid);
+    if (idx < 0)
+        return;
+    if (m_jobs[idx].status == RenderJobStatus::Rendering)
+        return;
+
+    m_jobs.removeAt(idx);
+    if (m_currentJobIndex > idx)
+        m_currentJobIndex--;
+    else if (m_currentJobIndex == idx)
+        m_currentJobIndex = -1;
+
+    emit jobsChanged();
+}
+
+void RenderQueue::clear()
+{
+    clearAll();
+}
+
+void RenderQueue::start()
+{
+    startQueue();
+}
+
+void RenderQueue::stop()
+{
+    cancelCurrent();
+    m_running = false;
+    m_paused = false;
 }
 
 void RenderQueue::clearCompleted()
@@ -65,6 +146,7 @@ void RenderQueue::clearCompleted()
                 m_currentJobIndex--;
         }
     }
+    emit jobsChanged();
 }
 
 void RenderQueue::clearAll()
@@ -74,6 +156,7 @@ void RenderQueue::clearAll()
 
     m_jobs.clear();
     m_currentJobIndex = -1;
+    emit jobsChanged();
 }
 
 void RenderQueue::startQueue()
@@ -112,9 +195,11 @@ void RenderQueue::cancelCurrent()
     m_process->kill();
     m_process->waitForFinished(3000);
 
-    m_jobs[m_currentJobIndex].status = RenderJobStatus::Cancelled;
-    m_jobs[m_currentJobIndex].endTime = QDateTime::currentDateTime();
-    m_jobs[m_currentJobIndex].errorMessage = "Cancelled by user";
+    RenderJob &j = m_jobs[m_currentJobIndex];
+    j.status = RenderJobStatus::Cancelled;
+    j.endTime = QDateTime::currentDateTime();
+    j.errorMessage = "Cancelled by user";
+    j.error = j.errorMessage;
 
     // Don't auto-advance; let the process finished handler deal with it
 }
@@ -159,6 +244,7 @@ void RenderQueue::moveJobUp(int id)
         return;
 
     m_jobs.swapItemsAt(idx, idx - 1);
+    emit jobsChanged();
 }
 
 void RenderQueue::moveJobDown(int id)
@@ -171,6 +257,29 @@ void RenderQueue::moveJobDown(int id)
         return;
 
     m_jobs.swapItemsAt(idx, idx + 1);
+    emit jobsChanged();
+}
+
+void RenderQueue::moveJobUpUuid(const QString &uuid)
+{
+    int idx = findJobIndexByUuid(uuid);
+    if (idx <= 0)
+        return;
+    if (m_jobs[idx].status != RenderJobStatus::Pending)
+        return;
+    m_jobs.swapItemsAt(idx, idx - 1);
+    emit jobsChanged();
+}
+
+void RenderQueue::moveJobDownUuid(const QString &uuid)
+{
+    int idx = findJobIndexByUuid(uuid);
+    if (idx < 0 || idx >= m_jobs.size() - 1)
+        return;
+    if (m_jobs[idx].status != RenderJobStatus::Pending)
+        return;
+    m_jobs.swapItemsAt(idx, idx + 1);
+    emit jobsChanged();
 }
 
 int RenderQueue::totalEstimatedTime() const
@@ -197,13 +306,25 @@ bool RenderQueue::saveQueue(const QString &filePath) const
     QJsonArray jobsArray;
     for (const auto &job : m_jobs) {
         QJsonObject obj;
-        obj["id"] = job.id;
+        obj["id"] = job.id;                 // legacy int id
+        obj["uuid"] = job.uuid;             // spec QString uuid
         obj["name"] = job.name;
         obj["projectFilePath"] = job.projectFilePath;
         obj["outputPath"] = job.outputPath;
+        obj["preset"] = job.preset;
+        obj["width"] = job.width;
+        obj["height"] = job.height;
+        obj["codec"] = job.codec;
+        obj["bitrateBps"] = job.bitrateBps;
+        obj["startUs"] = static_cast<qint64>(job.startUs);
+        obj["endUs"] = static_cast<qint64>(job.endUs);
+        obj["passes"] = job.passes;
         obj["exportConfig"] = job.exportConfig;
         obj["status"] = static_cast<int>(job.status);
+        obj["statusString"] = job.statusString();
+        obj["progressPercent"] = job.progressPercent;
         obj["progress"] = job.progress;
+        obj["error"] = job.error;
         obj["errorMessage"] = job.errorMessage;
 
         if (job.startTime.isValid())
@@ -215,7 +336,7 @@ bool RenderQueue::saveQueue(const QString &filePath) const
     }
 
     QJsonObject root;
-    root["version"] = 1;
+    root["version"] = 2;
     root["nextId"] = m_nextId;
     root["jobs"] = jobsArray;
 
@@ -246,13 +367,24 @@ bool RenderQueue::loadQueue(const QString &filePath)
         QJsonObject obj = val.toObject();
         RenderJob job;
         job.id = obj["id"].toInt();
+        job.uuid = obj.value("uuid").toString(makeUuid());
         job.name = obj["name"].toString();
         job.projectFilePath = obj["projectFilePath"].toString();
         job.outputPath = obj["outputPath"].toString();
+        job.preset = obj["preset"].toString();
+        job.width = obj["width"].toInt(1920);
+        job.height = obj["height"].toInt(1080);
+        job.codec = obj["codec"].toString("h264");
+        job.bitrateBps = obj["bitrateBps"].toInt(50000000);
+        job.startUs = static_cast<qint64>(obj["startUs"].toDouble(0));
+        job.endUs = static_cast<qint64>(obj["endUs"].toDouble(0));
+        job.passes = obj["passes"].toInt(1);
         job.exportConfig = obj["exportConfig"].toObject();
         job.status = static_cast<RenderJobStatus>(obj["status"].toInt());
-        job.progress = obj["progress"].toInt();
-        job.errorMessage = obj["errorMessage"].toString();
+        job.progressPercent = obj["progressPercent"].toInt(obj["progress"].toInt());
+        job.progress = job.progressPercent;
+        job.error = obj["error"].toString(obj["errorMessage"].toString());
+        job.errorMessage = job.error;
 
         if (obj.contains("startTime"))
             job.startTime = QDateTime::fromString(obj["startTime"].toString(), Qt::ISODate);
@@ -262,6 +394,7 @@ bool RenderQueue::loadQueue(const QString &filePath)
         m_jobs.append(job);
     }
 
+    emit jobsChanged();
     return true;
 }
 
@@ -284,16 +417,19 @@ void RenderQueue::startNextJob()
     if (m_currentJobIndex < 0) {
         m_running = false;
         emit queueFinished();
+        emit allCompleted();
         return;
     }
 
     RenderJob &job = m_jobs[m_currentJobIndex];
     job.status = RenderJobStatus::Rendering;
     job.progress = 0;
+    job.progressPercent = 0;
     job.startTime = QDateTime::currentDateTime();
     m_currentDuration = 0.0;
 
     emit jobStarted(job.id);
+    emit jobsChanged();
 
     // Build ffmpeg command
     QStringList args = buildFFmpegArgs(job);
@@ -330,15 +466,22 @@ void RenderQueue::startNextJob()
 
         if (job.status == RenderJobStatus::Cancelled) {
             // Already marked cancelled by cancelCurrent()
+            emit jobCompletedUuid(job.uuid, false, job.error);
         } else if (exitStatus == QProcess::CrashExit || exitCode != 0) {
             job.status = RenderJobStatus::Failed;
             job.errorMessage = QString("FFmpeg exited with code %1").arg(exitCode);
+            job.error = job.errorMessage;
             emit jobFailed(job.id, job.errorMessage);
+            emit jobCompletedUuid(job.uuid, false, job.errorMessage);
         } else {
             job.status = RenderJobStatus::Completed;
             job.progress = 100;
+            job.progressPercent = 100;
             emit jobCompleted(job.id);
+            emit jobCompletedUuid(job.uuid, true, QString());
         }
+
+        emit jobsChanged();
 
         // Emit overall queue progress
         int total = m_jobs.size();
@@ -359,7 +502,10 @@ void RenderQueue::startNextJob()
         job.status = RenderJobStatus::Failed;
         job.endTime = QDateTime::currentDateTime();
         job.errorMessage = "Failed to start ffmpeg process";
+        job.error = job.errorMessage;
         emit jobFailed(job.id, job.errorMessage);
+        emit jobCompletedUuid(job.uuid, false, job.errorMessage);
+        emit jobsChanged();
         startNextJob();
     }
 }
@@ -371,6 +517,15 @@ QStringList RenderQueue::buildFFmpegArgs(const RenderJob &job) const
 
     const QJsonObject &cfg = job.exportConfig;
 
+    // Optional timeline range trim (flat-field jobs only — legacy callers
+    // leave both at 0 and the trim is skipped).
+    if (job.startUs > 0) {
+        args << "-ss" << QString::number(job.startUs / 1000000.0, 'f', 6);
+    }
+    if (job.endUs > 0 && job.endUs > job.startUs) {
+        args << "-to" << QString::number(job.endUs / 1000000.0, 'f', 6);
+    }
+
     // Input file — use project file path as source
     args << "-i" << job.projectFilePath;
 
@@ -378,9 +533,18 @@ QStringList RenderQueue::buildFFmpegArgs(const RenderJob &job) const
     QString videoCodec = cfg["videoCodec"].toString("libx264");
     args << "-c:v" << videoCodec;
 
-    // Video bitrate
-    int videoBitrate = cfg["videoBitrate"].toInt(10000);
-    args << "-b:v" << QString("%1k").arg(videoBitrate);
+    // ProRes uses -profile:v rather than a bitrate flag.
+    const bool isProRes = (videoCodec == "prores_ks" || videoCodec == "prores");
+    if (isProRes) {
+        // Default to ProRes 422 LT (profile 1). buildFFmpegArgs is const so
+        // we read profile from cfg / flat-field codec only.
+        int profile = cfg.value("proresProfile").toInt(1);
+        args << "-profile:v" << QString::number(profile);
+    } else {
+        // Video bitrate (kbps in cfg)
+        int videoBitrate = cfg["videoBitrate"].toInt(10000);
+        args << "-b:v" << QString("%1k").arg(videoBitrate);
+    }
 
     // Resolution
     int width = cfg["width"].toInt(1920);
@@ -406,6 +570,14 @@ QStringList RenderQueue::buildFFmpegArgs(const RenderJob &job) const
         args << "-preset" << "8";
     } else if (videoCodec == "libvpx-vp9") {
         args << "-quality" << "good" << "-cpu-used" << "4";
+    }
+
+    // 2-pass VBR support — when job.passes==2 the first pass writes to a
+    // null muxer, the second pass is what produces the final file. Here we
+    // just hint the encoder; orchestrating both runs is left to the caller
+    // / future work (the legacy single-pass path stays the default).
+    if (job.passes == 2 && !isProRes) {
+        args << "-pass" << "2";
     }
 
     // Progress reporting
@@ -434,6 +606,14 @@ void RenderQueue::parseFFmpegOutput(const QString &line)
         return;
     }
 
+    auto reportPercent = [this](int percent) {
+        RenderJob &job = m_jobs[m_currentJobIndex];
+        job.progress = percent;
+        job.progressPercent = percent;
+        emit jobProgress(job.id, percent);
+        emit jobProgressUuid(job.uuid, percent);
+    };
+
     // Parse "out_time_ms=XXXX" from -progress pipe output
     static QRegularExpression outTimeMsRx(R"(out_time_ms=(\d+))");
     QRegularExpressionMatch outTimeMatch = outTimeMsRx.match(line);
@@ -442,10 +622,7 @@ void RenderQueue::parseFFmpegOutput(const QString &line)
         double currentSec = currentUs / 1000000.0;
         int percent = static_cast<int>(currentSec / m_currentDuration * 100.0);
         percent = qBound(0, percent, 99);
-
-        RenderJob &job = m_jobs[m_currentJobIndex];
-        job.progress = percent;
-        emit jobProgress(job.id, percent);
+        reportPercent(percent);
         return;
     }
 
@@ -460,10 +637,7 @@ void RenderQueue::parseFFmpegOutput(const QString &line)
         double currentTime = hours * 3600.0 + minutes * 60.0 + seconds + centis / 100.0;
         int percent = static_cast<int>(currentTime / m_currentDuration * 100.0);
         percent = qBound(0, percent, 99);
-
-        RenderJob &job = m_jobs[m_currentJobIndex];
-        job.progress = percent;
-        emit jobProgress(job.id, percent);
+        reportPercent(percent);
     }
 }
 
@@ -474,4 +648,70 @@ int RenderQueue::findJobIndex(int id) const
             return i;
     }
     return -1;
+}
+
+int RenderQueue::findJobIndexByUuid(const QString &uuid) const
+{
+    for (int i = 0; i < m_jobs.size(); ++i) {
+        if (m_jobs[i].uuid == uuid)
+            return i;
+    }
+    return -1;
+}
+
+QString RenderQueue::mapCodecToFFmpeg(const QString &codec)
+{
+    // The flat-field codec uses Premiere/Resolve naming; map it to the
+    // ffmpeg encoder name the existing buildFFmpegArgs() expects.
+    if (codec == "h264") return "libx264";
+    if (codec == "hevc" || codec == "h265") return "libx265";
+    if (codec == "av1") return "libsvtav1";
+    if (codec == "prores") return "prores_ks";
+    return codec;  // already-prefixed names pass through (libx264, libvpx-vp9...)
+}
+
+QString RenderQueue::defaultContainerFor(const QString &codec)
+{
+    if (codec == "prores") return "mov";
+    if (codec == "av1")    return "mp4";
+    return "mp4";
+}
+
+QVector<RenderPreset> RenderQueue::availablePresets()
+{
+    // Built-in catalogue — Premiere Media Encoder / Resolve Deliver parity.
+    // Bitrates expressed in bps to match the spec.
+    return {
+        { "1080p H.264 / 50 Mbps",            1920, 1080, "h264",   50000000,  "mp4" },
+        { "1080p H.265 / 30 Mbps",            1920, 1080, "hevc",   30000000,  "mp4" },
+        { "4K H.264 / 100 Mbps",              3840, 2160, "h264",  100000000,  "mp4" },
+        { "4K H.265 / 60 Mbps",               3840, 2160, "hevc",   60000000,  "mp4" },
+        { "720p H.264 / 8 Mbps (web)",        1280,  720, "h264",    8000000,  "mp4" },
+        { "ProRes 422 LT",                    1920, 1080, "prores", 100000000,  "mov" },
+        { "AV1 4K / 30 Mbps",                 3840, 2160, "av1",    30000000,  "mp4" },
+        { "Twitter 720p H.264 / 6 Mbps",      1280,  720, "h264",    6000000,  "mp4" },
+        { "YouTube 4K HDR (HEVC) / 80 Mbps",  3840, 2160, "hevc",   80000000,  "mp4" },
+        { "Vimeo 1080p H.264 / 20 Mbps",      1920, 1080, "h264",   20000000,  "mp4" },
+    };
+}
+
+RenderJob RenderQueue::jobFromPreset(const RenderPreset &preset,
+                                     const QString &outputPath,
+                                     qint64 startUs,
+                                     qint64 endUs)
+{
+    RenderJob j;
+    j.uuid = makeUuid();
+    j.outputPath = outputPath;
+    j.preset = preset.name;
+    j.width = preset.width;
+    j.height = preset.height;
+    j.codec = preset.codec;
+    j.bitrateBps = preset.bitrateBps;
+    j.startUs = startUs;
+    j.endUs = endUs;
+    j.passes = 1;
+    j.status = RenderJobStatus::Pending;
+    j.name = preset.name;
+    return j;
 }

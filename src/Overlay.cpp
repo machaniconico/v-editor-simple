@@ -2,6 +2,70 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QFontMetrics>
+#include <QImage>
+#include <QVector>
+
+namespace {
+
+// Separable box blur on the alpha channel. Mirrors the helper used in
+// TextManager.cpp's enhanced path; kept local here so Overlay.cpp does
+// not depend on TextManager's private renderer.
+void boxBlurAlphaInPlace(QImage &img, int radius)
+{
+    if (radius <= 0 || img.isNull()) return;
+    const int r = qMin(radius, 32);
+    const int w = img.width();
+    const int h = img.height();
+    if (w == 0 || h == 0) return;
+    if (img.format() != QImage::Format_ARGB32_Premultiplied)
+        img = img.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+
+    QVector<int> tmp(w * h);
+    for (int y = 0; y < h; ++y) {
+        const QRgb *row = reinterpret_cast<const QRgb*>(img.constScanLine(y));
+        int sum = 0;
+        for (int x = -r; x <= r; ++x)
+            sum += qAlpha(row[qBound(0, x, w - 1)]);
+        const int span = 2 * r + 1;
+        for (int x = 0; x < w; ++x) {
+            tmp[y * w + x] = sum / span;
+            sum += qAlpha(row[qBound(0, x + r + 1, w - 1)])
+                 - qAlpha(row[qBound(0, x - r,     w - 1)]);
+        }
+    }
+    for (int x = 0; x < w; ++x) {
+        int sum = 0;
+        for (int y = -r; y <= r; ++y)
+            sum += tmp[qBound(0, y, h - 1) * w + x];
+        const int span = 2 * r + 1;
+        for (int y = 0; y < h; ++y) {
+            const int a = sum / span;
+            QRgb *row = reinterpret_cast<QRgb*>(img.scanLine(y));
+            row[x] = qRgba(0, 0, 0, a);
+            sum += tmp[qBound(0, y + r + 1, h - 1) * w + x]
+                 - tmp[qBound(0, y - r,     h - 1) * w + x];
+        }
+    }
+}
+
+QImage rasterTextAlpha(const QString &text, const QRect &rect,
+                       const QFont &font, int alignFlags, int padPx)
+{
+    const int W = qMax(1, rect.width()  + padPx * 2);
+    const int H = qMax(1, rect.height() + padPx * 2);
+    QImage buf(W, H, QImage::Format_ARGB32_Premultiplied);
+    buf.fill(Qt::transparent);
+    QPainter p(&buf);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setRenderHint(QPainter::TextAntialiasing);
+    p.setFont(font);
+    p.setPen(Qt::black);
+    p.drawText(QRect(padPx, padPx, rect.width(), rect.height()), alignFlags, text);
+    p.end();
+    return buf;
+}
+
+} // namespace
 
 void OverlayRenderer::renderTextOverlay(QImage &frame, const TextOverlay &overlay, double currentTime)
 {
@@ -15,8 +79,9 @@ void OverlayRenderer::renderTextOverlay(QImage &frame, const TextOverlay &overla
 
     painter.setFont(overlay.font);
     QFontMetrics fm(overlay.font);
+    const int alignFlags = overlay.alignment | Qt::TextWordWrap;
     QRect textBounds = fm.boundingRect(QRect(0, 0, frame.width() - 40, 0),
-        overlay.alignment | Qt::TextWordWrap, overlay.text);
+        alignFlags, overlay.text);
 
     int px = static_cast<int>(overlay.x * frame.width()) - textBounds.width() / 2;
     int py = static_cast<int>(overlay.y * frame.height()) - textBounds.height() / 2;
@@ -25,6 +90,48 @@ void OverlayRenderer::renderTextOverlay(QImage &frame, const TextOverlay &overla
     // Background
     if (overlay.backgroundColor.alpha() > 0) {
         painter.fillRect(drawRect.adjusted(-8, -4, 8, 4), overlay.backgroundColor);
+    }
+
+    // Order: shadow -> glow -> outline -> fill. Each effect skips its
+    // offscreen QImage entirely when the boolean flag is false so disabled
+    // effects cost nothing beyond the branch test.
+    if (overlay.shadow) {
+        const double blur = qMax(0.0, overlay.shadowBlur);
+        const int pad = qMax(8, static_cast<int>(blur * 2.0) + 4);
+        QImage buf = rasterTextAlpha(overlay.text, drawRect, overlay.font, alignFlags, pad);
+        boxBlurAlphaInPlace(buf, static_cast<int>(blur));
+        {
+            QPainter pp(&buf);
+            pp.setCompositionMode(QPainter::CompositionMode_SourceIn);
+            pp.fillRect(buf.rect(), overlay.shadowColor);
+        }
+        const double op = qBound(0.0, overlay.shadowOpacity, 1.0);
+        const double prevOp = painter.opacity();
+        painter.setOpacity(prevOp * op);
+        painter.drawImage(drawRect.left() - pad + static_cast<int>(overlay.shadowOffsetX),
+                          drawRect.top()  - pad + static_cast<int>(overlay.shadowOffsetY),
+                          buf);
+        painter.setOpacity(prevOp);
+    }
+
+    if (overlay.glow) {
+        const double radius = qMax(0.0, overlay.glowRadius);
+        const int pad = qMax(8, static_cast<int>(radius * 2.0) + 4);
+        QImage buf = rasterTextAlpha(overlay.text, drawRect, overlay.font, alignFlags, pad);
+        boxBlurAlphaInPlace(buf, static_cast<int>(radius));
+        {
+            QPainter pp(&buf);
+            pp.setCompositionMode(QPainter::CompositionMode_SourceIn);
+            pp.fillRect(buf.rect(), overlay.glowColor);
+        }
+        const double op = qBound(0.0, overlay.glowOpacity, 1.0);
+        const double prevOp = painter.opacity();
+        const QPainter::CompositionMode prevMode = painter.compositionMode();
+        painter.setOpacity(prevOp * op);
+        painter.setCompositionMode(QPainter::CompositionMode_Plus);
+        painter.drawImage(drawRect.left() - pad, drawRect.top() - pad, buf);
+        painter.setCompositionMode(prevMode);
+        painter.setOpacity(prevOp);
     }
 
     // Outline
@@ -37,7 +144,7 @@ void OverlayRenderer::renderTextOverlay(QImage &frame, const TextOverlay &overla
 
     // Text
     painter.setPen(overlay.color);
-    painter.drawText(drawRect, overlay.alignment | Qt::TextWordWrap, overlay.text);
+    painter.drawText(drawRect, alignFlags, overlay.text);
 }
 
 void OverlayRenderer::renderImageOverlay(QImage &frame, const ImageOverlay &overlay, double currentTime)

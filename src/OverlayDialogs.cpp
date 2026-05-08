@@ -157,6 +157,82 @@ void TextOverlayDialog::setupUI()
 
     layout->addLayout(form);
 
+    auto applyColorButtonStyle = [](QPushButton *btn, const QColor &c) {
+        btn->setStyleSheet(QString("background-color: %1;").arg(c.name()));
+    };
+
+    // --- Drop shadow ---
+    auto *shadowBox = new QGroupBox(QString::fromUtf8("\xe3\x83\x89\xe3\x83\xad\xe3\x83\x83\xe3\x83\x97\xe3\x82\xb7\xe3\x83\xa3\xe3\x83\x89\xe3\x82\xa6"), this); // ドロップシャドウ
+    auto *shadowForm = new QFormLayout(shadowBox);
+    m_shadowEnabled = new QCheckBox(QString::fromUtf8("\xe6\x9c\x89\xe5\x8a\xb9"), shadowBox); // 有効
+    shadowForm->addRow(m_shadowEnabled);
+    m_shadowOffX = new QDoubleSpinBox(shadowBox);
+    m_shadowOffX->setRange(-200.0, 200.0); m_shadowOffX->setValue(4.0); m_shadowOffX->setSingleStep(0.5);
+    m_shadowOffY = new QDoubleSpinBox(shadowBox);
+    m_shadowOffY->setRange(-200.0, 200.0); m_shadowOffY->setValue(4.0); m_shadowOffY->setSingleStep(0.5);
+    auto *shadowOffLayout = new QHBoxLayout();
+    shadowOffLayout->addWidget(new QLabel("X:", shadowBox)); shadowOffLayout->addWidget(m_shadowOffX);
+    shadowOffLayout->addWidget(new QLabel("Y:", shadowBox)); shadowOffLayout->addWidget(m_shadowOffY);
+    shadowForm->addRow(QString::fromUtf8("\xe3\x82\xaa\xe3\x83\x95\xe3\x82\xbb\xe3\x83\x83\xe3\x83\x88:"), shadowOffLayout); // オフセット
+    m_shadowBlur = new QDoubleSpinBox(shadowBox);
+    m_shadowBlur->setRange(0.0, 64.0); m_shadowBlur->setValue(6.0); m_shadowBlur->setSingleStep(0.5);
+    shadowForm->addRow(QString::fromUtf8("\xe3\x83\x96\xe3\x83\xa9\xe3\x83\xbc:"), m_shadowBlur); // ブラー
+    m_shadowColorBtn = new QPushButton(QStringLiteral("Color"), shadowBox);
+    applyColorButtonStyle(m_shadowColorBtn, m_shadowColor);
+    connect(m_shadowColorBtn, &QPushButton::clicked, this, [this, applyColorButtonStyle]() {
+        QColor c = QColorDialog::getColor(m_shadowColor, this,
+            QString::fromUtf8("\xe3\x82\xb7\xe3\x83\xa3\xe3\x83\x89\xe3\x82\xa6\xe8\x89\xb2"), // シャドウ色
+            QColorDialog::ShowAlphaChannel);
+        if (c.isValid()) { m_shadowColor = c; applyColorButtonStyle(m_shadowColorBtn, c); }
+    });
+    shadowForm->addRow(QString::fromUtf8("\xe8\x89\xb2:"), m_shadowColorBtn); // 色
+    m_shadowOpacity = new QDoubleSpinBox(shadowBox);
+    m_shadowOpacity->setRange(0.0, 1.0); m_shadowOpacity->setValue(0.8); m_shadowOpacity->setSingleStep(0.05);
+    shadowForm->addRow(QString::fromUtf8("\xe4\xb8\x8d\xe9\x80\x8f\xe6\x98\x8e\xe5\xba\xa6:"), m_shadowOpacity); // 不透明度
+    layout->addWidget(shadowBox);
+
+    // --- Outer glow ---
+    auto *glowBox = new QGroupBox(QString::fromUtf8("\xe3\x82\xa2\xe3\x82\xa6\xe3\x82\xbf\xe3\x83\xbc\xe3\x83\xbb\xe3\x82\xb0\xe3\x83\xad\xe3\x83\xbc"), this); // アウター・グロー
+    auto *glowForm = new QFormLayout(glowBox);
+    m_glowEnabled = new QCheckBox(QString::fromUtf8("\xe6\x9c\x89\xe5\x8a\xb9"), glowBox);
+    glowForm->addRow(m_glowEnabled);
+    m_glowRadius = new QDoubleSpinBox(glowBox);
+    m_glowRadius->setRange(0.0, 64.0); m_glowRadius->setValue(8.0); m_glowRadius->setSingleStep(0.5);
+    glowForm->addRow(QString::fromUtf8("\xe5\x8d\x8a\xe5\xbe\x84:"), m_glowRadius); // 半径
+    m_glowColorBtn = new QPushButton(QStringLiteral("Color"), glowBox);
+    applyColorButtonStyle(m_glowColorBtn, m_glowColor);
+    connect(m_glowColorBtn, &QPushButton::clicked, this, [this, applyColorButtonStyle]() {
+        QColor c = QColorDialog::getColor(m_glowColor, this,
+            QString::fromUtf8("\xe3\x82\xb0\xe3\x83\xad\xe3\x83\xbc\xe8\x89\xb2"), // グロー色
+            QColorDialog::ShowAlphaChannel);
+        if (c.isValid()) { m_glowColor = c; applyColorButtonStyle(m_glowColorBtn, c); }
+    });
+    glowForm->addRow(QString::fromUtf8("\xe8\x89\xb2:"), m_glowColorBtn);
+    m_glowOpacity = new QDoubleSpinBox(glowBox);
+    m_glowOpacity->setRange(0.0, 1.0); m_glowOpacity->setValue(0.9); m_glowOpacity->setSingleStep(0.05);
+    glowForm->addRow(QString::fromUtf8("\xe4\xb8\x8d\xe9\x80\x8f\xe6\x98\x8e\xe5\xba\xa6:"), m_glowOpacity);
+    layout->addWidget(glowBox);
+
+    // --- Outline (stroke) ---
+    auto *outlineBox = new QGroupBox(QString::fromUtf8("\xe3\x82\xa2\xe3\x82\xa6\xe3\x83\x88\xe3\x83\xa9\xe3\x82\xa4\xe3\x83\xb3"), this); // アウトライン
+    auto *outlineForm = new QFormLayout(outlineBox);
+    m_outlineEnabled = new QCheckBox(QString::fromUtf8("\xe6\x9c\x89\xe5\x8a\xb9"), outlineBox);
+    m_outlineEnabled->setChecked(true); // historical default — outline was always drawn when width>0
+    outlineForm->addRow(m_outlineEnabled);
+    m_outlineWidth = new QSpinBox(outlineBox);
+    m_outlineWidth->setRange(0, 32); m_outlineWidth->setValue(2);
+    outlineForm->addRow(QString::fromUtf8("\xe5\xb9\x85:"), m_outlineWidth); // 幅
+    m_outlineColorBtn = new QPushButton(QStringLiteral("Color"), outlineBox);
+    applyColorButtonStyle(m_outlineColorBtn, m_outlineColor);
+    connect(m_outlineColorBtn, &QPushButton::clicked, this, [this, applyColorButtonStyle]() {
+        QColor c = QColorDialog::getColor(m_outlineColor, this,
+            QString::fromUtf8("\xe3\x82\xa2\xe3\x82\xa6\xe3\x83\x88\xe3\x83\xa9\xe3\x82\xa4\xe3\x83\xb3\xe8\x89\xb2"), // アウトライン色
+            QColorDialog::ShowAlphaChannel);
+        if (c.isValid()) { m_outlineColor = c; applyColorButtonStyle(m_outlineColorBtn, c); }
+    });
+    outlineForm->addRow(QString::fromUtf8("\xe8\x89\xb2:"), m_outlineColorBtn);
+    layout->addWidget(outlineBox);
+
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     layout->addWidget(buttons);
     connect(buttons, &QDialogButtonBox::accepted, this, [this]() {
@@ -168,6 +244,22 @@ void TextOverlayDialog::setupUI()
         m_result.y = m_ySpin->value();
         m_result.startTime = m_startSpin->value();
         m_result.endTime = m_endSpin->value();
+        // Effect groups — disabled groups still write their config so a
+        // toggle doesn't lose the user's tuning, only the bool flips.
+        m_result.shadow        = m_shadowEnabled->isChecked();
+        m_result.shadowOffsetX = m_shadowOffX->value();
+        m_result.shadowOffsetY = m_shadowOffY->value();
+        m_result.shadowBlur    = m_shadowBlur->value();
+        m_result.shadowColor   = m_shadowColor;
+        m_result.shadowOpacity = m_shadowOpacity->value();
+        m_result.glow          = m_glowEnabled->isChecked();
+        m_result.glowRadius    = m_glowRadius->value();
+        m_result.glowColor     = m_glowColor;
+        m_result.glowOpacity   = m_glowOpacity->value();
+        // Outline width=0 disables the existing renderer path; honour the
+        // explicit checkbox by zeroing width when the user unchecks it.
+        m_result.outlineWidth  = m_outlineEnabled->isChecked() ? m_outlineWidth->value() : 0;
+        m_result.outlineColor  = m_outlineColor;
         accept();
     });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);

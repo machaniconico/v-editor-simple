@@ -33,6 +33,28 @@ private:
     QComboBox *m_positionPreset;
     QColor m_textColor = Qt::white;
     QColor m_bgColor = QColor(0, 0, 0, 160);
+
+    // --- Drop shadow ---
+    QCheckBox *m_shadowEnabled = nullptr;
+    QDoubleSpinBox *m_shadowOffX = nullptr;
+    QDoubleSpinBox *m_shadowOffY = nullptr;
+    QDoubleSpinBox *m_shadowBlur = nullptr;
+    QPushButton *m_shadowColorBtn = nullptr;
+    QDoubleSpinBox *m_shadowOpacity = nullptr;
+    QColor m_shadowColor = QColor(0, 0, 0, 200);
+
+    // --- Outer glow ---
+    QCheckBox *m_glowEnabled = nullptr;
+    QDoubleSpinBox *m_glowRadius = nullptr;
+    QPushButton *m_glowColorBtn = nullptr;
+    QDoubleSpinBox *m_glowOpacity = nullptr;
+    QColor m_glowColor = QColor(255, 255, 0, 255);
+
+    // --- Outline (stroke) ---
+    QCheckBox *m_outlineEnabled = nullptr;
+    QSpinBox *m_outlineWidth = nullptr;
+    QPushButton *m_outlineColorBtn = nullptr;
+    QColor m_outlineColor = Qt::black;
 };
 
 // Persistence layer for user-saved Transition presets. Backed by
