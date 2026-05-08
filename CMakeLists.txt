@@ -51,6 +51,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/VideoEffectDialogs.cpp
     src/ColorWheelWidget.cpp
     src/ColorGradingPanel.cpp
+    src/CurveEditor.cpp
+    src/HueVsSatEditor.cpp
+    src/HueVsSatEditor.h
     src/Keyframe.cpp
     src/EffectPlugin.cpp
     src/ProjectFile.cpp
@@ -61,12 +64,16 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AutoEdit.cpp
     src/ThemeManager.cpp
     src/MultiCam.cpp
+    src/MultiCamDialog.cpp
+    src/MultiCamDialog.h
     src/TextManager.cpp
+    src/TitlePresetDialog.cpp
     src/TextInteractive.cpp
     src/GradientStopBar.cpp
     src/EffectPreset.cpp
     src/SubtitleGenerator.cpp
     src/MotionTracker.cpp
+    src/MotionStabilizer.cpp
     src/TrackerLink.cpp
     src/NoiseReduction.cpp
     src/ResourceGuide.cpp
@@ -76,18 +83,33 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ProxyManagementDialog.cpp
     src/DecoderSlotManager.cpp
     src/AudioMixer.cpp
+    src/EqualizerPanel.cpp
+    src/EqualizerPanel.h
+    src/CompressorPanel.cpp
+    src/CompressorPanel.h
+    src/ReverbPanel.cpp
+    src/ReverbPanel.h
+    src/NoiseReductionPanel.cpp
+    src/NoiseReductionPanel.h
     src/AudioMeterWidget.cpp
     src/AudioMeterWidget.h
     src/HistoryDockWidget.cpp
     src/HistoryDockWidget.h
     src/LutImporter.cpp
     src/TimelineMarker.cpp
+    src/AdjustmentLayer.cpp
+    src/AdjustmentLayer.h
     src/VideoStabilizer.cpp
     src/SpeedRamp.cpp
+    src/SpeedRampData.cpp
+    src/SpeedRampData.h
     src/RenderQueue.cpp
+    src/RenderQueueDialog.cpp
+    src/RenderQueueDialog.h
     src/AudioEQ.cpp
     src/ScreenRecorder.cpp
     src/AIHighlight.cpp
+    src/SceneDetector.cpp
     src/LayerCompositor.cpp
     src/TransformAnimator.cpp
     src/MaskSystem.cpp

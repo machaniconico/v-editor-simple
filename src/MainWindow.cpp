@@ -10,6 +10,17 @@
 #include "LumetriScopes.h"
 #include <QDockWidget>
 #include "GLPreview.h"
+#include "EqualizerPanel.h"
+#include "CompressorPanel.h"
+#include "ReverbPanel.h"
+#include "NoiseReductionPanel.h"
+#include "TitlePresetDialog.h"
+#include "MultiCamDialog.h"
+#include "RenderQueueDialog.h"
+#include "SceneDetector.h"
+#include "MotionStabilizer.h"
+#include "AdjustmentLayer.h"
+#include "SpeedRampData.h"
 #include "ProxyManager.h"
 #include "ProxyProgressDialog.h"
 #include "ProxyManagementDialog.h"
@@ -176,6 +187,10 @@ void MainWindow::setupUI()
     connect(m_player, &VideoPlayer::proxySettingsRequested,
             this, &MainWindow::openProxySettings);
     m_timeline = new Timeline(this);
+    // US-INT-1: hand the Timeline to GLPreview so paintGL can compose any
+    // adjustment layers covering the current timeline position.
+    if (m_player->glPreview())
+        m_player->glPreview()->setTimeline(m_timeline);
 
     // Welcome widget (shown when empty)
     m_welcomeWidget = new WelcomeWidget(this);
@@ -442,6 +457,20 @@ void MainWindow::setupMenuBar()
 
     fileMenu->addSeparator();
 
+    fileMenu->addSeparator();
+
+    // Premiere Multicam / Resolve Multicam Sync (simplified) parity —
+    // standalone dialog that builds a MultiCamProject EDL.
+    auto *multiCamDialogAction = fileMenu->addAction("マルチカメラ...");
+    connect(multiCamDialogAction, &QAction::triggered, this, &MainWindow::openMultiCamDialog);
+
+    // Premiere Media Encoder / Resolve Deliver page parity — modeless
+    // dialog that lists pending / running / completed export jobs.
+    auto *renderQueueDialogAction = fileMenu->addAction("レンダーキュー...");
+    connect(renderQueueDialogAction, &QAction::triggered, this, &MainWindow::openRenderQueueDialog);
+
+    fileMenu->addSeparator();
+
     auto *exportAction = fileMenu->addAction("エクスポート(&E)...");
     exportAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_E));
     connect(exportAction, &QAction::triggered, this, &MainWindow::exportVideo);
@@ -515,6 +544,26 @@ void MainWindow::setupMenuBar()
     auto *speedAction = editMenu->addAction("再生速度を設定...");
     connect(speedAction, &QAction::triggered, this, &MainWindow::setClipSpeed);
 
+    // Premiere "Speed / Duration" parity — applies a flat SpeedRamp
+    // curve to the selected clip via Timeline.
+    auto *speedRampDialogAction = editMenu->addAction("速度 / 持続時間...");
+    speedRampDialogAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_R));
+    connect(speedRampDialogAction, &QAction::triggered, this, &MainWindow::openSpeedRampDialog);
+
+    editMenu->addSeparator();
+
+    // Streaming chi-squared histogram cut detector (SceneDetector).
+    // Decodes a sample of frames from the active clip and, for each
+    // detected cut, drops a Timeline marker.
+    auto *sceneDetectAction = editMenu->addAction("シーン検出 (自動)...");
+    connect(sceneDetectAction, &QAction::triggered, this, &MainWindow::openSceneDetector);
+
+    // MotionStabilizer — analyses the active clip for camera shake and
+    // either bakes counter-translation keyframes (when supported) or
+    // reports the result to the status bar (deferred integration).
+    auto *stabilizeAct = editMenu->addAction("スタビライズ (手ブレ補正)...");
+    connect(stabilizeAct, &QAction::triggered, this, &MainWindow::runMotionStabilizer);
+
     editMenu->addSeparator();
 
     auto *shortcutAction = editMenu->addAction("キーボードショートカット(&K)...");
@@ -572,6 +621,19 @@ void MainWindow::setupMenuBar()
 
     auto *addPipAction = insertMenu->addAction("ピクチャー・イン・ピクチャー追加...");
     connect(addPipAction, &QAction::triggered, this, &MainWindow::addPip);
+
+    insertMenu->addSeparator();
+
+    // Premiere Essential Graphics / Resolve Fusion Titles parity.
+    auto *titlePresetAction = insertMenu->addAction("タイトルプリセット...");
+    titlePresetAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Y));
+    connect(titlePresetAction, &QAction::triggered, this, &MainWindow::openTitlePresetDialog);
+
+    // Photoshop / Premiere "Adjustment Layer" — a special timeline clip
+    // that carries no video content of its own but applies grading
+    // parameters to every video frame underneath.
+    auto *addAdjustmentAction = insertMenu->addAction("調整レイヤー");
+    connect(addAdjustmentAction, &QAction::triggered, this, &MainWindow::addAdjustmentLayerCmd);
 
     // オーディオ メニュー
     auto *audioMenu = menuBar()->addMenu("オーディオ(&A)");
@@ -723,12 +785,53 @@ void MainWindow::setupMenuBar()
     auto *duckSettingsAction = audioMenu->addAction("Auto-Duck Settings...");
     connect(duckSettingsAction, &QAction::triggered, this, &MainWindow::openAutoDuckSettings);
 
+    audioMenu->addSeparator();
+
+    // Per-track DSP panels (4-band EQ, compressor/limiter, Schroeder
+    // reverb, noise reduction). Each opens / toggles a right-docked
+    // QDockWidget that owns the panel widget; on change the panel signal
+    // calls AudioMixer::setEqForTrack / setCompressorForTrack /
+    // setReverbForTrack / setNoiseReductionForTrack.
+    auto *eqPanelAction = audioMenu->addAction("EQ パネル...");
+    connect(eqPanelAction, &QAction::triggered, this, &MainWindow::openEqualizerPanel);
+
+    auto *compPanelAction = audioMenu->addAction("コンプレッサー / リミッター...");
+    connect(compPanelAction, &QAction::triggered, this, &MainWindow::openCompressorPanel);
+
+    auto *reverbPanelAction = audioMenu->addAction("リバーブ...");
+    connect(reverbPanelAction, &QAction::triggered, this, &MainWindow::openReverbPanel);
+
+    auto *nrPanelAction = audioMenu->addAction("ノイズリダクション...");
+    connect(nrPanelAction, &QAction::triggered, this, &MainWindow::openNoiseReductionPanel);
+
     // マーカー メニュー
     auto *markersMenu = menuBar()->addMenu("マーカー(&K)");
 
     auto *addMarkerAction = markersMenu->addAction("再生ヘッドにマーカー追加");
     addMarkerAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_M));
     connect(addMarkerAction, &QAction::triggered, this, &MainWindow::addMarker);
+
+    // Quick "M" key — Premiere/Resolve parity. Uses default red marker
+    // colour and an empty label so the user gets a marker without a
+    // dialog interrupt; rename via 全マーカーを表示...
+    auto *quickMarkerAction = markersMenu->addAction("マーカー追加 (クイック)");
+    quickMarkerAction->setShortcut(QKeySequence(Qt::Key_M));
+    connect(quickMarkerAction, &QAction::triggered, this, &MainWindow::addQuickMarker);
+
+    // Shift+M — open colour picker first, then drop a marker tagged with
+    // the chosen colour. Persists colour into Timeline marker data via
+    // Timeline::addMarker(timelineUs, label, color).
+    auto *colouredMarkerAction = markersMenu->addAction("色付きマーカー追加...");
+    colouredMarkerAction->setShortcut(QKeySequence(Qt::SHIFT | Qt::Key_M));
+    connect(colouredMarkerAction, &QAction::triggered, this, &MainWindow::addColoredMarker);
+
+    auto *nextMarkerAction = markersMenu->addAction("次のマーカーへジャンプ");
+    nextMarkerAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Right));
+    connect(nextMarkerAction, &QAction::triggered, this, &MainWindow::jumpToNextMarker);
+
+    auto *prevMarkerAction = markersMenu->addAction("前のマーカーへジャンプ");
+    prevMarkerAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Left));
+    connect(prevMarkerAction, &QAction::triggered, this, &MainWindow::jumpToPrevMarker);
 
     auto *showMarkersAction = markersMenu->addAction("全マーカーを表示...");
     connect(showMarkersAction, &QAction::triggered, this, &MainWindow::showMarkers);
@@ -1020,6 +1123,143 @@ void MainWindow::setupMenuBar()
                      static_cast<double>(cw.gain.z()),
                      cw.gainLuma};
         m_player->glPreview()->setLiftGammaGain(values);
+    });
+
+    // US-CG-1: wire ColorGradingPanel RGB Curves → GLPreview shader.
+    // ColorGradingPanel re-emits CurveEditor::curvesChanged here.
+    connect(m_colorGradingPanel, &ColorGradingPanel::curvesChanged,
+            this, [this](const QVector<QVector<int>> &curves) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setRgbCurves(curves);
+    });
+
+    // US-CG-2: wire ColorGradingPanel White-Balance sliders → GLPreview uWb.
+    // Sits at the very top of the grade chain (BEFORE LGG / curves / LUT).
+    connect(m_colorGradingPanel, &ColorGradingPanel::whiteBalanceChanged,
+            this, [this](float r, float g, float b) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setWhiteBalance(r, g, b);
+    });
+
+    // US-CG-3: wire ColorGradingPanel Vignette sliders → GLPreview uVig*.
+    // Applied AFTER curves (US-CG-1) and BEFORE the .cube LUT (US-WIRE-1).
+    connect(m_colorGradingPanel, &ColorGradingPanel::vignetteChanged,
+            this, [this](float amount, float midpoint, float roundness, float feather) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setVignette(amount, midpoint, roundness, feather);
+    });
+
+    // US-CG-4: wire ColorGradingPanel Hue vs Saturation curve →
+    // GLPreview::setHueVsSatLut. ColorGradingPanel re-emits the embedded
+    // HueVsSatEditor's hueVsSatChanged signal here.
+    connect(m_colorGradingPanel, &ColorGradingPanel::hueVsSatChanged,
+            this, [this](const QVector<float> &lut) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setHueVsSatLut(lut);
+    });
+
+    // US-EF-1: wire ColorGradingPanel Chroma Key controls → GLPreview
+    // uChroma* uniforms. Applied at the very TOP of the compose path (BEFORE
+    // WB / LGG / curves / vignette / LUT) so the HSL gating + spill suppress
+    // operate on raw frame colour. enabled=false is a free no-op.
+    connect(m_colorGradingPanel, &ColorGradingPanel::chromaKeyChanged,
+            this, [this](bool enabled, float keyH, float keyS, float keyL,
+                         float hueTol, float satTol, float lumTol,
+                         float spill, float softness) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setChromaKey(enabled, keyH, keyS, keyL,
+                                            hueTol, satTol, lumTol,
+                                            spill, softness);
+    });
+
+    // US-EF-2: wire ColorGradingPanel Mask controls → GLPreview uMask*
+    // uniforms. The mask wraps the entire grade chain so the colour grade
+    // applies INSIDE the mask region (or outside when invert=true).
+    // enabled=false is a free no-op.
+    connect(m_colorGradingPanel, &ColorGradingPanel::maskChanged,
+            this, [this](bool enabled, bool ellipse, bool invert, float feather,
+                         QRectF rect) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setMask(enabled, ellipse, invert, feather, rect);
+    });
+
+    // US-EF-3: wire ColorGradingPanel HSL Qualifier controls → GLPreview
+    // uHslq* uniforms. The qualifier sits AFTER chroma key and BEFORE WB so
+    // it operates on raw frame colour and applies a SECONDARY lift/gamma/
+    // gain only inside the qualified hue/sat/luma region. enabled=false is
+    // a free no-op (entire shader stage skipped).
+    connect(m_colorGradingPanel, &ColorGradingPanel::hslQualifierChanged,
+            this, [this](bool enabled,
+                         float hueCenter, float hueRange,
+                         float satMin, float satMax,
+                         float lumaMin, float lumaMax,
+                         float softness,
+                         float liftR, float liftG, float liftB,
+                         float gammaR, float gammaG, float gammaB,
+                         float gainR, float gainG, float gainB) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setHslQualifier(enabled,
+                                               hueCenter, hueRange,
+                                               satMin, satMax,
+                                               lumaMin, lumaMax,
+                                               softness,
+                                               liftR, liftG, liftB,
+                                               gammaR, gammaG, gammaB,
+                                               gainR, gainG, gainB);
+    });
+
+    // US-EF-4: Effects shader pack — Sharpen / Gaussian Blur / Lens
+    // Distortion. ColorGradingPanel emits the raw slider scalars; GLPreview
+    // applies the per-stage multipliers (×0.01 / px / ×0.01) inside the
+    // fragment shader. Identity (0, 0, 0) is a free no-op (the shader's
+    // |amount|>eps tests skip each kernel/transform entirely).
+    connect(m_colorGradingPanel, &ColorGradingPanel::effectsPackChanged,
+            this, [this](float sharpen, float blur, float lens) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setSharpen(sharpen);
+        m_player->glPreview()->setBlur(blur);
+        m_player->glPreview()->setLensDistortion(lens);
+    });
+
+    // US-3D: 3-axis rotation + perspective foreshortening (Premiere "Basic
+    // 3D" / Resolve "Transform" 3D rotation parity). Forwarded directly to
+    // GLPreview::setRotation3D, which builds the 3x3 rotation matrix on the
+    // CPU (intrinsic Tait-Bryan XYZ) and ships it to the fragment shader.
+    // Identity (0,0,0,2.0) is a free no-op — the shader detects identity
+    // and skips the warp entirely.
+    connect(m_colorGradingPanel, &ColorGradingPanel::rotation3DChanged,
+            this, [this](float xDeg, float yDeg, float zDeg, float persDist) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setRotation3D(xDeg, yDeg, zDeg, persDist);
+    });
+
+    // US-EF-2: "マスクを描画" → enter the mask drawing overlay on the
+    // VideoPlayer. The callback feeds the normalized QRectF back to the
+    // panel via setMaskRect, which re-emits maskChanged so GLPreview picks
+    // up the new geometry. Reuses the US-WIRE-3 region picker overlay.
+    connect(m_colorGradingPanel, &ColorGradingPanel::requestMaskDraw,
+            this, [this]() {
+        if (!m_player || !m_colorGradingPanel)
+            return;
+        ColorGradingPanel *panel = m_colorGradingPanel;
+        m_player->enterMaskEditMode([panel](QRectF normalizedRect) {
+            if (!panel) return;
+            // QRectF() (Esc / aborted drag) is silently ignored.
+            if (!normalizedRect.isValid()
+                || normalizedRect.width() <= 0.0
+                || normalizedRect.height() <= 0.0)
+                return;
+            panel->setMaskRect(normalizedRect);
+        });
     });
 
     viewMenu->addSeparator();
@@ -2899,13 +3139,88 @@ void MainWindow::trackMotion()
             [this, progress](const TrackingResult &result) {
                 progress->close();
                 progress->deleteLater();
-                if (!result.isEmpty()) {
-                    QMessageBox::information(this, "Motion Tracking",
-                        QString("Tracking complete: %1 frames tracked.")
-                            .arg(result.regions.size()));
-                } else {
-                    QMessageBox::warning(this, "Motion Tracking", "Tracking produced no results.");
+                if (result.isEmpty()) {
+                    QMessageBox::warning(this,
+                        QString::fromUtf8("\xe3\x83\x88\xe3\x83\xa9\xe3\x83\x83\xe3\x82\xad\xe3\x83\xb3\xe3\x82\xb0"),
+                        QString::fromUtf8("\xe3\x83\x88\xe3\x83\xa9\xe3\x83\x83\xe3\x82\xad\xe3\x83\xb3\xe3\x82\xb0\xe7\xb5\x90\xe6\x9e\x9c\xe3\x81\x8c\xe7\xa9\xba\xe3\x81\xa7\xe3\x81\x99"));
+                    return;
                 }
+
+                const auto &vClips = m_timeline->videoClips();
+                if (vClips.isEmpty()) return;
+                const auto &mgr = vClips[0].textManager;
+                const int overlayCount = mgr.count();
+
+                if (overlayCount == 0) {
+                    QMessageBox::information(this,
+                        QString::fromUtf8("\xe3\x83\x88\xe3\x83\xa9\xe3\x83\x83\xe3\x82\xad\xe3\x83\xb3\xe3\x82\xb0\xe7\xb5\x90\xe6\x9e\x9c\xe3\x82\x92\xe9\x81\xa9\xe7\x94\xa8"),
+                        QString::fromUtf8("\xe9\x81\xa9\xe7\x94\xa8\xe5\x85\x88\xe3\x81\xae\xe3\x82\xaa\xe3\x83\xbc\xe3\x83\x90\xe3\x83\xbc\xe3\x83\xac\xe3\x82\xa4\xe3\x81\x8c\xe3\x81\x82\xe3\x82\x8a\xe3\x81\xbe\xe3\x81\x9b\xe3\x82\x93\xe3\x80\x82\xe5\x85\x88\xe3\x81\xab\xe3\x83\x86\xe3\x82\xad\xe3\x82\xb9\xe3\x83\x88\xe3\x82\xaa\xe3\x83\xbc\xe3\x83\x90\xe3\x83\xbc\xe3\x83\xac\xe3\x82\xa4\xe3\x82\x92\xe8\xbf\xbd\xe5\x8a\xa0\xe3\x81\x97\xe3\x81\xa6\xe3\x81\x8f\xe3\x81\xa0\xe3\x81\x95\xe3\x81\x84\xe3\x80\x82"));
+                    return;
+                }
+
+                QDialog dlg(this);
+                dlg.setWindowTitle(QString::fromUtf8("\xe3\x83\x88\xe3\x83\xa9\xe3\x83\x83\xe3\x82\xad\xe3\x83\xb3\xe3\x82\xb0\xe7\xb5\x90\xe6\x9e\x9c\xe3\x82\x92\xe9\x81\xa9\xe7\x94\xa8"));
+                auto *layout = new QVBoxLayout(&dlg);
+
+                auto *label = new QLabel(
+                    QString("Tracking complete: %1 frames tracked.\n"
+                            "\xe9\x81\xa9\xe7\x94\xa8\xe5\x85\x88\xe3\x82\xaa\xe3\x83\xbc\xe3\x83\x90\xe3\x83\xbc\xe3\x83\xac\xe3\x82\xa4\xe3\x82\x92\xe9\x81\xb8\xe6\x8a\x9e\xe3\x81\x97\xe3\x81\xa6\xe3\x81\x8f\xe3\x81\xa0\xe3\x81\x95\xe3\x81\x84:")
+                        .arg(result.regions.size()), &dlg);
+                label->setWordWrap(true);
+                layout->addWidget(label);
+
+                auto *combo = new QComboBox(&dlg);
+                for (int i = 0; i < overlayCount; ++i) {
+                    const auto &ov = mgr.overlay(i);
+                    combo->addItem(
+                        QString("%1: \"%2\"")
+                            .arg(i + 1)
+                            .arg(ov.text.left(30)),
+                        i);
+                }
+                layout->addWidget(combo);
+
+                auto *btnBox = new QDialogButtonBox(
+                    QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+                connect(btnBox, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+                connect(btnBox, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+                layout->addWidget(btnBox);
+
+                if (dlg.exec() != QDialog::Accepted)
+                    return;
+
+                const int selIdx = combo->currentData().toInt();
+                const auto &overlays = mgr.overlays();
+                if (selIdx < 0 || selIdx >= overlays.size())
+                    return;
+
+                EnhancedTextOverlay selOverlay = overlays[selIdx];
+
+                if (!selOverlay.positionKeyframes.isEmpty()) {
+                    const int ret = QMessageBox::question(this,
+                        QString::fromUtf8("\xe3\x82\xad\xe3\x83\xbc\xe3\x83\x95\xe3\x83\xac\xe3\x83\xbc\xe3\x83\xa0\xe7\xa2\xba\xe8\xaa\x8d"),
+                        QString::fromUtf8("\xe3\x81\x93\xe3\x81\xae\xe3\x82\xaa\xe3\x83\xbc\xe3\x83\x90\xe3\x83\xbc\xe3\x83\xac\xe3\x82\xa4\xe3\x81\xab\xe3\x81\xaf\xe6\x97\xa2\xe5\xad\x98\xe3\x81\xae\xe3\x83\x88\xe3\x83\xa9\xe3\x83\x83\xe3\x82\xad\xe3\x83\xb3\xe3\x82\xb0\xe3\x82\xad\xe3\x83\xbc\xe3\x83\x95\xe3\x83\xac\xe3\x83\xbc\xe3\x83\xa0\xe3\x81\x8c\xe3\x81\x82\xe3\x82\x8a\xe3\x81\xbe\xe3\x81\x99\xe3\x80\x82\n\xe6\x97\xa2\xe5\xad\x98\xe3\x81\xae\xe3\x82\xad\xe3\x83\xbc\xe3\x83\x95\xe3\x83\xac\xe3\x83\xbc\xe3\x83\xa0\xe3\x82\x92\xe4\xb8\x8a\xe6\x9b\xb8\xe3\x81\x8d\xe3\x81\x97\xe3\x81\xbe\xe3\x81\x99\xe3\x81\x8b\xef\xbc\x9f"),
+                        QMessageBox::Yes | QMessageBox::No);
+                    if (ret != QMessageBox::Yes)
+                        return;
+                }
+
+                TrackerLink::applyToOverlay(&selOverlay,
+                    result, m_projectConfig.fps);
+                m_timeline->applyTrackingToOverlay(selIdx, selOverlay);
+
+                {
+                    const auto &updatedMgr = m_timeline->videoClips()[0].textManager;
+                    QVector<EnhancedTextOverlay> ovList;
+                    for (int i = 0; i < updatedMgr.count(); ++i)
+                        ovList.append(updatedMgr.overlay(i));
+                    m_player->setTextOverlays(ovList);
+                }
+
+                statusBar()->showMessage(
+                    QString::fromUtf8("\xe3\x83\x88\xe3\x83\xa9\xe3\x83\x83\xe3\x82\xad\xe3\x83\xb3\xe3\x82\xb0\xe3\x82\x92\xe9\x81\xa9\xe7\x94\xa8\xe3\x81\x97\xe3\x81\xbe\xe3\x81\x97\xe3\x81\x9f: %1\xe3\x83\x95\xe3\x83\xac\xe3\x83\xbc\xe3\x83\xa0\xe2\x86\x92\"%2\"")
+                        .arg(selOverlay.positionKeyframes.size())
+                        .arg(selOverlay.text.left(20)));
             }, Qt::UniqueConnection);
 
         connect(progress, &QProgressDialog::canceled, this, [this]() {
@@ -5029,4 +5344,591 @@ void MainWindow::onMeterRequestResetAllMeters()
         meter->resetPeakHold();
     if (m_masterMeter)
         m_masterMeter->resetPeakHold();
+}
+
+// =============================================================
+// Consolidation slots — wire panels and dialogs implemented in
+// earlier sprint stories into the menu bar.
+// =============================================================
+
+namespace {
+// Build the (itemNames, trackIds) lists EqualizerPanel::setTracks expects.
+// Convention: id 0 = Master, ids 1..N = A1..An audio tracks (in order).
+static void buildAudioTrackList(int audioTrackCount,
+                                QStringList &itemNames,
+                                QList<int> &trackIds,
+                                bool includeMaster = true)
+{
+    itemNames.clear();
+    trackIds.clear();
+    if (includeMaster) {
+        itemNames << QStringLiteral("Master");
+        trackIds << 0;
+    }
+    for (int i = 0; i < audioTrackCount; ++i) {
+        itemNames << QStringLiteral("A%1").arg(i + 1);
+        trackIds << (i + 1);
+    }
+}
+} // namespace
+
+void MainWindow::openEqualizerPanel()
+{
+    auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    if (!mixer) {
+        QMessageBox::information(this, tr("EQ パネル"),
+            tr("オーディオミキサーが利用できません。"));
+        return;
+    }
+
+    if (!m_equalizerDock) {
+        m_equalizerDock = new QDockWidget(tr("EQ"), this);
+        m_equalizerDock->setObjectName("EqualizerDock");
+        auto *panel = new EqualizerPanel(m_equalizerDock);
+        m_equalizerDock->setWidget(panel);
+        addDockWidget(Qt::RightDockWidgetArea, m_equalizerDock);
+
+        connect(panel, &EqualizerPanel::eqChanged,
+                this, [this](int trackId, AudioMixer::EqSettings eq) {
+            if (auto *mx = m_player ? m_player->audioMixer() : nullptr)
+                mx->setEqForTrack(trackId, eq);
+        });
+    }
+
+    // Re-seed track list and current per-track settings on every show
+    // so newly added audio tracks appear without restart.
+    if (auto *panel = qobject_cast<EqualizerPanel *>(m_equalizerDock->widget())) {
+        QStringList names;
+        QList<int> ids;
+        const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
+        buildAudioTrackList(trackCount, names, ids);
+        panel->setTracks(names, ids);
+        for (int id : ids)
+            panel->setEqSettings(id, mixer->eqForTrack(id));
+    }
+    m_equalizerDock->setVisible(true);
+    m_equalizerDock->raise();
+}
+
+void MainWindow::openCompressorPanel()
+{
+    auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    if (!mixer) {
+        QMessageBox::information(this, tr("コンプレッサー"),
+            tr("オーディオミキサーが利用できません。"));
+        return;
+    }
+
+    if (!m_compressorDock) {
+        m_compressorDock = new QDockWidget(tr("Compressor / Limiter"), this);
+        m_compressorDock->setObjectName("CompressorDock");
+        auto *panel = new CompressorPanel(m_compressorDock);
+        panel->setMixer(mixer);
+        m_compressorDock->setWidget(panel);
+        addDockWidget(Qt::RightDockWidgetArea, m_compressorDock);
+
+        connect(panel, &CompressorPanel::compressorChanged,
+                this, [this](int trackId, AudioMixer::CompressorSettings c) {
+            if (auto *mx = m_player ? m_player->audioMixer() : nullptr)
+                mx->setCompressorForTrack(trackId, c);
+        });
+    }
+
+    if (auto *panel = qobject_cast<CompressorPanel *>(m_compressorDock->widget())) {
+        QStringList names;
+        QList<int> ids;
+        const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
+        buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
+        // CompressorPanel::setTrackList accepts the active track ids and
+        // inserts the master row (id 0) itself.
+        panel->setTrackList(ids);
+        for (int id : ids)
+            panel->loadSettings(id, mixer->compressorForTrack(id));
+        panel->loadSettings(0, mixer->compressorForTrack(0));
+    }
+    m_compressorDock->setVisible(true);
+    m_compressorDock->raise();
+}
+
+void MainWindow::openReverbPanel()
+{
+    auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    if (!mixer) {
+        QMessageBox::information(this, tr("リバーブ"),
+            tr("オーディオミキサーが利用できません。"));
+        return;
+    }
+
+    if (!m_reverbDock) {
+        m_reverbDock = new QDockWidget(tr("Reverb"), this);
+        m_reverbDock->setObjectName("ReverbDock");
+        auto *panel = new ReverbPanel(m_reverbDock);
+        panel->setMixer(mixer);
+        m_reverbDock->setWidget(panel);
+        addDockWidget(Qt::RightDockWidgetArea, m_reverbDock);
+
+        connect(panel, &ReverbPanel::reverbChanged,
+                this, [this](int trackId, AudioMixer::ReverbSettings r) {
+            if (auto *mx = m_player ? m_player->audioMixer() : nullptr)
+                mx->setReverbForTrack(trackId, r);
+        });
+    }
+
+    if (auto *panel = qobject_cast<ReverbPanel *>(m_reverbDock->widget())) {
+        QStringList names;
+        QList<int> ids;
+        const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
+        buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
+        panel->setTrackList(ids);
+        for (int id : ids)
+            panel->loadSettings(id, mixer->reverbForTrack(id));
+        panel->loadSettings(0, mixer->reverbForTrack(0));
+    }
+    m_reverbDock->setVisible(true);
+    m_reverbDock->raise();
+}
+
+void MainWindow::openNoiseReductionPanel()
+{
+    auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    if (!mixer) {
+        QMessageBox::information(this, tr("ノイズリダクション"),
+            tr("オーディオミキサーが利用できません。"));
+        return;
+    }
+
+    if (!m_noiseReductionDock) {
+        m_noiseReductionDock = new QDockWidget(tr("Noise Reduction"), this);
+        m_noiseReductionDock->setObjectName("NoiseReductionDock");
+        auto *panel = new NoiseReductionPanel(m_noiseReductionDock);
+        panel->setMixer(mixer);
+        m_noiseReductionDock->setWidget(panel);
+        addDockWidget(Qt::RightDockWidgetArea, m_noiseReductionDock);
+
+        connect(panel, &NoiseReductionPanel::noiseReductionChanged,
+                this, [this](int trackId, AudioMixer::NoiseReductionSettings nr) {
+            if (auto *mx = m_player ? m_player->audioMixer() : nullptr)
+                mx->setNoiseReductionForTrack(trackId, nr);
+        });
+    }
+
+    if (auto *panel = qobject_cast<NoiseReductionPanel *>(m_noiseReductionDock->widget())) {
+        QStringList names;
+        QList<int> ids;
+        const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
+        buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
+        panel->setTrackList(ids);
+        for (int id : ids)
+            panel->loadSettings(id, mixer->noiseReductionForTrack(id));
+        panel->loadSettings(0, mixer->noiseReductionForTrack(0));
+    }
+    m_noiseReductionDock->setVisible(true);
+    m_noiseReductionDock->raise();
+}
+
+void MainWindow::openTitlePresetDialog()
+{
+    if (!m_timeline || m_timeline->videoClips().isEmpty()) {
+        QMessageBox::information(this, tr("タイトルプリセット"),
+            tr("先にクリップを追加してください。"));
+        return;
+    }
+
+    TitlePresetDialog dlg(this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    const EnhancedTextOverlay &resolved = dlg.resolvedOverlay();
+    if (m_timeline->videoClips().isEmpty())
+        return;
+
+    // Persist the resolved overlay into V1's first clip via the
+    // existing helper (writes back via setClips internally so the
+    // mutation actually sticks).
+    if (!m_timeline->addTextOverlayToFirstVideoClip(resolved)) {
+        statusBar()->showMessage(
+            tr("タイトルプリセットの適用に失敗しました"), 3000);
+        return;
+    }
+    statusBar()->showMessage(
+        tr("タイトルプリセットを適用しました: %1").arg(resolved.text), 4000);
+}
+
+void MainWindow::openMultiCamDialog()
+{
+    MultiCamDialog dlg(this);
+    if (m_timeline) {
+        const qint64 totalUs =
+            static_cast<qint64>(m_timeline->totalDuration() * 1000000.0);
+        if (totalUs > 0)
+            dlg.setTimelineDurationUs(totalUs);
+    }
+    connect(&dlg, &MultiCamDialog::applyToTimeline,
+            this, &MainWindow::onMultiCamApplyToTimeline);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    const MultiCamProject project = dlg.result();
+    statusBar()->showMessage(
+        tr("マルチカメラ EDL を作成しました (角度: %1, 切替: %2)")
+            .arg(project.angles.size())
+            .arg(project.switches.size()), 4000);
+}
+
+void MainWindow::onMultiCamApplyToTimeline(const MultiCamProject &project)
+{
+    if (!m_timeline) return;
+    if (project.switches.isEmpty() || project.angles.isEmpty()) {
+        statusBar()->showMessage(
+            tr("マルチカメラ: 切替マーカーが無いため適用をスキップしました"), 4000);
+        return;
+    }
+
+    if (!m_timeline->videoClips().isEmpty()) {
+        const auto reply = QMessageBox::question(
+            this, tr("マルチカメラ"),
+            tr("V1 トラックを multi-cam EDL で置き換えますか？\n"
+               "(現在 %1 個のクリップが消去されます)")
+                .arg(m_timeline->videoClips().size()),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);
+        if (reply != QMessageBox::Yes)
+            return;
+    }
+
+    // angle id → angle lookup. Switches reference angles by id (not by
+    // index) so the EDL survives angle reorder/remove in the dialog.
+    QHash<int, MultiCamAngle> angleById;
+    for (const MultiCamAngle &a : project.angles)
+        angleById.insert(a.id, a);
+
+    // Defensive sort — the dialog already keeps switches[] ordered, but a
+    // mis-built project loaded from JSON could violate that.
+    QVector<MultiCamSwitch> sw = project.switches;
+    std::sort(sw.begin(), sw.end(),
+              [](const MultiCamSwitch &a, const MultiCamSwitch &b) {
+                  return a.timelineUs < b.timelineUs;
+              });
+
+    // Tail duration for the final switch — give the last angle a 30 s tail
+    // since switches[] only encodes "when to cut TO" but never an explicit
+    // EOF. Downstream EOF handling (VideoPlayer + AudioMixer) clamps to
+    // the source file length on its own.
+    constexpr qint64 kTailFallbackUs = 30LL * 1000000LL;
+
+    QVector<ClipInfo> v1Clips;
+    QVector<ClipInfo> a1Clips;
+    int skipped = 0;
+
+    qint64 prevTlEndUs = 0;
+    for (int i = 0; i < sw.size(); ++i) {
+        const MultiCamSwitch &cur = sw[i];
+        if (!angleById.contains(cur.activeAngleId)) {
+            ++skipped;
+            continue;
+        }
+        const MultiCamAngle &angle = angleById.value(cur.activeAngleId);
+        if (angle.sourcePath.isEmpty()
+            || !QFileInfo::exists(angle.sourcePath)) {
+            ++skipped;
+            continue;
+        }
+
+        const qint64 segStartTlUs = cur.timelineUs;
+        const qint64 segEndTlUs   = (i + 1 < sw.size())
+            ? sw[i + 1].timelineUs
+            : segStartTlUs + kTailFallbackUs;
+        if (segEndTlUs <= segStartTlUs)
+            continue;
+
+        const qint64 segDurUs = segEndTlUs - segStartTlUs;
+        // syncOffsetUs shifts the source PTS for this angle so multi-cam
+        // sync (clap board / audio align) lands at the same timeline tick.
+        const qint64 srcStartUs =
+            std::max<qint64>(0, segStartTlUs - angle.syncOffsetUs);
+        const qint64 leadInUs   = segStartTlUs - prevTlEndUs;
+
+        ClipInfo videoClip;
+        videoClip.filePath = angle.sourcePath;
+        videoClip.displayName = QFileInfo(angle.sourcePath).fileName();
+        const double srcStartSec = static_cast<double>(srcStartUs) / 1000000.0;
+        const double segDurSec   = static_cast<double>(segDurUs)   / 1000000.0;
+        videoClip.duration = srcStartSec + segDurSec;
+        videoClip.inPoint  = srcStartSec;
+        videoClip.outPoint = srcStartSec + segDurSec;
+        videoClip.leadInSec = static_cast<double>(leadInUs) / 1000000.0;
+
+        v1Clips.append(videoClip);
+
+        // Mirror the same source range to A1 — most camera files carry
+        // embedded audio, and AudioMixer silently outputs zero samples
+        // for missing audio streams.
+        a1Clips.append(videoClip);
+
+        prevTlEndUs = segEndTlUs;
+    }
+
+    if (v1Clips.isEmpty()) {
+        statusBar()->showMessage(
+            tr("マルチカメラ: 有効なセグメントが無く適用を中止しました"), 4000);
+        return;
+    }
+
+    while (m_timeline->videoTrackCount() < 1)
+        m_timeline->addVideoTrack();
+    while (m_timeline->audioTrackCount() < 1)
+        m_timeline->addAudioTrack();
+
+    m_timeline->videoTracks().first()->setClips(v1Clips);
+    m_timeline->audioTracks().first()->setClips(a1Clips);
+    m_timeline->refreshPlaybackSequence();
+
+    if (skipped > 0) {
+        statusBar()->showMessage(
+            tr("マルチカメラ EDL 適用 (V1/A1=%1 セグメント, %2 件スキップ)")
+                .arg(v1Clips.size()).arg(skipped), 6000);
+    } else {
+        statusBar()->showMessage(
+            tr("マルチカメラ EDL を V1/A1 に適用 (%1 セグメント)")
+                .arg(v1Clips.size()), 4000);
+    }
+}
+
+void MainWindow::openRenderQueueDialog()
+{
+    if (!m_renderQueueDialog) {
+        m_renderQueueDialog = new RenderQueueDialog(this);
+        if (m_timeline) {
+            const qint64 totalUs =
+                static_cast<qint64>(m_timeline->totalDuration() * 1000000.0);
+            m_renderQueueDialog->setDefaultTimelineRange(0, totalUs);
+        }
+    }
+    m_renderQueueDialog->show();
+    m_renderQueueDialog->raise();
+    m_renderQueueDialog->activateWindow();
+}
+
+void MainWindow::openSceneDetector()
+{
+    if (!m_timeline || m_timeline->videoClips().isEmpty()) {
+        QMessageBox::information(this, tr("シーン検出"),
+            tr("先にクリップを追加してください。"));
+        return;
+    }
+
+    // Run the existing AutoEdit scene-change analyser (synchronous; the
+    // SceneDetector class is the streaming variant and requires a frame
+    // pump that is deferred). On each detected cut, drop a Timeline
+    // marker at the timestamp.
+    const auto &clips = m_timeline->videoClips();
+    int targetIdx = m_timeline->selectedVideoClipIndex();
+    if (targetIdx < 0 || targetIdx >= clips.size())
+        targetIdx = 0;
+    const ClipInfo &clip = clips[targetIdx];
+
+    statusBar()->showMessage(tr("シーン変化を解析しています..."));
+    QApplication::processEvents();
+
+    auto scenes = AutoEdit::detectSceneChanges(clip.filePath);
+    if (scenes.isEmpty()) {
+        statusBar()->showMessage(tr("シーン変化が検出されませんでした"), 4000);
+        return;
+    }
+
+    // Drop a Timeline marker at every detected cut.
+    const QColor sceneCutColor("#3399ff");
+    int added = 0;
+    for (const auto &s : scenes) {
+        const qint64 timeUs = static_cast<qint64>(s.time * 1000000.0);
+        const QString label = tr("Scene Cut %1").arg(added + 1);
+        m_timeline->addMarker(timeUs, label, sceneCutColor);
+        ++added;
+    }
+    statusBar()->showMessage(
+        tr("シーン検出: %1 個のカットにマーカーを追加しました").arg(added), 5000);
+}
+
+void MainWindow::runMotionStabilizer()
+{
+    if (!m_timeline || m_timeline->videoClips().isEmpty()) {
+        QMessageBox::information(this, tr("スタビライズ"),
+            tr("先にクリップを追加してください。"));
+        return;
+    }
+
+    bool ok = false;
+    int smoothPct = QInputDialog::getInt(this, tr("スタビライズ"),
+        tr("Smoothness (1-100, higher=smoother):"),
+        50, 1, 100, 1, &ok);
+    if (!ok)
+        return;
+
+    // US-INT-4: synchronous analyse + bake. V1 clip 0 only for v1.
+    const auto &clips = m_timeline->videoClips();
+    const ClipInfo &target = clips.first();
+    statusBar()->showMessage(tr("スタビライズ解析中..."), 0);
+    QApplication::processEvents();
+
+    MotionStabilizer stab;
+    stab.setSmoothness(smoothPct / 100.0);
+    QVector<StabilizerKeyframe> kfs = stab.analyzeFile(target.filePath);
+    if (kfs.isEmpty()) {
+        statusBar()->showMessage(
+            tr("スタビライズ失敗: フレームを解析できませんでした"), 6000);
+        return;
+    }
+    m_timeline->setClipStabilizerKeyframes(0, kfs);
+    statusBar()->showMessage(
+        tr("スタビライズ完了: %1 フレーム").arg(kfs.size()), 6000);
+}
+
+void MainWindow::addAdjustmentLayerCmd()
+{
+    if (!m_timeline) {
+        QMessageBox::information(this, tr("調整レイヤー"),
+            tr("タイムラインが利用できません。"));
+        return;
+    }
+
+    AdjustmentLayer layer;
+    // Use playhead as start; default 5-second duration so the layer is
+    // visible in the timeline immediately.
+    const qint64 startUs =
+        static_cast<qint64>(m_timeline->playheadPosition() * 1000000.0);
+    layer.timelineStartUs = startUs;
+    layer.timelineEndUs = startUs + 5LL * 1000000LL;
+    layer.trackIndex = 0;
+    layer.name = tr("Adjustment Layer");
+
+    // Seed grading from the current ColorGradingPanel state if visible
+    // so the user gets a layer that already reflects what they see.
+    if (m_colorGradingPanel) {
+        const ColorWheels cw = m_colorGradingPanel->currentWheels();
+        layer.lift[0]  = cw.lift.x();   layer.lift[1]  = cw.lift.y();
+        layer.lift[2]  = cw.lift.z();   layer.lift[3]  = cw.liftLuma;
+        layer.gamma[0] = cw.gamma.x();  layer.gamma[1] = cw.gamma.y();
+        layer.gamma[2] = cw.gamma.z();  layer.gamma[3] = cw.gammaLuma;
+        layer.gain[0]  = cw.gain.x();   layer.gain[1]  = cw.gain.y();
+        layer.gain[2]  = cw.gain.z();   layer.gain[3]  = cw.gainLuma;
+        layer.gradingEnabled = true;
+    }
+
+    const int newId = m_timeline->addAdjustmentLayer(layer);
+    statusBar()->showMessage(
+        tr("調整レイヤーを追加しました (id=%1, %2s..%3s)")
+            .arg(newId)
+            .arg(layer.timelineStartUs / 1.0e6, 0, 'f', 2)
+            .arg(layer.timelineEndUs / 1.0e6, 0, 'f', 2),
+        4000);
+}
+
+void MainWindow::openSpeedRampDialog()
+{
+    if (!m_timeline || m_timeline->videoClips().isEmpty()) {
+        QMessageBox::information(this, tr("速度 / 持続時間"),
+            tr("先にクリップを追加してください。"));
+        return;
+    }
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, tr("速度 / 持続時間"),
+            tr("クリップを選択してください。"));
+        return;
+    }
+
+    bool ok = false;
+    const double speedMul = QInputDialog::getDouble(this, tr("速度 / 持続時間"),
+        tr("速度倍率 (0.1 - 5.0):"), 1.0, 0.1, 5.0, 2, &ok);
+    if (!ok)
+        return;
+
+    speedramp::SpeedRamp ramp;
+    ramp.clearAndSetIdentity();
+    ramp.addKeyframe(0, speedMul);
+
+    const int clipIdx = m_timeline->selectedVideoClipIndex();
+    if (clipIdx < 0) {
+        QMessageBox::information(this, tr("速度 / 持続時間"),
+            tr("V1 にクリップを選択してください。"));
+        return;
+    }
+    m_timeline->setSpeedRamp(clipIdx, ramp);
+    statusBar()->showMessage(
+        tr("速度ランプを %1x に設定しました (clip #%2)")
+            .arg(speedMul, 0, 'f', 2).arg(clipIdx), 5000);
+}
+
+void MainWindow::addQuickMarker()
+{
+    if (!m_timeline) return;
+    const qint64 timeUs =
+        static_cast<qint64>(m_timeline->playheadPosition() * 1000000.0);
+    const int id = m_timeline->addMarker(timeUs, QStringLiteral("Marker"),
+                                          QColor(QStringLiteral("#ff5050")));
+    statusBar()->showMessage(
+        tr("マーカー追加 (id=%1, %2s)")
+            .arg(id)
+            .arg(timeUs / 1.0e6, 0, 'f', 2), 3000);
+}
+
+void MainWindow::addColoredMarker()
+{
+    if (!m_timeline) return;
+    QColor c = QColorDialog::getColor(QColor(QStringLiteral("#ff5050")),
+                                      this, tr("マーカーの色を選択"));
+    if (!c.isValid())
+        return;
+
+    bool ok = false;
+    QString label = QInputDialog::getText(this, tr("色付きマーカー"),
+        tr("ラベル (空でも可):"), QLineEdit::Normal, QString(), &ok);
+    if (!ok)
+        return;
+
+    const qint64 timeUs =
+        static_cast<qint64>(m_timeline->playheadPosition() * 1000000.0);
+    if (label.isEmpty())
+        label = QStringLiteral("Marker");
+    const int id = m_timeline->addMarker(timeUs, label, c);
+    statusBar()->showMessage(
+        tr("色付きマーカー追加 (id=%1, %2s, %3)")
+            .arg(id)
+            .arg(timeUs / 1.0e6, 0, 'f', 2)
+            .arg(c.name()), 3000);
+}
+
+void MainWindow::jumpToNextMarker()
+{
+    if (!m_timeline) return;
+    const qint64 nowUs =
+        static_cast<qint64>(m_timeline->playheadPosition() * 1000000.0);
+    const int id = m_timeline->nextMarkerAfter(nowUs);
+    if (id < 0) {
+        statusBar()->showMessage(tr("これより後にマーカーがありません"), 2500);
+        return;
+    }
+    const auto m = m_timeline->markerById(id);
+    m_timeline->setPlayheadPosition(m.timelineUs / 1.0e6);
+    statusBar()->showMessage(
+        tr("マーカーへジャンプ: %1 (%2s)")
+            .arg(m.label)
+            .arg(m.timelineUs / 1.0e6, 0, 'f', 2), 2500);
+}
+
+void MainWindow::jumpToPrevMarker()
+{
+    if (!m_timeline) return;
+    const qint64 nowUs =
+        static_cast<qint64>(m_timeline->playheadPosition() * 1000000.0);
+    const int id = m_timeline->prevMarkerBefore(nowUs);
+    if (id < 0) {
+        statusBar()->showMessage(tr("これより前にマーカーがありません"), 2500);
+        return;
+    }
+    const auto m = m_timeline->markerById(id);
+    m_timeline->setPlayheadPosition(m.timelineUs / 1.0e6);
+    statusBar()->showMessage(
+        tr("マーカーへジャンプ: %1 (%2s)")
+            .arg(m.label)
+            .arg(m.timelineUs / 1.0e6, 0, 'f', 2), 2500);
 }

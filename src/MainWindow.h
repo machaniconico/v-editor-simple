@@ -191,6 +191,29 @@ private slots:
     void onMeterRequestNormalizeAll();
     void onMeterRequestResetAllMeters();
 
+    // Consolidation slots — wire panels and dialogs implemented in
+    // earlier sprint stories into the menu bar.
+    void openEqualizerPanel();
+    void openCompressorPanel();
+    void openReverbPanel();
+    void openNoiseReductionPanel();
+    void openTitlePresetDialog();
+    void openMultiCamDialog();
+    // Receives MultiCamDialog::applyToTimeline. Replaces V1 + A1 with the
+    // EDL encoded in MultiCamProject::switches (with a confirm prompt when
+    // V1 is non-empty). No-op on Cancel; missing-file segments are skipped
+    // with a status-bar warning rather than crashing.
+    void onMultiCamApplyToTimeline(const MultiCamProject &project);
+    void openRenderQueueDialog();
+    void openSceneDetector();
+    void runMotionStabilizer();
+    void addAdjustmentLayerCmd();
+    void openSpeedRampDialog();
+    void addQuickMarker();
+    void addColoredMarker();
+    void jumpToNextMarker();
+    void jumpToPrevMarker();
+
 protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
@@ -322,4 +345,17 @@ private:
 
     // History dock
     HistoryDockWidget *m_historyDock = nullptr;
+
+    // Consolidation: docks for the per-track audio panels (EQ /
+    // Compressor / Reverb / Noise Reduction). Created on first use and
+    // re-used on subsequent menu invocations so toggling the action
+    // shows/hides the same dock.
+    QDockWidget *m_equalizerDock = nullptr;
+    QDockWidget *m_compressorDock = nullptr;
+    QDockWidget *m_reverbDock = nullptr;
+    QDockWidget *m_noiseReductionDock = nullptr;
+
+    // Modeless render queue dialog — kept alive between invocations so
+    // running jobs persist when the user closes the window.
+    class RenderQueueDialog *m_renderQueueDialog = nullptr;
 };
