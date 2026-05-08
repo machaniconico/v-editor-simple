@@ -90,23 +90,25 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
                 double g = line[x * 3 + 1] / 255.0;
                 double b = line[x * 3 + 2] / 255.0;
 
-                // Gain: multiply signal
-                r *= (1.0 + cc.gainR);
-                g *= (1.0 + cc.gainG);
-                b *= (1.0 + cc.gainB);
+                // Stage 1 — Lift: additive offset (matches GLSL: color + uLift where uLift = liftR*0.5)
+                r += cc.liftR * 0.5;
+                g += cc.liftG * 0.5;
+                b += cc.liftB * 0.5;
 
-                // Lift: offset weighted by inverse luminance
-                r += cc.liftR * (1.0 - r);
-                g += cc.liftG * (1.0 - g);
-                b += cc.liftB * (1.0 - b);
+                // Stage 2 — Gamma: power curve; internalGamma = pow(2, gammaR) — matches GPU contract
+                // cc.gammaR in [-1,1], neutral=0 → internalGamma=1 → identity pow(in,1)
+                double igR = std::max(std::pow(2.0, cc.gammaR), 1e-3);
+                double igG = std::max(std::pow(2.0, cc.gammaG), 1e-3);
+                double igB = std::max(std::pow(2.0, cc.gammaB), 1e-3);
+                r = std::pow(std::max(r, 0.0), 1.0 / igR);
+                g = std::pow(std::max(g, 0.0), 1.0 / igG);
+                b = std::pow(std::max(b, 0.0), 1.0 / igB);
 
-                // Gamma: power curve through midtones
-                double gpR = 1.0 / qMax(1.0 + cc.gammaR, 0.01);
-                double gpG = 1.0 / qMax(1.0 + cc.gammaG, 0.01);
-                double gpB = 1.0 / qMax(1.0 + cc.gammaB, 0.01);
-                r = std::pow(qMax(r, 0.0), gpR);
-                g = std::pow(qMax(g, 0.0), gpG);
-                b = std::pow(qMax(b, 0.0), gpB);
+                // Stage 3 — Gain: multiplicative scaling; matches GPU pow(2, gainR*2)
+                // cc.gainR in [-1,1], neutral=0 → factor=1 → identity
+                r *= std::pow(2.0, cc.gainR * 2.0);
+                g *= std::pow(2.0, cc.gainG * 2.0);
+                b *= std::pow(2.0, cc.gainB * 2.0);
 
                 line[x * 3 + 0] = static_cast<uint8_t>(qBound(0.0, r, 1.0) * 255.0);
                 line[x * 3 + 1] = static_cast<uint8_t>(qBound(0.0, g, 1.0) * 255.0);

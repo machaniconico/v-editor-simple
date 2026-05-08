@@ -1,4 +1,8 @@
 #include "GLPreview.h"
+#include "Timeline.h"
+#include "VideoPlayer.h"
+#include "AdjustmentLayer.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -7,7 +11,9 @@
 #include <QtGlobal>
 #include <QDateTime>
 #include <QVector2D>
+#include <QVector3D>
 #include <QVector4D>
+#include <QMatrix3x3>
 #include <QOpenGLContext>
 #include <QDebug>
 #include <QPainter>
@@ -130,8 +136,97 @@ uniform sampler3D uLut3D;
 uniform float uLutIntensity;  // 0.0 to 1.0
 uniform bool uLutEnabled;
 
+// US-CG-1: RGB Curves LUT (256x4 RGBA8). Rows: 0=R, 1=G, 2=B, 3=Luma.
+uniform sampler2D uCurveLut;
+uniform bool uCurvesEnabled;
+
+// US-CG-2: White-balance gain triple, applied at the very top of the grade
+// chain (BEFORE LGG, curves, and the .cube LUT). Identity = vec3(1.0).
+uniform vec3 uWb;
+
+// US-CG-3: Radial vignette / Power Window. Applied AFTER curves and BEFORE
+// the .cube LUT. Identity = uVigAmount==0 (factor=1.0 → no-op).
+uniform float uVigAmount;     // -1..+1 (negative=darken, positive=lighten)
+uniform float uVigMid;        //  0..1  (radius % of frame, 0.7 default)
+uniform float uVigRound;      // -1..+1 (0=circular, ±1=squareness)
+uniform float uVigFeather;    //  0..1  (edge softness, 0.3 default)
+
+// US-EF-1: Chroma Key (Premiere Ultra Key / Resolve 3D Keyer simplified).
+// Applied at the VERY TOP of the compose path — BEFORE WB/LGG/curves/
+// vignette/LUT — so HSL gating + spill suppression operate on raw frame
+// colour. uChromaEnabled=false is a free no-op.
+uniform bool  uChromaEnabled;
+uniform vec3  uChromaKeyHsl;  // (H, S, L) of key colour, each in [0..1]
+uniform vec3  uChromaTol;     // (hueTol, satTol, lumTol), each in [0..1]
+uniform float uChromaSpill;   // 0..1 spill desaturation strength
+uniform float uChromaSoft;    // 0..1 smoothstep edge half-width
+
+// US-EF-3: HSL Qualifier (DaVinci secondary grading). Sits AFTER chroma key
+// and BEFORE WB so the qualifier acts on raw frame colour. Builds a 3D HSL
+// gating mask (circular hue distance × sat range × luma range) and applies
+// a SECONDARY lift/gamma/gain only inside the qualified region via mix().
+// uHslqEnabled=false is a free no-op (entire stage skipped).
+uniform bool  uHslqEnabled;
+uniform float uHslqHueCenter;   // degrees [0..360]
+uniform float uHslqHueRange;    // degrees [0..180]
+uniform vec2  uHslqSatRange;    // (min, max) in [0..1]
+uniform vec2  uHslqLumaRange;   // (min, max) in [0..1]
+uniform float uHslqSoftness;    // [0..50] edge slop (degrees / pct)
+uniform vec3  uHslqLift;        // per-channel additive offset
+uniform vec3  uHslqGamma;       // per-channel gamma (identity 1.0)
+uniform vec3  uHslqGain;        // per-channel multiplier (identity 1.0)
+
+// US-CG-4: Hue vs Saturation curve (DaVinci Resolve color page parity).
+// Sampled AFTER the .cube LUT and BEFORE the mask wrap so the curve sees
+// the final graded colour. uHueVsSatEnabled=false is a free no-op.
+//   uHueVsSatLut : 256x1 R-only texture; sample.r is the sat multiplier
+//                  for that hue bin (0.0 = full desaturate, 1.0 = identity,
+//                  2.0 = double saturation).
+uniform bool      uHueVsSatEnabled;
+uniform sampler2D uHueVsSatLut;
+
+// US-EF-2: Mask Animation (DaVinci Power Window simplified). Wraps the
+// entire grade chain — `ungraded` is captured before chroma key, the grade
+// chain mutates `color`, and at the end we mix(ungraded, graded, weight).
+// uMaskEnabled=false branches around the mix entirely → free no-op (output
+// is bit-identical to the previous shader behaviour).
+uniform bool  uMaskEnabled;
+uniform bool  uMaskEllipse;   // false=Rect, true=Ellipse
+uniform bool  uMaskInvert;
+uniform float uMaskFeather;   // 0..1 edge softness
+uniform vec4  uMaskRect;      // (x, y, w, h) normalized in vTexCoord space
+
 // 0=sRGB, 1=PQ, 2=HLG. Non-zero applies inverse EOTF + Hable tone map before grading.
 uniform int uHdrTransfer;
+
+// US-EF-4: Effects shader pack — Sharpen / Gaussian Blur / Lens Distortion.
+// uLensDistortion is applied as a texture-coordinate transform at the very
+// TOP of main() (BEFORE the texture sample), while uBlurRadius and
+// uSharpenAmount drive POST stages at the END of main() — after the entire
+// grade chain (chroma key → HSL Q → WB → exposure → ... → LGG → curves →
+// vignette → LUT → mask wrap). All three default to identity (0) so the
+// stage is a free no-op until the user touches the エフェクト sliders.
+uniform float uSharpenAmount;   // 0..200; shader multiplies by 0.01
+uniform float uBlurRadius;      // 0..50 px; identity at 0
+uniform float uLensDistortion;  // -100..+100; shader multiplies by 0.01
+
+// US-3D: 3-axis rotation + perspective foreshortening (Premiere "Basic 3D" /
+// Resolve "Transform" 3D rotation parity). Composed AFTER lens distortion
+// (its texture-coord transform) and BEFORE the texture sample, via a
+// fragment-shader inverse warp: shift to centre, multiply by uRot3D,
+// perspective-divide by (1 + p.z * uPerspectiveDist), shift back. Out-of-
+// bounds sample coordinates render black so the rotated quad letterboxes
+// against the canvas. uRot3DEnabled=false is a free no-op.
+uniform bool  uRot3DEnabled;
+uniform mat3  uRot3D;
+uniform float uPerspectiveDist; // inverse FOV; 0.1..10.0 (default 2.0)
+
+// US-INT-4: stabilizer pre-warp. uStab is a 2D inverse-affine matrix in
+// homogeneous form (last row [0 0 1]) that operates on (lensCoord-0.5),
+// then re-shifts. Composed BEFORE the 3D-rotate warp so user 3D-rotate is
+// preserved (operations stack). Identity = uStabEnabled=false = free no-op.
+uniform bool  uStabEnabled;
+uniform mat3  uStab;
 
 // GPU Video Effects — run after CC.
 uniform bool  uFxBlurEnable;
@@ -254,6 +349,40 @@ vec3 adjustGamma(vec3 color, float gamma) {
     return pow(max(color, vec3(0.0)), vec3(invGamma));
 }
 
+// US-EF-1: HSL helpers used by the Chroma Key stage. RGB↔HSL conversions
+// match the formulas used in QColor::getHslF so the GPU mask matches the
+// CPU swatch the user picked in the colour dialog.
+vec3 rgbToHsl(vec3 c) {
+    float maxC = max(max(c.r, c.g), c.b);
+    float minC = min(min(c.r, c.g), c.b);
+    float L = (maxC + minC) * 0.5;
+    float H = 0.0, S = 0.0;
+    if (maxC > minC) {
+        float d = maxC - minC;
+        S = (L > 0.5) ? d / (2.0 - maxC - minC) : d / (maxC + minC);
+        if (maxC == c.r) H = (c.g - c.b) / d + (c.g < c.b ? 6.0 : 0.0);
+        else if (maxC == c.g) H = (c.b - c.r) / d + 2.0;
+        else H = (c.r - c.g) / d + 4.0;
+        H /= 6.0;
+    }
+    return vec3(H, S, L);
+}
+float hue2rgb(float p, float q, float t) {
+    if (t < 0.0) t += 1.0;
+    if (t > 1.0) t -= 1.0;
+    if (t < 1.0/6.0) return p + (q - p) * 6.0 * t;
+    if (t < 1.0/2.0) return q;
+    if (t < 2.0/3.0) return p + (q - p) * (2.0/3.0 - t) * 6.0;
+    return p;
+}
+vec3 hslToRgb(vec3 hsl) {
+    float h = hsl.x, s = hsl.y, l = hsl.z;
+    if (s == 0.0) return vec3(l);
+    float q = l < 0.5 ? l * (1.0 + s) : l + s - l * s;
+    float p = 2.0 * l - q;
+    return vec3(hue2rgb(p, q, h + 1.0/3.0), hue2rgb(p, q, h), hue2rgb(p, q, h - 1.0/3.0));
+}
+
 // US-WIRE-2: Lift/Gamma/Gain color wheels
 // Order: Lift → Gamma → Gain applied BEFORE LUT (grading → LUT, DaVinci-style)
 // Math per pixel RGB in [0,1] linear-ish space:
@@ -293,7 +422,8 @@ vec3 fxBlur(vec2 uv) {
     }
     return (wsum > 0.0) ? acc / wsum : texture(uTexture, uv).rgb;
 }
-
+)"
+R"(
 float fxHash(vec2 p) {
     return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
 }
@@ -350,9 +480,49 @@ vec4 applyChromaKey(vec3 color, vec3 key, float tolerance) {
 }
 
 void main() {
-    vec2 sampleUv = uFxMosaicEnable ? applyMosaic(vTexCoord, uFxMosaicSize) : vTexCoord;
+    // US-EF-4: Lens Distortion — applied at the very TOP of main() as a
+    // texture-coordinate transform BEFORE the texture sample. amount<0 →
+    // barrel (frame edges bow outward), amount>0 → pincushion. Identity at
+    // 0 means lensCoord == vTexCoord so the texture lookup is unchanged.
+    vec2 lensCoord = vTexCoord;
+    if (abs(uLensDistortion) > 0.001) {
+        vec2 c = vTexCoord - 0.5;
+        float r2 = dot(c, c);
+        float k = 1.0 + uLensDistortion * 0.01 * r2;
+        lensCoord = c * k + 0.5;
+    }
+    // US-INT-4: stabilizer inverse-affine pre-warp. Applied BEFORE the
+    // 3D-rotate stage so the user's 3D rotation matrix is preserved (the
+    // two transforms stack — stabilization undoes camera shake on the
+    // source frame; 3D rotate is then applied on top of the stabilized
+    // image). Identity = free no-op via uStabEnabled=false.
+    if (uStabEnabled) {
+        vec3 q = uStab * vec3(lensCoord.x - 0.5, lensCoord.y - 0.5, 1.0);
+        lensCoord = vec2(q.x + 0.5, q.y + 0.5);
+    }
+
+    // US-3D: 3-axis rotation + perspective foreshortening. Composed AFTER
+    // the lens distortion warp so both transforms stack into the final
+    // sample coord. Inverse mapping: shift to centre, multiply by the CPU-
+    // built 3x3 rotation matrix, perspective-divide along z, shift back.
+    // Out-of-bounds samples short-circuit to black so the rotated quad
+    // letterboxes against the canvas instead of repeating texture edges.
+    if (uRot3DEnabled) {
+        vec2 c = lensCoord - 0.5;
+        vec3 p = uRot3D * vec3(c.x, c.y, 0.0);
+        float w = 1.0 + p.z * uPerspectiveDist;
+        if (w < 1e-3) w = 1e-3;
+        vec2 rotCoord = vec2(p.x, p.y) / w + 0.5;
+        if (rotCoord.x < 0.0 || rotCoord.x > 1.0 ||
+            rotCoord.y < 0.0 || rotCoord.y > 1.0) {
+            FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+        lensCoord = rotCoord;
+    }
+    vec2 sampleUv = uFxMosaicEnable ? applyMosaic(lensCoord, uFxMosaicSize) : lensCoord;
     vec4 texColor = texture(uTexture, sampleUv);
-    vec3 color = uFxBlurEnable ? fxBlur(vTexCoord) : texColor.rgb;
+    vec3 color = uFxBlurEnable ? fxBlur(lensCoord) : texColor.rgb;
 
     if (uHdrTransfer == 1) {
         color = pqInverseEotf(color);
@@ -363,6 +533,72 @@ void main() {
     }
 
     if (uEffectsEnabled) {
+        // US-EF-2: Mask Animation. Snapshot the raw colour BEFORE any grade
+        // stage runs so the mask wrap can mix(ungraded, graded, weight) at
+        // the end of the chain. Cheap (one vec3 copy); when uMaskEnabled is
+        // false the wrap branch is skipped entirely.
+        vec3 ungraded = color;
+
+        // US-EF-1: Chroma Key — gates raw frame colour BEFORE every grade
+        // stage so the picked HSL distance reflects what the user clicked
+        // in the swatch. Distance is computed in HSL space with the hue
+        // axis treated as circular; the smoothstep mask softens edges and
+        // a hue-proximity-weighted desaturation removes the green/blue
+        // spill that bleeds onto the foreground subject.
+        if (uChromaEnabled) {
+            vec3 hsl = rgbToHsl(color.rgb);
+            vec3 d = abs(hsl - uChromaKeyHsl);
+            d.x = min(d.x, 1.0 - d.x);  // hue is circular
+            vec3 normalizedTol = max(uChromaTol, vec3(0.0001));
+            float dist = length(d / normalizedTol);
+            float alpha = smoothstep(1.0 - uChromaSoft, 1.0 + uChromaSoft, dist);
+            float keyProx = 1.0 - smoothstep(0.0, 1.0, d.x / normalizedTol.x);
+            hsl.y *= mix(1.0, 1.0 - uChromaSpill, keyProx);
+            color.rgb = hslToRgb(hsl);
+            color.rgb *= alpha;
+            texColor.a *= alpha;
+        }
+
+        // US-EF-3: HSL Qualifier (DaVinci secondary grading). Build a 3D
+        // gating mask in HSL space (circular hue distance × sat range ×
+        // luma range), then apply a secondary lift/gamma/gain ONLY inside
+        // the qualified region via mix(). Sits between chroma key (which
+        // gates raw colour) and WB (which globally tints) so the qualifier
+        // sees the raw-but-keyed frame. uHslqEnabled=false skips the stage.
+        if (uHslqEnabled) {
+            vec3 hsl = rgbToHsl(color.rgb);
+            // Circular hue distance, in degrees [0..180].
+            float hDist = abs(hsl.x * 360.0 - uHslqHueCenter);
+            hDist = min(hDist, 360.0 - hDist);
+            float hWeight = 1.0 - smoothstep(uHslqHueRange - uHslqSoftness,
+                                             uHslqHueRange + uHslqSoftness,
+                                             hDist);
+            float satEdge = uHslqSoftness * 0.01;
+            float sWeight = smoothstep(uHslqSatRange.x - satEdge,
+                                       uHslqSatRange.x, hsl.y) *
+                           (1.0 - smoothstep(uHslqSatRange.y,
+                                             uHslqSatRange.y + satEdge,
+                                             hsl.y));
+            float lWeight = smoothstep(uHslqLumaRange.x - satEdge,
+                                       uHslqLumaRange.x, hsl.z) *
+                           (1.0 - smoothstep(uHslqLumaRange.y,
+                                             uHslqLumaRange.y + satEdge,
+                                             hsl.z));
+            float qMask = clamp(hWeight * sWeight * lWeight, 0.0, 1.0);
+
+            vec3 graded = color.rgb + uHslqLift;
+            graded = pow(max(graded, vec3(0.0)),
+                         vec3(1.0) / max(uHslqGamma, vec3(1e-3)));
+            graded *= uHslqGain;
+            color.rgb = mix(color.rgb, graded, qMask);
+        }
+
+        // US-CG-2: White-balance multiply at the VERY TOP of the grade chain
+        // (BEFORE LGG, curves, .cube LUT, and the legacy CPU-style stages).
+        // Identity uWb=vec3(1.0) is a free no-op.
+        if (uWb != vec3(1.0))
+            color *= uWb;
+
         // Apply color correction pipeline (same order as CPU)
         if (uExposure != 0.0)
             color = adjustExposure(color, uExposure);
@@ -384,10 +620,80 @@ void main() {
         if (uLift != vec4(0.0) || uLggGamma != vec4(1.0, 1.0, 1.0, 1.0) || uGain != vec4(1.0, 1.0, 1.0, 1.0))
             color = applyLiftGammaGain(color);
 
+        // US-CG-1: RGB Curves stage. The 256x4 LUT has rows
+        //   0=R, 1=G, 2=B, 3=Luma (sample at v = 0.125, 0.375, 0.625, 0.875).
+        // Per-channel curves remap c.r/c.g/c.b independently; the Luma curve
+        // remaps perceptual luma and redistributes the offset across RGB so
+        // hue stays roughly constant.
+        if (uCurvesEnabled) {
+            vec3 cclamped = clamp(color, 0.0, 1.0);
+            color.r = texture(uCurveLut, vec2(cclamped.r, 0.125)).r;
+            color.g = texture(uCurveLut, vec2(cclamped.g, 0.375)).g;
+            color.b = texture(uCurveLut, vec2(cclamped.b, 0.625)).b;
+            float Y = dot(clamp(color, 0.0, 1.0), vec3(0.299, 0.587, 0.114));
+            float Ycurved = texture(uCurveLut, vec2(Y, 0.875)).a;
+            float dY = Ycurved - Y;
+            color += vec3(dY);
+        }
+
+        // US-CG-3: Radial vignette / Power Window. Sits AFTER curves and
+        // BEFORE the .cube LUT so the LUT can still recolor the falloff.
+        // amount=0 is a free no-op (factor stays at 1.0).
+        if (abs(uVigAmount) > 0.0001) {
+            vec2 uv = vTexCoord - 0.5;
+            float r = length(uv * vec2(1.0 + uVigRound * 0.5,
+                                       1.0 - uVigRound * 0.5));
+            float falloff = smoothstep(uVigMid - uVigFeather * 0.5,
+                                       uVigMid + uVigFeather * 0.5, r);
+            float factor = 1.0 + uVigAmount * falloff;
+            color.rgb = clamp(color.rgb * factor, 0.0, 1.0);
+        }
+
         // US-FEAT-B: LUT 3D-texture blend — sample 3D LUT and mix with intensity
         if (uLutEnabled) {
             vec3 lutColor = texture(uLut3D, clamp(color, 0.0, 1.0)).rgb;
             color = mix(color, lutColor, uLutIntensity);
+        }
+
+        // US-CG-4: Hue vs Saturation curve. Sampled AFTER the .cube LUT so
+        // the curve operates on the final graded colour. The 256x1 R-only
+        // LUT is keyed on the HSL hue and the returned scalar multiplies
+        // the saturation channel before converting back to RGB. Disabled
+        // (uHueVsSatEnabled=false) is a free no-op.
+        if (uHueVsSatEnabled) {
+            vec3 hsl = rgbToHsl(clamp(color.rgb, 0.0, 1.0));
+            // LUT stores satMul/2 as R8_UNorm so the [0..2] range fits
+            // into [0..1]; un-pack with *2.0 to restore the multiplier.
+            float satMul = texture(uHueVsSatLut, vec2(hsl.x, 0.5)).r * 2.0;
+            hsl.y = clamp(hsl.y * satMul, 0.0, 1.0);
+            color.rgb = hslToRgb(hsl);
+        }
+
+        // US-EF-2: Mask Animation wrap. Compute the mask weight from
+        // vTexCoord and mix the ungraded snapshot with the freshly graded
+        // colour. uMaskEnabled=false skips the entire stage so the output
+        // remains bit-identical to the pre-wrap pipeline.
+        if (uMaskEnabled) {
+            vec2 uv = vTexCoord;
+            vec2 m = (uv - uMaskRect.xy) / max(uMaskRect.zw, vec2(0.0001));
+            float weight = 0.0;
+            if (uMaskEllipse) {
+                vec2 c = m - vec2(0.5);
+                float r = length(c);
+                float halfRange = max(uMaskFeather * 0.5, 0.001);
+                weight = 1.0 - smoothstep(0.5 - halfRange,
+                                          0.5 + halfRange, r);
+            } else {
+                // Rect: edge softness on each side. Inside the rect both
+                // factors approach 1; outside, both go to 0. Soft edges
+                // stretch by uMaskFeather measured in mask-space units.
+                float f = max(uMaskFeather, 0.001);
+                vec2 e = smoothstep(0.0, f, m)
+                       * (1.0 - smoothstep(1.0 - f, 1.0, m));
+                weight = clamp(e.x * e.y, 0.0, 1.0);
+            }
+            if (uMaskInvert) weight = 1.0 - weight;
+            color = mix(ungraded, color, weight);
         }
     }
 
@@ -397,6 +703,47 @@ void main() {
     if (uFxVignetteEnable) color = fxApplyVignette(color, sampleUv);
     if (uFxNoiseEnable)    color = fxApplyNoise(color, sampleUv);
     if (uFxSharpenEnable)  color = applySharpen(uTexture, sampleUv, 1.0 / uFxTexSize, uFxSharpenAmount);
+
+    // US-EF-4: POST Blur — single-pass 3x3 box-average approximation. Cheap
+    // identity at uBlurRadius<0.5 (skips the gather entirely). Uses the
+    // lens-distorted sampleUv so the blur kernel sits in the same image
+    // space the rest of the shader sampled from.
+    if (uBlurRadius > 0.5) {
+        vec2 px = uBlurRadius / vec2(textureSize(uTexture, 0));
+        vec3 b = vec3(0.0);
+        b += texture(uTexture, sampleUv + vec2(-px.x, -px.y)).rgb;
+        b += texture(uTexture, sampleUv + vec2( 0.0, -px.y)).rgb;
+        b += texture(uTexture, sampleUv + vec2( px.x, -px.y)).rgb;
+        b += texture(uTexture, sampleUv + vec2(-px.x,  0.0)).rgb;
+        b += texture(uTexture, sampleUv).rgb;
+        b += texture(uTexture, sampleUv + vec2( px.x,  0.0)).rgb;
+        b += texture(uTexture, sampleUv + vec2(-px.x,  px.y)).rgb;
+        b += texture(uTexture, sampleUv + vec2( 0.0,  px.y)).rgb;
+        b += texture(uTexture, sampleUv + vec2( px.x,  px.y)).rgb;
+        color = mix(color, b / 9.0, smoothstep(0.0, 50.0, uBlurRadius));
+    }
+
+    // US-EF-4: POST Sharpen (unsharp mask). Build a 3x3 box average of the
+    // lens-distorted neighborhood and add the high-frequency residual back
+    // to the post-grade `color`. Identity at uSharpenAmount<0.001 (skip the
+    // 9 samples entirely). Slider scale is /100 so the user-visible 0..200
+    // maps to a 0..2 multiplier of the residual.
+    if (uSharpenAmount > 0.001) {
+        vec2 px = 1.0 / vec2(textureSize(uTexture, 0));
+        vec3 blur = vec3(0.0);
+        blur += texture(uTexture, sampleUv + vec2(-px.x, -px.y)).rgb;
+        blur += texture(uTexture, sampleUv + vec2( 0.0, -px.y)).rgb;
+        blur += texture(uTexture, sampleUv + vec2( px.x, -px.y)).rgb;
+        blur += texture(uTexture, sampleUv + vec2(-px.x,  0.0)).rgb;
+        blur += texture(uTexture, sampleUv).rgb;
+        blur += texture(uTexture, sampleUv + vec2( px.x,  0.0)).rgb;
+        blur += texture(uTexture, sampleUv + vec2(-px.x,  px.y)).rgb;
+        blur += texture(uTexture, sampleUv + vec2( 0.0,  px.y)).rgb;
+        blur += texture(uTexture, sampleUv + vec2( px.x,  px.y)).rgb;
+        blur /= 9.0;
+        vec3 baseRgb = texture(uTexture, sampleUv).rgb;
+        color = clamp(color + uSharpenAmount * 0.01 * (baseRgb - blur), 0.0, 1.0);
+    }
 
     vec4 outColor = vec4(clamp(color, 0.0, 1.0), texColor.a);
     if (uFxChromaKeyEnable)
@@ -524,6 +871,14 @@ void GLPreview::cleanupGL()
     if (m_lutTexture) {
         delete m_lutTexture;
         m_lutTexture = nullptr;
+    }
+    if (m_curveLutTex) {
+        delete m_curveLutTex;
+        m_curveLutTex = nullptr;
+    }
+    if (m_hueVsSatTex) {
+        delete m_hueVsSatTex;
+        m_hueVsSatTex = nullptr;
     }
     if (m_texture) {
         delete m_texture;
@@ -834,6 +1189,65 @@ void GLPreview::createShaderProgram()
     m_locLutIntensity  = m_program->uniformLocation("uLutIntensity");
     m_locLutEnabled    = m_program->uniformLocation("uLutEnabled");
 
+    // US-CG-1: RGB curves
+    m_locCurveLut       = m_program->uniformLocation("uCurveLut");
+    m_locCurvesEnabled  = m_program->uniformLocation("uCurvesEnabled");
+
+    // US-CG-2: White-balance gain triple uniform.
+    m_locWb             = m_program->uniformLocation("uWb");
+
+    // US-CG-3: Radial vignette uniforms.
+    m_locVigAmount      = m_program->uniformLocation("uVigAmount");
+    m_locVigMid         = m_program->uniformLocation("uVigMid");
+    m_locVigRound       = m_program->uniformLocation("uVigRound");
+    m_locVigFeather     = m_program->uniformLocation("uVigFeather");
+
+    // US-EF-1: Chroma Key uniforms.
+    m_locChromaEnabled  = m_program->uniformLocation("uChromaEnabled");
+    m_locChromaKeyHsl   = m_program->uniformLocation("uChromaKeyHsl");
+    m_locChromaTol      = m_program->uniformLocation("uChromaTol");
+    m_locChromaSpill    = m_program->uniformLocation("uChromaSpill");
+    m_locChromaSoft     = m_program->uniformLocation("uChromaSoft");
+
+    // US-EF-3: HSL Qualifier uniforms.
+    m_locHslqEnabled    = m_program->uniformLocation("uHslqEnabled");
+    m_locHslqHueCenter  = m_program->uniformLocation("uHslqHueCenter");
+    m_locHslqHueRange   = m_program->uniformLocation("uHslqHueRange");
+    m_locHslqSatRange   = m_program->uniformLocation("uHslqSatRange");
+    m_locHslqLumaRange  = m_program->uniformLocation("uHslqLumaRange");
+    m_locHslqSoftness   = m_program->uniformLocation("uHslqSoftness");
+    m_locHslqLift       = m_program->uniformLocation("uHslqLift");
+    m_locHslqGamma      = m_program->uniformLocation("uHslqGamma");
+    m_locHslqGain       = m_program->uniformLocation("uHslqGain");
+
+    // US-CG-4: Hue vs Saturation curve uniform locations.
+    m_locHueVsSatEnabled = m_program->uniformLocation("uHueVsSatEnabled");
+    m_locHueVsSatLut     = m_program->uniformLocation("uHueVsSatLut");
+
+    // US-EF-2: Mask Animation uniforms.
+    m_locMaskEnabled    = m_program->uniformLocation("uMaskEnabled");
+    m_locMaskEllipse    = m_program->uniformLocation("uMaskEllipse");
+    m_locMaskInvert     = m_program->uniformLocation("uMaskInvert");
+    m_locMaskFeather    = m_program->uniformLocation("uMaskFeather");
+    m_locMaskRect       = m_program->uniformLocation("uMaskRect");
+
+    // US-EF-4: Effects shader pack — Sharpen / Gaussian Blur / Lens Distortion.
+    // All three default to identity (0) so the stages are free no-ops until
+    // the user touches the エフェクト sliders in ColorGradingPanel.
+    m_locSharpenAmount  = m_program->uniformLocation("uSharpenAmount");
+    m_locBlurRadius     = m_program->uniformLocation("uBlurRadius");
+    m_locLensDistortion = m_program->uniformLocation("uLensDistortion");
+
+    // US-3D: 3-axis rotation + perspective foreshortening. Identity matrix
+    // (uRot3DEnabled=false) is a free no-op — the shader skips the warp.
+    m_locRot3DEnabled    = m_program->uniformLocation("uRot3DEnabled");
+    m_locRot3D           = m_program->uniformLocation("uRot3D");
+    m_locPerspectiveDist = m_program->uniformLocation("uPerspectiveDist");
+
+    // US-INT-4: stabilizer pre-warp uniform locations.
+    m_locStabEnabled = m_program->uniformLocation("uStabEnabled");
+    m_locStab        = m_program->uniformLocation("uStab");
+
     // NV12 zero-copy program — only used when the interop fast path engages.
     // Failure to compile/link is non-fatal: callers fall back to the legacy
     // QImage path automatically.
@@ -861,6 +1275,12 @@ void GLPreview::displayFrame(const QImage &frame)
         qWarning() << "GLPreview::displayFrame called with null image";
         return;
     }
+    // US-INT-4: cache the source-frame dimensions so the stabilizer matrix
+    // builder can convert SOURCE-pixel offsets to UV-fraction. Identity
+    // path (m_stabKeyframes empty) leaves the matrix at identity so this
+    // is a free no-op when stabilization is not in use.
+    m_stabFrameW = frame.width();
+    m_stabFrameH = frame.height();
     const QImage::Format inFmt = frame.format();
     const bool is16 = (inFmt == QImage::Format_RGBA64
                        || inFmt == QImage::Format_RGBA64_Premultiplied);
@@ -1361,22 +1781,150 @@ void GLPreview::paintGL()
     m_program->setUniformValue(m_locShadows,     static_cast<float>(m_cc.shadows));
     m_program->setUniformValue(m_locExposure,    static_cast<float>(m_cc.exposure));
 
+    // US-INT-1: merge any adjustment-layers covering the current timeline
+    // position on top of the per-clip cached uniforms. The cached values
+    // (m_wb / m_vig* / m_liftGammaGain) are already in shader-uniform space
+    // (sliders → gains/exponents) so we transform composite slider values
+    // identically to ColorGradingPanel before merging. Empty layer list →
+    // composite.gradingEnabled=false → effective_* = cached_* exactly.
+    float effWbR = m_wb[0], effWbG = m_wb[1], effWbB = m_wb[2];
+    float effVigAmount = m_vigAmount, effVigMid = m_vigMid;
+    float effVigRound = m_vigRound, effVigFeather = m_vigFeather;
+    auto effLgg = m_liftGammaGain;
+    if (m_timeline) {
+        qint64 tlUs = 0;
+        if (auto *vp = qobject_cast<VideoPlayer *>(parentWidget()))
+            tlUs = vp->timelinePositionUs();
+        const AdjustmentLayerComposite comp =
+            composeAdjustmentLayersAt(m_timeline->adjustmentLayers(), tlUs);
+        if (comp.gradingEnabled) {
+            // White Balance: transform composite sliders → gains using the
+            // same formula ColorGradingPanel::onWhiteBalanceChanged uses.
+            const double K     = 5500.0 + comp.wbTempSlider * 30.0;
+            double rGain       = std::clamp(1.0 + (5500.0 - K) / 3000.0, 0.5, 2.0);
+            double bGain       = std::clamp(1.0 + (K - 5500.0) / 3000.0, 0.5, 2.0);
+            const double gGain = 1.0 - (comp.wbTintSlider / 100.0) * 0.4;
+            // Multiplicative on top of per-clip WB.
+            effWbR *= static_cast<float>(rGain);
+            effWbG *= static_cast<float>(gGain);
+            effWbB *= static_cast<float>(bGain);
+
+            // Lift / Gamma / Gain: transform composite sliders → uniform
+            // space identically to GLPreview::setLiftGammaGain.
+            for (int ch = 0; ch < 4; ++ch) {
+                const double liftU  = comp.lift[ch]  * 0.5;
+                const double gammaU = comp.gamma[ch];           // identity = 0 here
+                const double gainU  = std::pow(2.0, comp.gain[ch] * 2.0);
+                // lift additive, gamma + gain multiplicative. Composite
+                // gamma defaults to 0 (untouched); only multiply when the
+                // composite explicitly overrode gamma.
+                effLgg[0][ch] += liftU;
+                if (gammaU != 0.0)
+                    effLgg[1][ch] *= gammaU;
+                effLgg[2][ch] *= gainU;
+            }
+
+            // Vignette: amount = max(per-clip, composite). When composite
+            // wins we also adopt its midpoint/roundness/feather.
+            const float compAmount = static_cast<float>(comp.vigAmount);
+            if (std::fabs(compAmount) > std::fabs(effVigAmount)) {
+                effVigAmount  = compAmount;
+                effVigMid     = static_cast<float>(comp.vigMidpoint);
+                effVigRound   = static_cast<float>(comp.vigRoundness);
+                effVigFeather = static_cast<float>(comp.vigFeather);
+            }
+        }
+    }
+
+    // US-CG-2: White-balance gain triple — uploaded every draw because the
+    // shader test `uWb != vec3(1.0)` skips the multiply at identity.
+    m_program->setUniformValue(m_locWb,
+        QVector3D(effWbR, effWbG, effWbB));
+
+    // US-CG-3: Radial vignette — uploaded every draw. The shader test
+    // `abs(uVigAmount) > 0.0001` keeps amount==0 a free no-op.
+    m_program->setUniformValue(m_locVigAmount,  effVigAmount);
+    m_program->setUniformValue(m_locVigMid,     effVigMid);
+    m_program->setUniformValue(m_locVigRound,   effVigRound);
+    m_program->setUniformValue(m_locVigFeather, effVigFeather);
+
+    // US-EF-1: Chroma Key — uploaded every draw. uChromaEnabled=false is a
+    // free no-op (entire stage skipped in the fragment shader).
+    m_program->setUniformValue(m_locChromaEnabled, m_chromaEnabled);
+    m_program->setUniformValue(m_locChromaKeyHsl,
+        QVector3D(m_chromaKeyH, m_chromaKeyS, m_chromaKeyL));
+    m_program->setUniformValue(m_locChromaTol,
+        QVector3D(m_chromaHueTol, m_chromaSatTol, m_chromaLumTol));
+    m_program->setUniformValue(m_locChromaSpill, m_chromaSpillStrength);
+    m_program->setUniformValue(m_locChromaSoft,  m_chromaSoftness);
+
+    // US-EF-3: HSL Qualifier — uploaded every draw. uHslqEnabled=false is a
+    // free no-op (entire stage skipped in the fragment shader).
+    m_program->setUniformValue(m_locHslqEnabled,   m_hslqEnabled);
+    m_program->setUniformValue(m_locHslqHueCenter, m_hslqHueCenter);
+    m_program->setUniformValue(m_locHslqHueRange,  m_hslqHueRange);
+    m_program->setUniformValue(m_locHslqSatRange,
+        QVector2D(m_hslqSatMin, m_hslqSatMax));
+    m_program->setUniformValue(m_locHslqLumaRange,
+        QVector2D(m_hslqLumaMin, m_hslqLumaMax));
+    m_program->setUniformValue(m_locHslqSoftness,  m_hslqSoftness);
+    m_program->setUniformValue(m_locHslqLift,
+        QVector3D(m_hslqLift[0], m_hslqLift[1], m_hslqLift[2]));
+    m_program->setUniformValue(m_locHslqGamma,
+        QVector3D(m_hslqGamma[0], m_hslqGamma[1], m_hslqGamma[2]));
+    m_program->setUniformValue(m_locHslqGain,
+        QVector3D(m_hslqGain[0], m_hslqGain[1], m_hslqGain[2]));
+
+    // US-EF-2: Mask Animation — uploaded every draw. uMaskEnabled=false is
+    // a free no-op (the wrap mix() is skipped in the fragment shader).
+    m_program->setUniformValue(m_locMaskEnabled, m_maskEnabled);
+    m_program->setUniformValue(m_locMaskEllipse, m_maskEllipse);
+    m_program->setUniformValue(m_locMaskInvert,  m_maskInvert);
+    m_program->setUniformValue(m_locMaskFeather, m_maskFeather);
+    m_program->setUniformValue(m_locMaskRect,
+        QVector4D(m_maskRect[0], m_maskRect[1], m_maskRect[2], m_maskRect[3]));
+
+    // US-EF-4: Effects shader pack — Sharpen / Gaussian Blur / Lens Distortion.
+    // Identity at 0 keeps each stage a free no-op (the shader's |amount|>eps
+    // tests skip the kernel/transform entirely).
+    m_program->setUniformValue(m_locSharpenAmount,  m_sharpenAmount);
+    m_program->setUniformValue(m_locBlurRadius,     m_blurRadius);
+    m_program->setUniformValue(m_locLensDistortion, m_lensDistortion);
+
+    // US-3D: 3-axis rotation + perspective. Ship the CPU-built 3x3 rotation
+    // matrix as a QMatrix3x3 (column-major float[9]). Identity is a free
+    // no-op — the shader skips the entire warp when uRot3DEnabled=false.
+    m_program->setUniformValue(m_locRot3DEnabled, m_rot3DEnabled);
+    if (m_rot3DEnabled && m_locRot3D != -1) {
+        QMatrix3x3 mat(m_rot3DMatrix);
+        m_program->setUniformValue(m_locRot3D, mat);
+    }
+    m_program->setUniformValue(m_locPerspectiveDist, m_perspectiveDist);
+
+    // US-INT-4: stabilizer pre-warp matrix. Identity = free no-op.
+    if (m_locStabEnabled != -1)
+        m_program->setUniformValue(m_locStabEnabled, m_stabEnabled);
+    if (m_stabEnabled && m_locStab != -1) {
+        QMatrix3x3 stabMat(m_stabMatrix);
+        m_program->setUniformValue(m_locStab, stabMat);
+    }
+
     // Lift/Gamma/Gain (US-WIRE-2: vec4: xyz=RGB, w=Luma)
     m_program->setUniformValue(m_locLift,
-        QVector4D(static_cast<float>(m_liftGammaGain[0][0]),
-                  static_cast<float>(m_liftGammaGain[0][1]),
-                  static_cast<float>(m_liftGammaGain[0][2]),
-                  static_cast<float>(m_liftGammaGain[0][3])));
+        QVector4D(static_cast<float>(effLgg[0][0]),
+                  static_cast<float>(effLgg[0][1]),
+                  static_cast<float>(effLgg[0][2]),
+                  static_cast<float>(effLgg[0][3])));
     m_program->setUniformValue(m_locLggGamma,
-        QVector4D(static_cast<float>(m_liftGammaGain[1][0]),
-                  static_cast<float>(m_liftGammaGain[1][1]),
-                  static_cast<float>(m_liftGammaGain[1][2]),
-                  static_cast<float>(m_liftGammaGain[1][3])));
+        QVector4D(static_cast<float>(effLgg[1][0]),
+                  static_cast<float>(effLgg[1][1]),
+                  static_cast<float>(effLgg[1][2]),
+                  static_cast<float>(effLgg[1][3])));
     m_program->setUniformValue(m_locGain,
-        QVector4D(static_cast<float>(m_liftGammaGain[2][0]),
-                  static_cast<float>(m_liftGammaGain[2][1]),
-                  static_cast<float>(m_liftGammaGain[2][2]),
-                  static_cast<float>(m_liftGammaGain[2][3])));
+        QVector4D(static_cast<float>(effLgg[2][0]),
+                  static_cast<float>(effLgg[2][1]),
+                  static_cast<float>(effLgg[2][2]),
+                  static_cast<float>(effLgg[2][3])));
 
     // LUT
     m_program->setUniformValue(m_locLutEnabled, m_lutEnabled);
@@ -1387,11 +1935,91 @@ void GLPreview::paintGL()
         m_program->setUniformValue(m_locLut3D, 1);
     }
 
+    // US-CG-1: RGB Curves LUT — bind on texture unit 2 when enabled.
+    // Pending uploads (queued via setRgbCurves before initializeGL) are
+    // flushed here because the GL context is guaranteed current.
+    if (m_curvesNeedUpload && !m_pendingCurves.isEmpty()) {
+        QVector<unsigned char> data(256 * 4 * 4, 0);
+        for (int row = 0; row < 4 && row < m_pendingCurves.size(); ++row) {
+            const QVector<int> &curve = m_pendingCurves[row];
+            for (int x = 0; x < 256; ++x) {
+                int v = (x < curve.size()) ? curve[x] : x;
+                v = std::clamp(v, 0, 255);
+                int idx = (row * 256 + x) * 4;
+                data[idx + 0] = static_cast<unsigned char>(v);
+                data[idx + 1] = static_cast<unsigned char>(v);
+                data[idx + 2] = static_cast<unsigned char>(v);
+                data[idx + 3] = static_cast<unsigned char>(v);
+            }
+        }
+        if (!m_curveLutTex) {
+            m_curveLutTex = new QOpenGLTexture(QOpenGLTexture::Target2D);
+            m_curveLutTex->setSize(256, 4);
+            m_curveLutTex->setFormat(QOpenGLTexture::RGBA8_UNorm);
+            m_curveLutTex->allocateStorage();
+            m_curveLutTex->setMinificationFilter(QOpenGLTexture::Linear);
+            m_curveLutTex->setMagnificationFilter(QOpenGLTexture::Linear);
+            m_curveLutTex->setWrapMode(QOpenGLTexture::ClampToEdge);
+        }
+        m_curveLutTex->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt8,
+                               data.constData());
+        m_curvesNeedUpload = false;
+    }
+    m_program->setUniformValue(m_locCurvesEnabled, m_curvesEnabled);
+    if (m_curvesEnabled && m_curveLutTex) {
+        glActiveTexture(GL_TEXTURE2);
+        m_curveLutTex->bind();
+        m_program->setUniformValue(m_locCurveLut, 2);
+    }
+
+    // US-CG-4: Hue vs Saturation curve LUT — bind on texture unit 3 when
+    // enabled. Pending uploads (queued via setHueVsSatLut before the GL
+    // context was current) are flushed here.
+    if (m_hueVsSatNeedUpload && m_pendingHueVsSatLut.size() == 256) {
+        QVector<unsigned char> data(256, 0);
+        for (int x = 0; x < 256; ++x) {
+            // Slider range is 0..2.0; pack into a single byte 0..255 by
+            // halving so 1.0 (identity) lands exactly on 128. The shader
+            // un-packs by multiplying the sample by 2.0.
+            float v = m_pendingHueVsSatLut[x] * 0.5f;
+            v = std::clamp(v, 0.0f, 1.0f);
+            data[x] = static_cast<unsigned char>(std::lround(v * 255.0f));
+        }
+        if (!m_hueVsSatTex) {
+            m_hueVsSatTex = new QOpenGLTexture(QOpenGLTexture::Target2D);
+            m_hueVsSatTex->setSize(256, 1);
+            m_hueVsSatTex->setFormat(QOpenGLTexture::R8_UNorm);
+            m_hueVsSatTex->allocateStorage();
+            m_hueVsSatTex->setMinificationFilter(QOpenGLTexture::Linear);
+            m_hueVsSatTex->setMagnificationFilter(QOpenGLTexture::Linear);
+            m_hueVsSatTex->setWrapMode(QOpenGLTexture::Repeat);
+        }
+        m_hueVsSatTex->setData(QOpenGLTexture::Red, QOpenGLTexture::UInt8,
+                               data.constData());
+        m_hueVsSatNeedUpload = false;
+    }
+    m_program->setUniformValue(m_locHueVsSatEnabled, m_hueVsSatEnabled);
+    if (m_hueVsSatEnabled && m_hueVsSatTex) {
+        glActiveTexture(GL_TEXTURE3);
+        m_hueVsSatTex->bind();
+        m_program->setUniformValue(m_locHueVsSatLut, 3);
+    }
+
     // Draw quad
     m_vao.bind();
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     m_vao.release();
 
+    if (m_curvesEnabled && m_curveLutTex) {
+        glActiveTexture(GL_TEXTURE2);
+        m_curveLutTex->release();
+        glActiveTexture(GL_TEXTURE0);
+    }
+    if (m_hueVsSatEnabled && m_hueVsSatTex) {
+        glActiveTexture(GL_TEXTURE3);
+        m_hueVsSatTex->release();
+        glActiveTexture(GL_TEXTURE0);
+    }
     if (m_lutEnabled && m_lutTexture) {
         glActiveTexture(GL_TEXTURE1);
         m_lutTexture->release();
@@ -2344,6 +2972,300 @@ void GLPreview::setLutTexture(const QImage &lutGrid, float intensity)
 void GLPreview::setLutIntensity(double intensity)
 {
     m_lutIntensity = qBound(0.0f, static_cast<float>(intensity), 1.0f);
+    update();
+}
+
+// US-CG-1: queue an RGB curves upload. The actual GL texture upload runs
+// inside paintGL because that's where we know the GL context is current.
+// Identity curves (every entry == its index) effectively no-op the shader
+// stage, so we still upload them — that lets users toggle channels back
+// and forth without re-creating the texture each time.
+void GLPreview::setRgbCurves(const QVector<QVector<int>> &curves)
+{
+    if (curves.size() < 4) return;
+    m_pendingCurves = curves;
+    m_curvesNeedUpload = true;
+    m_curvesEnabled = true;
+    update();
+}
+
+// US-CG-4: queue a Hue vs Saturation LUT upload. The 256-float LUT is
+// stored as-is; the actual GL texture upload runs inside paintGL where the
+// GL context is guaranteed current. An empty / wrong-sized vector disables
+// the stage so the shader becomes a free no-op.
+void GLPreview::setHueVsSatLut(const QVector<float> &lut)
+{
+    if (lut.size() != 256) {
+        m_hueVsSatEnabled = false;
+        update();
+        return;
+    }
+    m_pendingHueVsSatLut = lut;
+    m_hueVsSatNeedUpload = true;
+    m_hueVsSatEnabled = true;
+    update();
+}
+
+// US-CG-2: White-balance gain triple. Stored on the widget; uploaded as the
+// uWb uniform on the next paint. Identity is (1, 1, 1).
+void GLPreview::setWhiteBalance(float r, float g, float b)
+{
+    m_wb[0] = r;
+    m_wb[1] = g;
+    m_wb[2] = b;
+    update();
+}
+
+// US-CG-3: Radial vignette / Power Window. Stored on the widget; uploaded as
+// uVigAmount/uVigMid/uVigRound/uVigFeather on the next paint. Identity is
+// amount==0 (factor==1.0 in the shader → free no-op).
+void GLPreview::setVignette(float amount, float midpoint, float roundness, float feather)
+{
+    m_vigAmount  = amount;
+    m_vigMid     = midpoint;
+    m_vigRound   = roundness;
+    m_vigFeather = feather;
+    update();
+}
+
+// US-EF-1: Chroma Key. Stored on the widget; uploaded as uChroma* uniforms
+// on the next paint. enabled=false is a free no-op (the entire shader stage
+// is skipped). All scalar inputs are already normalized to [0..1] by the
+// ColorGradingPanel before they reach us.
+void GLPreview::setChromaKey(bool enabled, float keyH, float keyS, float keyL,
+                             float hueTol, float satTol, float lumTol,
+                             float spill, float softness)
+{
+    m_chromaEnabled        = enabled;
+    m_chromaKeyH           = keyH;
+    m_chromaKeyS           = keyS;
+    m_chromaKeyL           = keyL;
+    m_chromaHueTol         = hueTol;
+    m_chromaSatTol         = satTol;
+    m_chromaLumTol         = lumTol;
+    m_chromaSpillStrength  = spill;
+    m_chromaSoftness       = softness;
+    update();
+}
+
+// US-EF-2: Mask Animation (DaVinci Power Window simplified). Stored on the
+// widget; uploaded as uMask* uniforms on the next paint. enabled=false is a
+// free no-op (the entire wrap stage is skipped in the fragment shader).
+void GLPreview::setMask(bool enabled, bool ellipse, bool invert, float feather,
+                        QRectF normalizedRect)
+{
+    m_maskEnabled = enabled;
+    m_maskEllipse = ellipse;
+    m_maskInvert  = invert;
+    m_maskFeather = feather;
+    // Defensive clamp — guarantees the shader sees finite, in-range values
+    // even if the upstream emitter glitches.
+    m_maskRect[0] = static_cast<float>(std::clamp(normalizedRect.x(), 0.0, 1.0));
+    m_maskRect[1] = static_cast<float>(std::clamp(normalizedRect.y(), 0.0, 1.0));
+    m_maskRect[2] = static_cast<float>(std::clamp(normalizedRect.width(),
+                                                  0.001, 1.0));
+    m_maskRect[3] = static_cast<float>(std::clamp(normalizedRect.height(),
+                                                  0.001, 1.0));
+    update();
+}
+
+// US-EF-3: HSL Qualifier (DaVinci secondary grading). Stored on the widget;
+// uploaded as uHslq* uniforms on the next paint. Sits AFTER chroma key and
+// BEFORE WB so the qualifier acts on raw frame colour. enabled=false is a
+// free no-op (the entire shader stage is skipped). Inputs:
+//   hueCenter   degrees [0..360]
+//   hueRange    degrees [0..180]
+//   satMin/Max  fractions [0..1] (panel divides percent by 100)
+//   lumaMin/Max fractions [0..1]
+//   softness    [0..50] degrees / percent edge slop
+//   lift / gamma / gain   per-channel adjustment (identity 0/1/1)
+void GLPreview::setHslQualifier(bool enabled,
+                                float hueCenter, float hueRange,
+                                float satMin, float satMax,
+                                float lumaMin, float lumaMax,
+                                float softness,
+                                float liftR, float liftG, float liftB,
+                                float gammaR, float gammaG, float gammaB,
+                                float gainR, float gainG, float gainB)
+{
+    m_hslqEnabled   = enabled;
+    m_hslqHueCenter = hueCenter;
+    m_hslqHueRange  = hueRange;
+    m_hslqSatMin    = satMin;
+    m_hslqSatMax    = satMax;
+    m_hslqLumaMin   = lumaMin;
+    m_hslqLumaMax   = lumaMax;
+    m_hslqSoftness  = softness;
+    m_hslqLift[0]   = liftR;
+    m_hslqLift[1]   = liftG;
+    m_hslqLift[2]   = liftB;
+    m_hslqGamma[0]  = gammaR;
+    m_hslqGamma[1]  = gammaG;
+    m_hslqGamma[2]  = gammaB;
+    m_hslqGain[0]   = gainR;
+    m_hslqGain[1]   = gainG;
+    m_hslqGain[2]   = gainB;
+    update();
+}
+
+// US-EF-4: Effects shader pack — Sharpen / Gaussian Blur / Lens Distortion.
+// Each setter just stores the panel-emitted scalar and triggers a repaint;
+// the shader's |amount|>eps tests keep identity (0) a free no-op.
+void GLPreview::setSharpen(float amount)
+{
+    m_sharpenAmount = amount;
+    update();
+}
+
+void GLPreview::setBlur(float radiusPx)
+{
+    m_blurRadius = radiusPx;
+    update();
+}
+
+void GLPreview::setLensDistortion(float amount)
+{
+    m_lensDistortion = amount;
+    update();
+}
+
+// US-3D: 3-axis rotation + perspective foreshortening. Build the 3x3
+// rotation matrix from intrinsic Tait-Bryan XYZ Euler angles
+// (R = Rx * Ry * Rz) on the CPU side and ship it to the fragment shader as
+// a QMatrix3x3. perspectiveDist is the inverse FOV — clamped to [0.1..10.0]
+// so the shader's perspective divide cannot go singular. Identity (all
+// angles 0, perspectiveDist any value) is detected with a tight epsilon
+// and turns the stage into a free no-op.
+void GLPreview::setRotation3D(float xDeg, float yDeg, float zDeg, float perspectiveDist)
+{
+    constexpr float kPi = 3.14159265358979323846f;
+    const float xRad = xDeg * kPi / 180.0f;
+    const float yRad = yDeg * kPi / 180.0f;
+    const float zRad = zDeg * kPi / 180.0f;
+
+    const float cx = std::cos(xRad), sx = std::sin(xRad);
+    const float cy = std::cos(yRad), sy = std::sin(yRad);
+    const float cz = std::cos(zRad), sz = std::sin(zRad);
+
+    // R = Rx * Ry * Rz (intrinsic Tait-Bryan). Standard rotation matrices.
+    //   Rx = [1 0 0; 0 cx -sx; 0 sx cx]
+    //   Ry = [cy 0 sy; 0 1 0; -sy 0 cy]
+    //   Rz = [cz -sz 0; sz cz 0; 0 0 1]
+    // Composed product written out so we don't pull in QMatrix4x4 multiply.
+    // QMatrix3x3(const float*) expects row-major values.
+    m_rot3DMatrix[0] = cy * cz;
+    m_rot3DMatrix[1] = -cy * sz;
+    m_rot3DMatrix[2] = sy;
+    m_rot3DMatrix[3] = sx * sy * cz + cx * sz;
+    m_rot3DMatrix[4] = -sx * sy * sz + cx * cz;
+    m_rot3DMatrix[5] = -sx * cy;
+    m_rot3DMatrix[6] = -cx * sy * cz + sx * sz;
+    m_rot3DMatrix[7] = cx * sy * sz + sx * cz;
+    m_rot3DMatrix[8] = cx * cy;
+
+    m_perspectiveDist = std::max(0.1f, std::min(10.0f, perspectiveDist));
+
+    // Identity check: any axis with non-trivial rotation enables the stage.
+    // 0.05° threshold matches the slider's integer-degree resolution so a
+    // dead-centre slider produces a true no-op.
+    constexpr float kIdentityThreshold = 0.05f;
+    m_rot3DEnabled = (std::abs(xDeg) > kIdentityThreshold
+                   || std::abs(yDeg) > kIdentityThreshold
+                   || std::abs(zDeg) > kIdentityThreshold);
+    update();
+}
+
+// US-INT-4: stabilizer keyframe ingest. Vector is copied; caller-supplied
+// keyframes are assumed sorted by timeUs (analyzeFile produces them in
+// frame-decode order which is monotonic). Empty vector disables the stage.
+void GLPreview::setStabilizerKeyframes(const QVector<StabilizerKeyframe> &kfs)
+{
+    m_stabKeyframes = kfs;
+    if (m_stabKeyframes.isEmpty()) {
+        m_stabEnabled = false;
+        m_stabMatrix[0] = 1.0f; m_stabMatrix[1] = 0.0f; m_stabMatrix[2] = 0.0f;
+        m_stabMatrix[3] = 0.0f; m_stabMatrix[4] = 1.0f; m_stabMatrix[5] = 0.0f;
+        m_stabMatrix[6] = 0.0f; m_stabMatrix[7] = 0.0f; m_stabMatrix[8] = 1.0f;
+    }
+    update();
+}
+
+// US-INT-4: per-frame source-time hook. std::lower_bound picks the first
+// keyframe with timeUs >= sourceUs; we lerp between (idx-1) and idx for a
+// smooth inverse-affine. Out-of-range source times clamp to the endpoints.
+// Builds the inverse 2D affine in (lensCoord-0.5) space:
+//   inverse stab = scale(1/s) * rotate(-theta) * translate(-dx_uv, -dy_uv)
+// where dx_uv/dy_uv are the keyframe pixel offsets divided by frame size
+// (frame size = MotionStabilizer's last source dim, captured below). The
+// resulting 3x3 mat3 is stored row-major in m_stabMatrix.
+void GLPreview::setStabilizerSourceTimeUs(qint64 sourceUs)
+{
+    m_stabSourceUs = sourceUs;
+    if (m_stabKeyframes.isEmpty()) {
+        m_stabEnabled = false;
+        return;
+    }
+
+    // Binary search for the first keyframe with timeUs >= sourceUs.
+    auto cmp = [](const StabilizerKeyframe &kf, qint64 t) { return kf.timeUs < t; };
+    auto it = std::lower_bound(m_stabKeyframes.constBegin(), m_stabKeyframes.constEnd(),
+                               sourceUs, cmp);
+    int idx = static_cast<int>(it - m_stabKeyframes.constBegin());
+
+    double dx = 0.0, dy = 0.0, theta = 0.0, scl = 1.0;
+    if (idx <= 0) {
+        const auto &kf = m_stabKeyframes.first();
+        dx = kf.dx; dy = kf.dy; theta = kf.theta; scl = kf.scale;
+    } else if (idx >= m_stabKeyframes.size()) {
+        const auto &kf = m_stabKeyframes.last();
+        dx = kf.dx; dy = kf.dy; theta = kf.theta; scl = kf.scale;
+    } else {
+        const auto &a = m_stabKeyframes[idx - 1];
+        const auto &b = m_stabKeyframes[idx];
+        const qint64 span = b.timeUs - a.timeUs;
+        const double t = (span > 0)
+            ? static_cast<double>(sourceUs - a.timeUs) / static_cast<double>(span)
+            : 0.0;
+        dx    = a.dx    + (b.dx    - a.dx)    * t;
+        dy    = a.dy    + (b.dy    - a.dy)    * t;
+        theta = a.theta + (b.theta - a.theta) * t;
+        scl   = a.scale + (b.scale - a.scale) * t;
+    }
+
+    // Frame size: MotionStabilizer trans deltas are in SOURCE pixels; the
+    // shader pre-warp operates in normalised (0..1) UV space. Divide by
+    // current frame dimensions (set by setFrameSize / displayFrame). Fall
+    // back to 1920x1080 if unknown so we don't divide by zero.
+    const double fw = (m_stabFrameW > 0) ? static_cast<double>(m_stabFrameW) : 1920.0;
+    const double fh = (m_stabFrameH > 0) ? static_cast<double>(m_stabFrameH) : 1080.0;
+    const double dxUv = dx / fw;
+    const double dyUv = dy / fh;
+
+    // Inverse 2D affine in (cx, cy, 1) space:
+    //   c' = (1/s) * R(-theta) * c - (dxUv, dyUv)
+    // where R(-theta) = [ cosT  sinT; -sinT  cosT ] (note flipped signs vs R(theta))
+    const double invS = (std::abs(scl) > 1e-9) ? 1.0 / scl : 1.0;
+    const double cT = std::cos(-theta);
+    const double sT = std::sin(-theta);
+
+    // Row-major 3x3 matrix [m11 m12 m13; m21 m22 m23; 0 0 1].
+    // q.x = invS*(cT*cx + sT*cy) - dxUv
+    // q.y = invS*(-sT*cx + cT*cy) - dyUv
+    m_stabMatrix[0] = static_cast<float>(invS * cT);
+    m_stabMatrix[1] = static_cast<float>(invS * sT);
+    m_stabMatrix[2] = static_cast<float>(-dxUv);
+    m_stabMatrix[3] = static_cast<float>(invS * -sT);
+    m_stabMatrix[4] = static_cast<float>(invS * cT);
+    m_stabMatrix[5] = static_cast<float>(-dyUv);
+    m_stabMatrix[6] = 0.0f;
+    m_stabMatrix[7] = 0.0f;
+    m_stabMatrix[8] = 1.0f;
+
+    constexpr double kIdEps = 1e-6;
+    m_stabEnabled = (std::abs(dxUv) > kIdEps
+                  || std::abs(dyUv) > kIdEps
+                  || std::abs(theta) > kIdEps
+                  || std::abs(scl - 1.0) > kIdEps);
     update();
 }
 
