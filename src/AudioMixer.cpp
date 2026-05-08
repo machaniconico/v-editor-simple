@@ -1367,6 +1367,23 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
     if (m_decodeRunner) m_decodeRunner->wake();
 }
 
+// US-INT-2 Phase A: stub — store per-entry speed ramps; the audio worker
+// thread does not yet consume them (variable-speed atempo deferred to
+// Phase B to avoid regressing the just-stabilised US-FIX-3 砂嵐ノイズ
+// fix — introducing real-time time-stretch into the per-track DSP chain
+// needs separate noise testing). The vector is held under m_controlMutex
+// so a future Phase B audio-side reader can take the same lock without
+// races against the GUI-thread setter.
+void AudioMixer::setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps)
+{
+    {
+        QMutexLocker lock(&m_controlMutex);
+        m_speedRamps = ramps;
+    }
+    qInfo() << "AudioMixer::setSpeedRamps count=" << ramps.size()
+            << "(Phase A: stored only; per-fragment atempo deferred to Phase B)";
+}
+
 void AudioMixer::seekTo(int64_t timelineUs) {
     qInfo() << "AudioMixer::seekTo us=" << timelineUs
             << "playing=" << m_playing.load(std::memory_order_acquire);

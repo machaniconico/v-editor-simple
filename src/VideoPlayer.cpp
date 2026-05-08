@@ -903,6 +903,24 @@ void VideoPlayer::setAudioSequence(const QVector<PlaybackEntry> &entries)
     }
 }
 
+// US-INT-2 Phase A: store per-entry speed ramps parallel to m_sequence.
+// The active consumer is entryLocalPositionUs (video reprojection); audio
+// time-stretching is deferred to Phase B. Caller (MainWindow) MUST invoke
+// setSpeedRamps in lockstep with setSequence to keep parallel arrays
+// consistent. A size mismatch is logged but tolerated — entryLocalPositionUs
+// guards out-of-range indices and falls back to identity.
+void VideoPlayer::setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps)
+{
+    qInfo() << "VideoPlayer::setSpeedRamps count=" << ramps.size()
+            << "(sequence size=" << m_sequence.size() << ")";
+    m_speedRamps = ramps;
+    if (m_speedRamps.size() != m_sequence.size()) {
+        qWarning()
+            << "VideoPlayer::setSpeedRamps SIZE MISMATCH — entries past"
+            << m_speedRamps.size() << "fall back to identity ramp";
+    }
+}
+
 int VideoPlayer::findActiveEntryAt(int64_t timelineUs) const
 {
     if (m_sequence.isEmpty()) return -1;
@@ -954,8 +972,27 @@ int64_t VideoPlayer::entryLocalPositionUs(int entryIdx, int64_t timelineUs) cons
     const double tSec = static_cast<double>(timelineUs) / AV_TIME_BASE;
     const double offsetIntoEntry = qMax(0.0, tSec - e.timelineStart);
     const double speed = (e.speed > 0.0) ? e.speed : 1.0;
-    const double localSec = e.clipIn + offsetIntoEntry * speed;
-    return static_cast<int64_t>(localSec * AV_TIME_BASE);
+    // US-INT-2 Phase A: ramp-aware reprojection. The legacy uniform
+    // `clip.speed` (carried on PlaybackEntry as `e.speed`) and the
+    // per-clip SpeedRamp curve compose multiplicatively — first scale
+    // timeline-time into the already-uniformly-stretched clip frame
+    // (offsetIntoEntry * speed), then bend that linear axis through the
+    // ramp via timelineToSourceUs(). Identity ramp short-circuits to
+    // the legacy uniform formula so identity clips and clips on builds
+    // without ramps are bit-exact unchanged. The size guard handles the
+    // brief window after setSequence runs but before setSpeedRamps lands.
+    const bool haveRamp = (entryIdx < m_speedRamps.size())
+                       && !m_speedRamps[entryIdx].isIdentity();
+    if (!haveRamp) {
+        const double localSec = e.clipIn + offsetIntoEntry * speed;
+        return static_cast<int64_t>(localSec * AV_TIME_BASE);
+    }
+    const qint64 scaledTlUs =
+        static_cast<qint64>(offsetIntoEntry * speed * AV_TIME_BASE);
+    const qint64 srcOffsetUs =
+        m_speedRamps[entryIdx].timelineToSourceUs(scaledTlUs);
+    const int64_t clipInUs = static_cast<int64_t>(e.clipIn * AV_TIME_BASE);
+    return clipInUs + srcOffsetUs;
 }
 
 int64_t VideoPlayer::fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) const

@@ -324,6 +324,13 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     if (clip.trailOut.type != TransitionType::None)
         obj["trailOut"] = transitionToJson(clip.trailOut);
 
+    // US-INT-2 Phase A: persist non-identity speed ramps. Identity ramps
+    // are skipped to keep project files compact and forward-compatible
+    // (older builds without the field load fine via SpeedRamp::identity()
+    // default in clipFromJson).
+    if (!clip.speedRamp.isIdentity())
+        obj["speedRamp"] = clip.speedRamp.toJson();
+
     return obj;
 }
 
@@ -371,6 +378,9 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         clip.leadIn = transitionFromJson(obj["leadIn"].toObject());
     if (obj.contains("trailOut"))
         clip.trailOut = transitionFromJson(obj["trailOut"].toObject());
+
+    if (obj.contains("speedRamp"))
+        clip.speedRamp = speedramp::SpeedRamp::fromJson(obj["speedRamp"].toObject());
 
     return clip;
 }

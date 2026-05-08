@@ -325,6 +325,27 @@ void MainWindow::setupUI()
             e.filePath = pm.getProxyPath(e.filePath);
         qInfo() << "MainWindow: forwarding sequenceChanged entries=" << resolved.size();
         m_player->setSequence(resolved);
+        // US-INT-2 Phase A: gather per-entry speed ramps in lockstep with
+        // setSequence. Key by (sourceTrack, sourceClipIndex) — positional
+        // alignment between resolved[] and any single track's clips() is
+        // unsafe (gaps + overlaps mean the indexes diverge). Missing or
+        // out-of-range clips fall back to identity so the parallel array
+        // size always matches resolved.
+        QVector<speedramp::SpeedRamp> videoRamps;
+        videoRamps.reserve(resolved.size());
+        const auto &vTracks = m_timeline->videoTracks();
+        for (const auto &e : resolved) {
+            if (e.sourceTrack >= 0 && e.sourceTrack < vTracks.size()) {
+                const auto &clips = vTracks[e.sourceTrack]->clips();
+                if (e.sourceClipIndex >= 0
+                    && e.sourceClipIndex < clips.size()) {
+                    videoRamps.append(clips[e.sourceClipIndex].speedRamp);
+                    continue;
+                }
+            }
+            videoRamps.append(speedramp::SpeedRamp::identity());
+        }
+        m_player->setSpeedRamps(videoRamps);
     });
     // Audio-side schedule — feeds AudioMixer so every active entry across
     // A1..A16 is sum-mixed into a single output. Unlinked A clips and
@@ -337,6 +358,25 @@ void MainWindow::setupUI()
             e.filePath = pm.getProxyPath(e.filePath);
         qInfo() << "MainWindow: forwarding audioSequenceChanged entries=" << resolved.size();
         m_player->setAudioSequence(resolved);
+        // US-INT-2 Phase A: forward audio-side speed ramps (stored only for
+        // now; AudioMixer Phase B will read them under m_controlMutex when
+        // per-fragment atempo lands).
+        QVector<speedramp::SpeedRamp> audioRamps;
+        audioRamps.reserve(resolved.size());
+        const auto &aTracks = m_timeline->audioTracks();
+        for (const auto &e : resolved) {
+            if (e.sourceTrack >= 0 && e.sourceTrack < aTracks.size()) {
+                const auto &clips = aTracks[e.sourceTrack]->clips();
+                if (e.sourceClipIndex >= 0
+                    && e.sourceClipIndex < clips.size()) {
+                    audioRamps.append(clips[e.sourceClipIndex].speedRamp);
+                    continue;
+                }
+            }
+            audioRamps.append(speedramp::SpeedRamp::identity());
+        }
+        if (auto *mix = m_player->audioMixer())
+            mix->setSpeedRamps(audioRamps);
     });
     // Per-track solo state lives on the mixer (effective gain applied per
     // entry); audioSequenceChanged alone can't carry it because solo is
