@@ -22,6 +22,8 @@
 #include "SpeedRampData.h"
 #include "AdjustmentLayer.h"
 #include "MotionStabilizer.h"
+#include "Camera3D.h"
+#include "MotionSectionWidget.h"
 
 // Where Timeline::addClip drops a freshly-imported clip. Persisted via
 // QSettings('VSimpleEditor','Preferences')/importPlacement; the MainWindow
@@ -79,6 +81,9 @@ struct ClipInfo {
     double videoScale = 1.0;
     double videoDx = 0.0;
     double videoDy = 0.0;
+    double rotation2DDegrees = 0.0;
+    bool is3DLayer = false;
+    Layer3DTransform layer3D;
 
     // Future multi-track compositing groundwork. 1.0 = opaque (current
     // V1-wins behaviour). <1.0 values are placeholders until the layered
@@ -449,6 +454,7 @@ public:
 
     // Audio
     void addAudioFile(const QString &filePath);
+    void insertAudioClipAtPlayhead(const QString &wavPath, int trackIdx = 2);
     void toggleMuteTrack(int audioTrackIndex);
     void toggleSoloTrack(int audioTrackIndex);
     void normalizeAudioClipPeak(int trackIdx, int clipIdx);
@@ -497,6 +503,8 @@ public:
     // new transform on the next advanceToEntry.
     bool setClipVideoTransform(int trackIdx, int clipIdx,
                                double scale, double dx, double dy);
+    void setClipMotion(int trackIdx, int clipIdx,
+                       const effectctrl::MotionState &motion);
     // Update an existing overlay's start/end time. Called from the timeline
     // text strip when the user drags an overlay's edge handle.
     bool updateTextOverlayTime(int overlayIndex, double startTime, double endTime);

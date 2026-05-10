@@ -8,6 +8,7 @@
 #include "VideoEffect.h"
 #include "Keyframe.h"
 #include "Overlay.h"
+#include "PlanarTracker.h"
 
 // --- Audio mixer serialization sub-types ---
 
@@ -76,6 +77,9 @@ struct ProjectData {
 
     // US-FEAT-A: overlay persistence
     QList<OverlayItem> overlays;
+
+    // US-MOCHA-2: planar track persistence
+    QVector<planartrack::PlanarTrack> planarTracks;
 };
 
 class ProjectFile
@@ -126,4 +130,8 @@ private:
     // US-FEAT-A: overlay persistence
     static QJsonObject overlayToJson(const OverlayItem &o);
     static OverlayItem overlayFromJson(const QJsonObject &obj);
+
+    // US-MOCHA-2: planar track persistence
+    static QJsonObject planarTrackToJson(const planartrack::PlanarTrack &t);
+    static planartrack::PlanarTrack planarTrackFromJson(const QJsonObject &obj);
 };

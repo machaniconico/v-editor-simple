@@ -2,6 +2,8 @@
 #include "Timeline.h"
 #include "VideoPlayer.h"
 #include "AdjustmentLayer.h"
+#include "Camera3D.h"
+#include "SurfaceTool.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -90,6 +92,132 @@ bool stallTraceEnabled()
     return kEnabled;
 }
 constexpr qint64 kStallThresholdInteropLockMs = 50;
+
+struct PreviewClipMotion {
+    bool valid = false;
+    int trackIdx = -1;
+    int clipIdx = -1;
+    double scale = 1.0;
+    double dx = 0.0;
+    double dy = 0.0;
+    double rotation2D = 0.0;
+    double opacity = 1.0;
+    bool is3DLayer = false;
+    Layer3DTransform layer3D;
+};
+
+bool fuzzyMatchMotionValue(double a, double b, double eps = 1e-4)
+{
+    return std::abs(a - b) <= eps;
+}
+
+QImage applyPlanarRotation(const QImage &image, double degrees)
+{
+    if (image.isNull() || std::abs(degrees) <= 1e-4)
+        return image;
+
+    const QImage src = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    QImage rotated(src.size(), QImage::Format_ARGB32_Premultiplied);
+    rotated.fill(Qt::transparent);
+
+    QPainter painter(&rotated);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+    painter.translate(src.width() * 0.5, src.height() * 0.5);
+    painter.rotate(degrees);
+    painter.translate(-src.width() * 0.5, -src.height() * 0.5);
+    painter.drawImage(0, 0, src);
+    painter.end();
+    return rotated;
+}
+
+PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clipIdx)
+{
+    PreviewClipMotion motion;
+    motion.valid = true;
+    motion.trackIdx = trackIdx;
+    motion.clipIdx = clipIdx;
+    motion.scale = clip.videoScale;
+    motion.dx = clip.videoDx;
+    motion.dy = clip.videoDy;
+    motion.rotation2D = clip.rotation2DDegrees;
+    motion.opacity = clip.opacity;
+    motion.is3DLayer = clip.is3DLayer;
+    motion.layer3D = clip.is3DLayer ? clip.layer3D : Layer3DTransform{};
+    return motion;
+}
+
+PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double timelineSec,
+                                           bool compositeBaked,
+                                           double currentScale, double currentDx, double currentDy)
+{
+    if (!timeline)
+        return {};
+
+    struct ActiveClipRef {
+        int trackIdx = -1;
+        int clipIdx = -1;
+        const ClipInfo *clip = nullptr;
+    };
+
+    QVector<ActiveClipRef> activeClips;
+    const auto &videoTracks = timeline->videoTracks();
+    for (int trackIdx = 0; trackIdx < videoTracks.size(); ++trackIdx) {
+        const auto *track = videoTracks[trackIdx];
+        if (!track || track->isHidden())
+            continue;
+
+        double accumSec = 0.0;
+        const auto &clips = track->clips();
+        for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
+            const ClipInfo &clip = clips[clipIdx];
+            accumSec += qMax(0.0, clip.leadInSec);
+            const double durationSec = clip.effectiveDuration();
+            const double startSec = accumSec;
+            const double endSec = startSec + durationSec;
+            if (durationSec > 0.0
+                && timelineSec >= startSec - 1e-6
+                && timelineSec <= endSec + 1e-6) {
+                activeClips.append(ActiveClipRef{trackIdx, clipIdx, &clip});
+                break;
+            }
+            accumSec = endSec;
+        }
+    }
+
+    if (activeClips.isEmpty())
+        return {};
+    if (compositeBaked && activeClips.size() > 1)
+        return {};
+    if (activeClips.size() == 1)
+        return makePreviewMotion(*activeClips.first().clip,
+                                 activeClips.first().trackIdx,
+                                 activeClips.first().clipIdx);
+
+    for (int trackIdx = 0; trackIdx < videoTracks.size(); ++trackIdx) {
+        const auto *track = videoTracks[trackIdx];
+        if (!track)
+            continue;
+        const int selectedClipIdx = track->selectedClip();
+        if (selectedClipIdx < 0)
+            continue;
+        for (const ActiveClipRef &ref : activeClips) {
+            if (ref.trackIdx == trackIdx && ref.clipIdx == selectedClipIdx)
+                return makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx);
+        }
+    }
+
+    for (const ActiveClipRef &ref : activeClips) {
+        if (fuzzyMatchMotionValue(ref.clip->videoScale, currentScale)
+            && fuzzyMatchMotionValue(ref.clip->videoDx, currentDx)
+            && fuzzyMatchMotionValue(ref.clip->videoDy, currentDy)) {
+            return makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx);
+        }
+    }
+
+    return makePreviewMotion(*activeClips.first().clip,
+                             activeClips.first().trackIdx,
+                             activeClips.first().clipIdx);
+}
 } // namespace
 
 // Vertex shader — simple fullscreen quad
@@ -112,6 +240,7 @@ out vec4 FragColor;
 
 uniform sampler2D uTexture;
 uniform bool uEffectsEnabled;
+uniform float uClipOpacity;
 
 // Color correction uniforms
 uniform float uBrightness;   // -100 to 100
@@ -749,6 +878,7 @@ void main() {
     if (uFxChromaKeyEnable)
         outColor = applyChromaKey(outColor.rgb, uFxChromaKey, uFxChromaTolerance);
 
+    outColor *= uClipOpacity;
     FragColor = outColor;
 }
 )";
@@ -1154,6 +1284,7 @@ void GLPreview::createShaderProgram()
     m_locShadows        = m_program->uniformLocation("uShadows");
     m_locExposure       = m_program->uniformLocation("uExposure");
     m_locEffectsEnabled = m_program->uniformLocation("uEffectsEnabled");
+    m_locClipOpacity    = m_program->uniformLocation("uClipOpacity");
     m_locHdrTransfer    = m_program->uniformLocation("uHdrTransfer");
 
     m_locFxBlurEnable        = m_program->uniformLocation("uFxBlurEnable");
@@ -1572,6 +1703,46 @@ void GLPreview::paintGL()
         }
     }
 
+    PreviewClipMotion previewMotion;
+    if (m_timeline) {
+        double timelineSec = 0.0;
+        if (auto *player = qobject_cast<VideoPlayer *>(parentWidget()))
+            timelineSec = static_cast<double>(player->timelinePositionUs()) / AV_TIME_BASE;
+        previewMotion = resolvePreviewClipMotion(m_timeline, timelineSec,
+                                                 m_compositeBakedMode,
+                                                 m_videoSourceScale,
+                                                 m_videoSourceDx,
+                                                 m_videoSourceDy);
+    }
+
+    double renderScale = m_videoSourceScale;
+    double renderDx = m_videoSourceDx;
+    double renderDy = m_videoSourceDy;
+    double clipOpacity = 1.0;
+    QImage uploadFrame = m_currentFrame;
+    if (previewMotion.valid) {
+        renderScale = previewMotion.scale;
+        renderDx = previewMotion.dx;
+        renderDy = previewMotion.dy;
+        clipOpacity = qBound(0.0, previewMotion.opacity, 1.0);
+        if (m_videoDragMode == VideoDragNone) {
+            m_videoSourceScale = renderScale;
+            m_videoSourceDx = renderDx;
+            m_videoSourceDy = renderDy;
+        }
+        if (!m_compositeBakedMode
+            && (std::abs(previewMotion.rotation2D) > 1e-4 || previewMotion.is3DLayer)) {
+            uploadFrame = applyPlanarRotation(m_currentFrame, previewMotion.rotation2D);
+            if (previewMotion.is3DLayer) {
+                Camera3DState cameraState;
+                uploadFrame = Camera3D::applyPerspective(uploadFrame,
+                                                         previewMotion.layer3D,
+                                                         cameraState,
+                                                         uploadFrame.size());
+            }
+        }
+    }
+
     // US-T34 OBS-style source transform — shrink/move the viewport so the
     // same texture renders inside a translated+scaled sub-rect of the
     // letterbox. OpenGL's Y axis is bottom-up, so dy is inverted.
@@ -1581,15 +1752,15 @@ void GLPreview::paintGL()
     // user's drag state (if it called setVideoSourceTransform(1, 0, 0))
     // or apply the transform twice on top of the baked canvas.
     if (!m_compositeBakedMode
-        && (m_videoSourceScale != 1.0 || m_videoSourceDx != 0.0 || m_videoSourceDy != 0.0)) {
+        && (renderScale != 1.0 || renderDx != 0.0 || renderDy != 0.0)) {
         const int baseW = viewportW;
         const int baseH = viewportH;
-        const int newW = qMax(1, qRound(baseW * m_videoSourceScale));
-        const int newH = qMax(1, qRound(baseH * m_videoSourceScale));
+        const int newW = qMax(1, qRound(baseW * renderScale));
+        const int newH = qMax(1, qRound(baseH * renderScale));
         const int baseCx = viewportX + baseW / 2;
         const int baseCy = viewportY + baseH / 2;
-        const int offsetPxX = qRound(m_videoSourceDx * baseW);
-        const int offsetPxY = qRound(m_videoSourceDy * baseH);
+        const int offsetPxX = qRound(renderDx * baseW);
+        const int offsetPxY = qRound(renderDy * baseH);
         viewportX = baseCx + offsetPxX - newW / 2;
         viewportY = baseCy - offsetPxY - newH / 2;
         viewportW = newW;
@@ -1602,14 +1773,14 @@ void GLPreview::paintGL()
     // per frame (~8 MB for 1080p RGBA) thrashes driver memory and has been
     // observed to crash Intel/AMD drivers after a few hundred frames.
     if (m_needsUpload) {
-        const int fw = m_currentFrame.width();
-        const int fh = m_currentFrame.height();
+        const int fw = uploadFrame.width();
+        const int fh = uploadFrame.height();
         if (fw <= 0 || fh <= 0) {
             m_needsUpload = false;
             return;
         }
 
-        const QImage::Format frameFmt = m_currentFrame.format();
+        const QImage::Format frameFmt = uploadFrame.format();
         const bool is16 = (frameFmt == QImage::Format_RGBA64
                            || frameFmt == QImage::Format_RGBA64_Premultiplied);
         const bool isRGB888 = (frameFmt == QImage::Format_RGB888);
@@ -1674,7 +1845,7 @@ void GLPreview::paintGL()
             ? QOpenGLTexture::UInt16
             : QOpenGLTexture::UInt8;
         m_texture->setData(0, 0, upPixFormat, upPixType,
-                           static_cast<const void*>(m_currentFrame.constBits()));
+                           static_cast<const void*>(uploadFrame.constBits()));
         m_needsUpload = false;
     }
 
@@ -1687,6 +1858,8 @@ void GLPreview::paintGL()
     // Set uniforms
     m_program->setUniformValue(m_locTexture, 0);
     m_program->setUniformValue(m_locEffectsEnabled, m_effectsEnabled);
+    if (m_locClipOpacity != -1)
+        m_program->setUniformValue(m_locClipOpacity, static_cast<float>(clipOpacity));
     m_program->setUniformValue(m_locHdrTransfer, m_hdrTransfer);
 
     // Seed every Fx uniform to off/zero; enable only those found in m_videoEffects.
@@ -2151,6 +2324,14 @@ void GLPreview::paintGL()
             }
         }
     }
+
+    // US-MOCHA-3: SurfaceTool overlay — 4-corner pin gizmo drawn after all
+    // other overlay visuals so it renders on top.
+    if (m_surfaceTool && m_surfaceTool->isEnabled()) {
+        QPainter spainter(this);
+        spainter.setRenderHint(QPainter::Antialiasing, true);
+        m_surfaceTool->paintOverlay(spainter, letterboxRect());
+    }
 }
 
 QRectF GLPreview::letterboxRect() const
@@ -2439,6 +2620,13 @@ void GLPreview::clearTextToolRect()
 
 void GLPreview::mousePressEvent(QMouseEvent *event)
 {
+    // US-MOCHA-3: SurfaceTool intercepts mouse events when installed and enabled.
+    if (m_surfaceTool && m_surfaceTool->isEnabled()) {
+        if (m_surfaceTool->handleMousePress(event->pos(), event->button(), event->modifiers())) {
+            event->accept();
+            return;
+        }
+    }
     // US-T34 Video source transform: only active when the text tool is OFF
     // so it doesn't clash with text creation / click-to-edit gestures.
     if (!m_textToolActive && event->button() == Qt::LeftButton) {
@@ -2557,6 +2745,13 @@ void GLPreview::mousePressEvent(QMouseEvent *event)
 
 void GLPreview::mouseMoveEvent(QMouseEvent *event)
 {
+    // US-MOCHA-3: SurfaceTool handles mouse move when dragging a corner.
+    if (m_surfaceTool && m_surfaceTool->isEnabled()) {
+        if (m_surfaceTool->handleMouseMove(event->pos(), event->modifiers())) {
+            event->accept();
+            return;
+        }
+    }
     // US-T34 video transform drag / hover cursor
     if (!m_textToolActive) {
         if (m_videoDragMode != VideoDragNone) {
@@ -2698,6 +2893,13 @@ void GLPreview::mouseMoveEvent(QMouseEvent *event)
 
 void GLPreview::mouseReleaseEvent(QMouseEvent *event)
 {
+    // US-MOCHA-3: SurfaceTool handles mouse release when dragging a corner.
+    if (m_surfaceTool && m_surfaceTool->isEnabled()) {
+        if (m_surfaceTool->handleMouseRelease(event->pos(), event->button(), event->modifiers())) {
+            event->accept();
+            return;
+        }
+    }
     if (!m_textToolActive && m_videoDragMode != VideoDragNone) {
         m_videoDragMode = VideoDragNone;
         m_videoDragHandle = HandleNone;
@@ -3293,5 +3495,12 @@ void GLPreview::clearLut()
     // US-FEAT-B: zero intensity so LUT has no residual effect if re-enabled
     m_lutIntensity = 0.0f;
     doneCurrent();
+    update();
+}
+
+// US-MOCHA-3: install a SurfaceTool for 4-corner planar tracking gizmo.
+void GLPreview::installSurfaceTool(SurfaceTool *tool)
+{
+    m_surfaceTool = tool;
     update();
 }

@@ -2095,15 +2095,20 @@ void Timeline::setupUI()
     m_headerLayout->setContentsMargins(0, 0, 0, 0);
     m_headerLayout->setSpacing(2);
     // Magnet (snap) toggle in the header column's top area. Fixed height
-    // pairs with the right side's [time-ruler 22 + playhead-overlay 15]
-    // strip. The header column's QVBoxLayout spacing (2 px) sits AFTER
-    // this row, while the right side's tracksOuterLayout has spacing=0
-    // — shave 2 px here so the V/A separator on the left lines up with
-    // the V/A separator on the right (otherwise the header column drifts
-    // 2 px below the track column at the V/A boundary).
+    // must equal the total of all fixed-height widgets that sit above the
+    // first track row on the right side: marker-lane (16 px) + time-ruler
+    // (22 px) + playhead-overlay (15 px) = 53 px. The header column's
+    // QVBoxLayout spacing (2 px) fires once after this widget, so we
+    // subtract 2 px so the V/A separator on the left lines up with the
+    // V/A separator on the right (otherwise the header column drifts 2 px
+    // below the track column at the V/A boundary).
     auto *magnetArea = new QWidget(m_headerColumn);
     m_magnetArea = magnetArea;
-    magnetArea->setFixedHeight(22 + 15 - 2);
+    // 16 = MarkerLane::kLaneHeight (private, can't reference directly)
+    // 22 = TimeRuler fixed height, 15 = PlayheadOverlay fixed height
+    // -2 = compensates for the 2 px QVBoxLayout spacing that fires once
+    //      after this widget before the first track header row.
+    magnetArea->setFixedHeight(16 + 22 + 15 - 2);
     magnetArea->setStyleSheet("background-color: #1f1f1f;");
     auto *magnetRow = new QHBoxLayout(magnetArea);
     magnetRow->setContentsMargins(6, 2, 6, 2);
@@ -3078,6 +3083,40 @@ bool Timeline::setClipVideoTransform(int trackIdx, int clipIdx,
     track->setClips(clips);
     scheduleEmitSequenceChanged();
     return true;
+}
+
+void Timeline::setClipMotion(int trackIdx, int clipIdx,
+                             const effectctrl::MotionState &motion)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size())
+        return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track)
+        return;
+
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return;
+
+    ClipInfo &clip = clips[clipIdx];
+    clip.videoScale = qBound(0.0, motion.scale, 10.0);
+    clip.videoDx = qBound(-10000.0, motion.dx, 10000.0);
+    clip.videoDy = qBound(-10000.0, motion.dy, 10000.0);
+    clip.rotation2DDegrees = qBound(-360.0, motion.rotation2DDeg, 360.0);
+    clip.opacity = qBound(0.0, motion.opacity, 1.0);
+    clip.is3DLayer = motion.is3DLayer;
+    clip.layer3D.positionZ = motion.is3DLayer
+        ? qBound(-10000.0, motion.posZ, 10000.0) : 0.0;
+    clip.layer3D.rotationX = motion.is3DLayer
+        ? qBound(-360.0, motion.rotX, 360.0) : 0.0;
+    clip.layer3D.rotationY = motion.is3DLayer
+        ? qBound(-360.0, motion.rotY, 360.0) : 0.0;
+    clip.layer3D.rotationZ = motion.is3DLayer
+        ? qBound(-360.0, motion.rotZ, 360.0) : 0.0;
+
+    track->setClips(clips);
+    emitSequenceChangedNow();
+    emit positionChanged(m_playheadPos);
 }
 
 bool Timeline::updateTextOverlayTime(int overlayIndex, double startTime, double endTime)
@@ -4140,6 +4179,68 @@ void Timeline::addAudioFile(const QString &filePath)
     target->addClip(clip);
     saveUndoState("Add audio");
     updateInfoLabel();
+}
+
+void Timeline::insertAudioClipAtPlayhead(const QString &wavPath, int trackIdx)
+{
+    // Probe duration via FFmpeg
+    AVFormatContext *fmt = nullptr;
+    double duration = 0.0;
+    if (avformat_open_input(&fmt, wavPath.toUtf8().constData(), nullptr, nullptr) == 0) {
+        if (avformat_find_stream_info(fmt, nullptr) >= 0)
+            duration = static_cast<double>(fmt->duration) / AV_TIME_BASE;
+        avformat_close_input(&fmt);
+    }
+
+    ClipInfo clip;
+    clip.filePath = wavPath;
+    clip.displayName = QFileInfo(wavPath).fileName();
+    clip.duration = duration;
+    clip.linkGroup = allocateLinkGroup();
+
+    // Determine target audio track: trackIdx is 1-based (2 = A2).
+    // If the requested track doesn't exist, create it.
+    int targetIndex = trackIdx - 1; // convert to 0-based
+    if (targetIndex < 0 || targetIndex >= m_audioTracks.size()) {
+        // Create tracks up to the requested one
+        while (m_audioTracks.size() <= targetIndex) {
+            addAudioTrack();
+        }
+    }
+
+    TimelineTrack *target = m_audioTracks[targetIndex];
+    if (!target) return;
+
+    // Insert at the playhead position: find the clip index where playhead falls
+    double playheadSec = m_playheadPos;
+    double accumulatedTime = 0.0;
+    int insertIdx = 0;
+    const auto &clips = target->clips();
+    for (int i = 0; i < clips.size(); ++i) {
+        double clipEnd = accumulatedTime + clips[i].leadInSec + clips[i].effectiveDuration();
+        if (playheadSec < clipEnd) {
+            // Playhead is within or before this clip
+            if (playheadSec < accumulatedTime + clips[i].leadInSec) {
+                // In the lead-in gap before this clip
+                insertIdx = i;
+            } else {
+                // Inside the clip — insert after it
+                insertIdx = i + 1;
+            }
+            break;
+        }
+        accumulatedTime = clipEnd;
+        insertIdx = i + 1;
+    }
+
+    // Set leadInSec so the clip starts at the playhead position
+    clip.leadInSec = playheadSec - accumulatedTime;
+    if (clip.leadInSec < 0.0) clip.leadInSec = 0.0;
+
+    target->insertClip(insertIdx, clip);
+    saveUndoState("Insert voice-over");
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
 }
 
 void Timeline::toggleMuteTrack(int audioTrackIndex)

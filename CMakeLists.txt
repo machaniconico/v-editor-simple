@@ -4,6 +4,8 @@ project(v-simple-editor VERSION 0.14.0 LANGUAGES CXX)
 set(VEDITOR_EDITION "classic" CACHE STRING "Build edition: classic (H.264/HEVC) | modern (+ AV1)")
 set_property(CACHE VEDITOR_EDITION PROPERTY STRINGS classic modern)
 message(STATUS "VEDITOR_EDITION = ${VEDITOR_EDITION}")
+option(VEDITOR_PLANAR_TRACKER_SELFTEST "Enable the planar tracker synthetic self-test helper" OFF)
+option(VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST "Enable the effect param schema round-trip self-test" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,9 +50,27 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/Overlay.cpp
     src/OverlayDialogs.cpp
     src/VideoEffect.cpp
+    src/EffectParamSchema.h
+    src/EffectParamSchema.cpp
     src/VideoEffectDialogs.cpp
     src/ColorWheelWidget.cpp
     src/ColorGradingPanel.cpp
+    src/EffectControlsPanel.h
+    src/EffectControlsPanel.cpp
+    src/MotionSectionWidget.h
+    src/MotionSectionWidget.cpp
+    src/EffectRowWidget.h
+    src/EffectRowWidget.cpp
+    src/EffectKeyframeNavBar.h
+    src/EffectKeyframeNavBar.cpp
+    src/EffectKeyframeToggle.h
+    src/EffectKeyframeToggle.cpp
+    src/EffectControlsToolbar.h
+    src/EffectControlsToolbar.cpp
+    src/EffectClipboard.h
+    src/EffectClipboard.cpp
+    src/PasteAttributesDialog.h
+    src/PasteAttributesDialog.cpp
     src/CurveEditor.cpp
     src/HueVsSatEditor.cpp
     src/HueVsSatEditor.h
@@ -83,6 +103,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ProxyManagementDialog.cpp
     src/DecoderSlotManager.cpp
     src/AudioMixer.cpp
+    src/PlanarTracker.cpp
+    src/PlanarTracker.h
+    src/SurfaceTool.cpp
+    src/SurfaceTool.h
     src/EqualizerPanel.cpp
     src/EqualizerPanel.h
     src/CompressorPanel.cpp
@@ -108,6 +132,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/RenderQueueDialog.h
     src/AudioEQ.cpp
     src/ScreenRecorder.cpp
+    src/VoiceOverRecorder.h
+    src/VoiceOverRecorder.cpp
+    src/VoiceOverDialog.h
+    src/VoiceOverDialog.cpp
     src/AIHighlight.cpp
     src/SceneDetector.cpp
     src/LayerCompositor.cpp
@@ -165,5 +193,7 @@ endif()
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     APP_VERSION="${PROJECT_VERSION}"
     VEDITOR_EDITION="${VEDITOR_EDITION}"
+    $<$<BOOL:${VEDITOR_PLANAR_TRACKER_SELFTEST}>:VEDITOR_PLANAR_TRACKER_SELFTEST=1>
+    $<$<BOOL:${VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST}>:VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST=1>
     $<$<STREQUAL:${VEDITOR_EDITION},modern>:VEDITOR_AV1=1>
 )

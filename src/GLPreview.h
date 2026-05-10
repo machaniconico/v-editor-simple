@@ -20,6 +20,7 @@
 #include "MotionStabilizer.h"
 
 class Timeline;
+class SurfaceTool;
 
 class GLPreview : public QOpenGLWidget, protected QOpenGLFunctions
 {
@@ -243,6 +244,9 @@ public:
     // it pull from farther away. MainWindow persists via QSettings.
     void setSnapStrength(double pixels) { m_snapStrength = qMax(0.0, pixels); }
     double snapStrength() const { return m_snapStrength; }
+    // US-MOCHA-3: SurfaceTool integration — installs a 4-corner pin gizmo
+    // that draws on top of the GLPreview and intercepts mouse events when enabled.
+    void installSurfaceTool(SurfaceTool *tool);
 
 signals:
     void textRectRequested(const QRectF &normalizedRect);
@@ -386,6 +390,7 @@ private:
     int m_locExposure = -1;
     int m_locEffectsEnabled = -1;
     int m_locHdrTransfer = -1;
+    int m_locClipOpacity = -1;
     int m_hdrTransfer = 0;  // 0=none, 1=PQ, 2=HLG
 
     QVector<VideoEffect> m_videoEffects;
@@ -571,4 +576,7 @@ private:
     QOpenGLShaderProgram *m_nv12Program = nullptr;
     int m_locNv12TexY = -1;
     int m_locNv12TexUV = -1;
+
+    // US-MOCHA-3: SurfaceTool for 4-corner planar tracking gizmo.
+    SurfaceTool *m_surfaceTool = nullptr;
 };

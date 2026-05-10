@@ -1,4 +1,5 @@
 #include "VideoEffect.h"
+#include "EffectParamSchema.h"
 #include <QPainter>
 #include <QtMath>
 #include <QRandomGenerator>
@@ -54,6 +55,93 @@ VideoEffect VideoEffect::createInvert()
     { VideoEffect e; e.type = VideoEffectType::Invert; return e; }
 VideoEffect VideoEffect::createNoise(double a)
     { VideoEffect e; e.type = VideoEffectType::Noise; e.param1 = a; return e; }
+
+// ===== EffectParamSchema helper accessors =====
+
+namespace effectctrl {
+
+double paramValue(const VideoEffect &effect, const QString &paramName)
+{
+    auto schema = paramSchemaFor(effect.type);
+    for (const auto &def : schema) {
+        if (def.name == paramName) {
+            if (def.type == ParamType::Color) return 0.0;
+            if (paramName == "radius" && effect.type == VideoEffectType::Blur)
+                return effect.param1;
+            if (paramName == "amount" && effect.type == VideoEffectType::Sharpen)
+                return effect.param1;
+            if (paramName == "blockSize" && effect.type == VideoEffectType::Mosaic)
+                return effect.param1;
+            if (paramName == "tolerance" && effect.type == VideoEffectType::ChromaKey)
+                return effect.param1;
+            if (paramName == "softness" && effect.type == VideoEffectType::ChromaKey)
+                return effect.param2;
+            if (paramName == "intensity" && effect.type == VideoEffectType::Vignette)
+                return effect.param1;
+            if (paramName == "radius" && effect.type == VideoEffectType::Vignette)
+                return effect.param2;
+            if (paramName == "intensity" && effect.type == VideoEffectType::Sepia)
+                return effect.param1;
+            if (paramName == "amount" && effect.type == VideoEffectType::Noise)
+                return effect.param1;
+            return def.defaultVal;
+        }
+    }
+    return 0.0;
+}
+
+void setParamValue(VideoEffect &effect, const QString &paramName, double value)
+{
+    auto schema = paramSchemaFor(effect.type);
+    for (const auto &def : schema) {
+        if (def.name == paramName) {
+            if (def.type == ParamType::Color) return;
+            if (paramName == "radius" && effect.type == VideoEffectType::Blur) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "amount" && effect.type == VideoEffectType::Sharpen) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "blockSize" && effect.type == VideoEffectType::Mosaic) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "tolerance" && effect.type == VideoEffectType::ChromaKey) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "softness" && effect.type == VideoEffectType::ChromaKey) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "intensity" && effect.type == VideoEffectType::Vignette) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "radius" && effect.type == VideoEffectType::Vignette) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "intensity" && effect.type == VideoEffectType::Sepia) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "amount" && effect.type == VideoEffectType::Noise) {
+                effect.param1 = value; return;
+            }
+            return;
+        }
+    }
+}
+
+QColor colorParamValue(const VideoEffect &effect, const QString &paramName)
+{
+    if (paramName == "color" && effect.type == VideoEffectType::ChromaKey)
+        return effect.keyColor;
+    return QColor();
+}
+
+void setColorParam(VideoEffect &effect, const QString &paramName, QColor color)
+{
+    if (paramName == "color" && effect.type == VideoEffectType::ChromaKey)
+        effect.keyColor = color;
+}
+
+} // namespace effectctrl
 
 // ===== Color Correction Processing =====
 

@@ -7,7 +7,10 @@
 #include "VideoEffectDialogs.h"
 #include "EffectPlugin.h"
 #include "ColorGradingPanel.h"
+#include "EffectControlsPanel.h"
 #include "LumetriScopes.h"
+#include "EffectClipboard.h"
+#include "PasteAttributesDialog.h"
 #include <QDockWidget>
 #include "GLPreview.h"
 #include "EqualizerPanel.h"
@@ -15,6 +18,7 @@
 #include "ReverbPanel.h"
 #include "NoiseReductionPanel.h"
 #include "TitlePresetDialog.h"
+#include "VoiceOverDialog.h"
 #include "MultiCamDialog.h"
 #include "RenderQueueDialog.h"
 #include "SceneDetector.h"
@@ -174,6 +178,11 @@ MainWindow::MainWindow(QWidget *parent)
     qInfo() << "MainWindow::ctor end";
 }
 
+double MainWindow::currentPlayheadSeconds() const
+{
+    return m_timeline ? m_timeline->playheadPosition() : 0.0;
+}
+
 void MainWindow::setupUI()
 {
     auto *centralWidget = new QWidget(this);
@@ -308,7 +317,12 @@ void MainWindow::setupUI()
     mainLayout->addWidget(m_mainSplitter);
     setCentralWidget(centralWidget);
 
-    connect(m_player, &VideoPlayer::positionChanged, m_timeline, &Timeline::setPlayheadPosition);
+    connect(m_player, &VideoPlayer::positionChanged, this, [this](double seconds) {
+        if (m_timeline) {
+            m_timeline->setPlayheadPosition(seconds);
+        }
+        emit playheadSecondsChanged(seconds);
+    });
     connect(m_timeline, &Timeline::scrubPositionChanged, this, [this](double seconds) {
         m_player->previewSeek(qRound(static_cast<double>(seconds) * 1000.0));
     });
@@ -564,6 +578,28 @@ void MainWindow::setupMenuBar()
 
     editMenu->addSeparator();
 
+    m_copyEffectsAction = editMenu->addAction("Copy Effects");
+    m_copyEffectsAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_C));
+    connect(m_copyEffectsAction, &QAction::triggered, this, &MainWindow::copyEffects);
+
+    m_pasteEffectsAction = editMenu->addAction("Paste Effects");
+    m_pasteEffectsAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_V));
+    connect(m_pasteEffectsAction, &QAction::triggered, this, &MainWindow::pasteEffects);
+
+    m_pasteAttributesAction = editMenu->addAction("Paste Attributes...");
+    connect(m_pasteAttributesAction, &QAction::triggered, this, &MainWindow::pasteAttributes);
+
+    auto &clipBoard = effectctrl::EffectClipboard::instance();
+    m_pasteEffectsAction->setEnabled(clipBoard.hasContent());
+    m_pasteAttributesAction->setEnabled(clipBoard.hasContent());
+    connect(&clipBoard, &effectctrl::EffectClipboard::contentChanged, this, [this]() {
+        const bool has = effectctrl::EffectClipboard::instance().hasContent();
+        if (m_pasteEffectsAction) m_pasteEffectsAction->setEnabled(has);
+        if (m_pasteAttributesAction) m_pasteAttributesAction->setEnabled(has);
+    });
+
+    editMenu->addSeparator();
+
     auto *applyDefaultTransAct = editMenu->addAction("規定トランジションを適用(&D)");
     applyDefaultTransAct->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_D));
     connect(applyDefaultTransAct, &QAction::triggered, this, &MainWindow::applyDefaultTransition);
@@ -683,6 +719,10 @@ void MainWindow::setupMenuBar()
 
     auto *bgmAction = audioMenu->addAction("BGM / 音声ファイルを追加...");
     connect(bgmAction, &QAction::triggered, this, &MainWindow::addBgm);
+
+    auto *voiceOverAction = audioMenu->addAction("Voice-over Record...");
+    voiceOverAction->setShortcut(QKeySequence(Qt::Key_F12));
+    connect(voiceOverAction, &QAction::triggered, this, &MainWindow::openVoiceOverDialog);
 
     audioMenu->addSeparator();
 
@@ -1269,6 +1309,21 @@ void MainWindow::setupMenuBar()
         m_player->glPreview()->setLensDistortion(lens);
     });
 
+    // US-EFC-1: Effect Controls panel — per-clip effect parameter panel.
+    m_effectControlsPanel = new effectctrl::EffectControlsPanel(this);
+    m_effectControlsPanel->setVisible(false);
+    addDockWidget(Qt::RightDockWidgetArea, m_effectControlsPanel);
+    m_effectControlsPanel->close();
+
+    m_effectControlsPanel->setTimeline(m_timeline);
+    m_effectControlsPanel->setMainWindow(this);
+    connect(m_timeline, &Timeline::clipSelectedOnTrack,
+            m_effectControlsPanel, &effectctrl::EffectControlsPanel::refreshFromCurrentClip);
+    connect(m_effectControlsPanel, &effectctrl::EffectControlsPanel::effectsChanged,
+            this, [this](const QVector<VideoEffect> &effects) {
+        m_timeline->setClipEffects(effects);
+    });
+
     // US-3D: 3-axis rotation + perspective foreshortening (Premiere "Basic
     // 3D" / Resolve "Transform" 3D rotation parity). Forwarded directly to
     // GLPreview::setRotation3D, which builds the 3x3 rotation matrix on the
@@ -1308,6 +1363,11 @@ void MainWindow::setupMenuBar()
     colorPanelAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_G));
     connect(colorPanelAction, &QAction::toggled, m_colorGradingPanel, &QDockWidget::setVisible);
     connect(m_colorGradingPanel, &QDockWidget::visibilityChanged, colorPanelAction, &QAction::setChecked);
+
+    auto *effectControlsAction = viewMenu->addAction("Effect Controls");
+    effectControlsAction->setCheckable(true);
+    connect(effectControlsAction, &QAction::toggled, m_effectControlsPanel, &QDockWidget::setVisible);
+    connect(m_effectControlsPanel, &QDockWidget::visibilityChanged, effectControlsAction, &QAction::setChecked);
 
     // Lumetri Scopes dock — Histogram + Luma Waveform + Vectorscope. Off
     // by default so first-run users aren't paying CPU on scope math; the
@@ -1918,6 +1978,127 @@ void MainWindow::pasteClip()
     m_timeline->pasteClip();
     statusBar()->showMessage("Pasted clip");
     updateEditActions();
+}
+
+void MainWindow::copyEffects()
+{
+    if (!m_timeline || !m_timeline->hasSelection()) {
+        statusBar()->showMessage("No clip selected", 3000);
+        return;
+    }
+    const int clipIdx = m_timeline->selectedVideoClipIndex();
+    if (clipIdx < 0) {
+        statusBar()->showMessage("No clip selected", 3000);
+        return;
+    }
+    const auto &clips = m_timeline->videoClips();
+    const auto &clip = clips[clipIdx];
+
+    effectctrl::ClipMotion motion;
+    motion.scale = clip.videoScale;
+    motion.dx = clip.videoDx;
+    motion.dy = clip.videoDy;
+    motion.rotationDeg = clip.rotation2DDegrees;
+    motion.opacity = clip.opacity;
+
+    effectctrl::EffectClipboard::instance().capture(clip.effects, motion);
+    statusBar()->showMessage("Effects copied", 2000);
+}
+
+void MainWindow::pasteEffects()
+{
+    if (!m_timeline || !m_timeline->hasSelection()) {
+        statusBar()->showMessage("No clip selected", 3000);
+        return;
+    }
+    auto &clipboard = effectctrl::EffectClipboard::instance();
+    if (!clipboard.hasContent()) {
+        statusBar()->showMessage("Clipboard is empty", 2000);
+        return;
+    }
+    const int clipIdx = m_timeline->selectedVideoClipIndex();
+    const int trackIdx = 0; // V1
+    if (clipIdx < 0) {
+        statusBar()->showMessage("No clip selected", 3000);
+        return;
+    }
+
+    m_timeline->setClipEffects(clipboard.effects());
+
+    effectctrl::MotionState motion;
+    motion.scale = clipboard.motion().scale;
+    motion.dx = clipboard.motion().dx;
+    motion.dy = clipboard.motion().dy;
+    motion.rotation2DDeg = clipboard.motion().rotationDeg;
+    motion.opacity = clipboard.motion().opacity;
+    motion.is3DLayer = false;
+    motion.posZ = 0.0;
+    motion.rotX = 0.0;
+    motion.rotY = 0.0;
+    motion.rotZ = 0.0;
+    m_timeline->setClipMotion(trackIdx, clipIdx, motion);
+
+    statusBar()->showMessage("Effects pasted", 2000);
+}
+
+void MainWindow::pasteAttributes()
+{
+    if (!m_timeline || !m_timeline->hasSelection()) {
+        statusBar()->showMessage("No clip selected", 3000);
+        return;
+    }
+    auto &clipboard = effectctrl::EffectClipboard::instance();
+    if (!clipboard.hasContent()) {
+        statusBar()->showMessage("Clipboard is empty", 2000);
+        return;
+    }
+    const int clipIdx = m_timeline->selectedVideoClipIndex();
+    const int trackIdx = 0;
+    if (clipIdx < 0) {
+        statusBar()->showMessage("No clip selected", 3000);
+        return;
+    }
+    const auto &clips = m_timeline->videoClips();
+    auto targetClip = clips[clipIdx];
+
+    PasteAttributesDialog dialog(clipboard.effects(), clipboard.motion(), this);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    auto sel = dialog.selection();
+
+    if (sel.pastePosition || sel.pasteScale || sel.pasteRotation || sel.pasteOpacity) {
+        effectctrl::MotionState motion;
+        const auto &cbMotion = clipboard.motion();
+        const auto &srcClip = targetClip;
+
+        motion.scale = sel.pasteScale ? cbMotion.scale : srcClip.videoScale;
+        motion.dx = sel.pastePosition ? cbMotion.dx : srcClip.videoDx;
+        motion.dy = sel.pastePosition ? cbMotion.dy : srcClip.videoDy;
+        motion.rotation2DDeg = sel.pasteRotation ? cbMotion.rotationDeg : srcClip.rotation2DDegrees;
+        motion.opacity = sel.pasteOpacity ? cbMotion.opacity : srcClip.opacity;
+        motion.is3DLayer = srcClip.is3DLayer;
+        motion.posZ = srcClip.layer3D.positionZ;
+        motion.rotX = srcClip.layer3D.rotationX;
+        motion.rotY = srcClip.layer3D.rotationY;
+        motion.rotZ = srcClip.layer3D.rotationZ;
+
+        m_timeline->setClipMotion(trackIdx, clipIdx, motion);
+    }
+
+    if (!sel.effectIndices.isEmpty()) {
+        auto targetEffects = targetClip.effects;
+        const auto &cbEffects = clipboard.effects();
+
+        targetEffects.clear();
+        for (int idx : sel.effectIndices) {
+            if (idx >= 0 && idx < cbEffects.size())
+                targetEffects.append(cbEffects[idx]);
+        }
+
+        m_timeline->setClipEffects(targetEffects);
+    }
+
+    statusBar()->showMessage("Attributes past", 2000);
 }
 
 void MainWindow::undoAction()
@@ -5971,4 +6152,54 @@ void MainWindow::jumpToPrevMarker()
         tr("マーカーへジャンプ: %1 (%2s)")
             .arg(m.label)
             .arg(m.timelineUs / 1.0e6, 0, 'f', 2), 2500);
+}
+
+void MainWindow::openVoiceOverDialog()
+{
+    if (m_voiceOverDialog) {
+        m_voiceOverDialog->raise();
+        m_voiceOverDialog->activateWindow();
+        return;
+    }
+
+    // Build default output path
+    QString projectDir;
+    if (!m_projectFilePath.isEmpty()) {
+        projectDir = QFileInfo(m_projectFilePath).absolutePath();
+    } else {
+        projectDir = QDir::homePath();
+    }
+    QString audioDir = projectDir + "/audio";
+    QDir dir(audioDir);
+    if (!dir.exists())
+        dir.mkpath(".");
+
+    QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss");
+    QString defaultPath = audioDir + "/voiceover-" + timestamp + ".wav";
+
+    m_voiceOverDialog = new voiceover::VoiceOverDialog(defaultPath, this);
+
+    // Mute audio preview during recording to prevent feedback
+    const bool wasMuted = m_player ? m_player->isMuted() : false;
+    if (m_player)
+        m_player->setMuted(true);
+
+    connect(m_voiceOverDialog, &voiceover::VoiceOverDialog::recordingStopped,
+            this, [this](const QString &wavPath, qint64) {
+                if (m_voiceOverDialog && m_voiceOverDialog->insertAtPlayhead() && m_timeline) {
+                    m_timeline->insertAudioClipAtPlayhead(wavPath, 2);
+                    statusBar()->showMessage(
+                        tr("Voice-over inserted at playhead: %1").arg(wavPath), 5000);
+                }
+            });
+
+    connect(m_voiceOverDialog, &QDialog::finished,
+            this, [this, wasMuted](int) {
+                if (m_player)
+                    m_player->setMuted(wasMuted);
+                m_voiceOverDialog->deleteLater();
+                m_voiceOverDialog = nullptr;
+            });
+
+    m_voiceOverDialog->exec();
 }

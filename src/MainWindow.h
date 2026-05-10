@@ -57,6 +57,17 @@
 #include "WelcomeWidget.h"
 #include "HistoryDockWidget.h"
 
+namespace effectctrl {
+class EffectClipboard;
+class EffectControlsPanel;
+struct ClipMotion;
+}
+class PasteAttributesDialog;
+
+namespace voiceover {
+class VoiceOverDialog;
+}
+
 class VideoPlayer;
 class Timeline;
 class ExportDialog;
@@ -75,6 +86,14 @@ public slots:
 
     // Used by main.cpp --play flag: start video playback.
     void testStartPlayback();
+
+public:
+    // Current playhead position in seconds. Used by EffectControlsPanel
+    // for keyframe insertion at the current timeline position.
+    double currentPlayheadSeconds() const;
+
+signals:
+    void playheadSecondsChanged(double seconds);
 
 private slots:
     void newProject();
@@ -197,8 +216,12 @@ private slots:
     void openCompressorPanel();
     void openReverbPanel();
     void openNoiseReductionPanel();
+    void openVoiceOverDialog();
     void openTitlePresetDialog();
     void openMultiCamDialog();
+    void copyEffects();
+    void pasteEffects();
+    void pasteAttributes();
     // Receives MultiCamDialog::applyToTimeline. Replaces V1 + A1 with the
     // EDL encoded in MultiCamProject::switches (with a confirm prompt when
     // V1 is non-empty). No-op on Cancel; missing-file segments are skipped
@@ -242,6 +265,7 @@ private:
     Timeline *m_timeline;
     class ProxyProgressDialog *m_proxyDialog = nullptr;
     class ColorGradingPanel *m_colorGradingPanel = nullptr;
+    effectctrl::EffectControlsPanel *m_effectControlsPanel = nullptr;
     QStringList m_supportedFormats;
     ProjectConfig m_projectConfig;
 
@@ -252,6 +276,9 @@ private:
     QAction *m_rippleDeleteAction;
     QAction *m_copyAction;
     QAction *m_pasteAction;
+    QAction *m_copyEffectsAction = nullptr;
+    QAction *m_pasteEffectsAction = nullptr;
+    QAction *m_pasteAttributesAction = nullptr;
     QAction *m_undoAction;
     QAction *m_redoAction;
     QAction *m_snapAction;
@@ -358,4 +385,7 @@ private:
     // Modeless render queue dialog — kept alive between invocations so
     // running jobs persist when the user closes the window.
     class RenderQueueDialog *m_renderQueueDialog = nullptr;
+
+    // Voice-over recording
+    voiceover::VoiceOverDialog *m_voiceOverDialog = nullptr;
 };

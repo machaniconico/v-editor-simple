@@ -99,6 +99,18 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     // projectFileAdjustmentLayersToJson() once the UI lands.
     root["adjustmentLayers"] = QJsonArray{};
 
+    // US-MOCHA-2: planar tracks — skip empty / all-identity tracks on save
+    // to keep project files compact (forward-compat guard).
+    {
+        QJsonArray ptArr;
+        for (const auto &t : data.planarTracks) {
+            if (!planartrack::shouldSkipOnSave(t)) {
+                ptArr.append(planarTrackToJson(t));
+            }
+        }
+        root["planarTracks"] = ptArr;
+    }
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -155,6 +167,13 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             data.overlays.append(overlayFromJson(v.toObject()));
     }
 
+    // US-MOCHA-2: planar tracks — backward compat: missing key = empty vector
+    data.planarTracks.clear();
+    if (root.contains("planarTracks")) {
+        for (const auto &v : root["planarTracks"].toArray())
+            data.planarTracks.append(planarTrackFromJson(v.toObject()));
+    }
+
     return true;
 }
 
@@ -205,6 +224,17 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     // Adjustment layers — see save() above for rationale (schema reserved).
     root["adjustmentLayers"] = QJsonArray{};
 
+    // US-MOCHA-2: planar tracks — skip empty / all-identity tracks on save
+    {
+        QJsonArray ptArr;
+        for (const auto &t : data.planarTracks) {
+            if (!planartrack::shouldSkipOnSave(t)) {
+                ptArr.append(planarTrackToJson(t));
+            }
+        }
+        root["planarTracks"] = ptArr;
+    }
+
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
 }
@@ -253,6 +283,13 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
             data.overlays.append(overlayFromJson(v.toObject()));
     }
 
+    // US-MOCHA-2: planar tracks — backward compat: missing key = empty vector
+    data.planarTracks.clear();
+    if (root.contains("planarTracks")) {
+        for (const auto &v : root["planarTracks"].toArray())
+            data.planarTracks.append(planarTrackFromJson(v.toObject()));
+    }
+
     return true;
 }
 
@@ -293,7 +330,10 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["videoScale"] = clip.videoScale;
     obj["videoDx"] = clip.videoDx;
     obj["videoDy"] = clip.videoDy;
+    obj["rotation2DDegrees"] = clip.rotation2DDegrees;
     obj["opacity"] = clip.opacity;
+    obj["is3DLayer"] = clip.is3DLayer;
+    obj["layer3D"] = clip.layer3D.toJson();
 
     if (!clip.volumeEnvelope.isEmpty()) {
         QJsonArray envArr;
@@ -347,7 +387,14 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.videoScale = obj["videoScale"].toDouble(1.0);
     clip.videoDx = obj["videoDx"].toDouble(0.0);
     clip.videoDy = obj["videoDy"].toDouble(0.0);
+    clip.rotation2DDegrees = obj["rotation2DDegrees"].toDouble(0.0);
     clip.opacity = obj["opacity"].toDouble(1.0);
+    clip.is3DLayer = obj["is3DLayer"].toBool(false);
+    clip.layer3D = obj.contains("layer3D")
+        ? Layer3DTransform::fromJson(obj["layer3D"].toObject())
+        : Layer3DTransform{};
+    if (!clip.is3DLayer)
+        clip.layer3D.reset();
 
     if (obj.contains("volumeEnvelope")) {
         for (const auto &v : obj["volumeEnvelope"].toArray()) {
@@ -711,4 +758,18 @@ OverlayItem ProjectFile::overlayFromJson(const QJsonObject &obj)
     o.opacity = obj["opacity"].toDouble(1.0);
     o.trackIdx = obj["trackIdx"].toInt(0);
     return o;
+}
+
+// --- US-MOCHA-2: planar track persistence ---
+
+QJsonObject ProjectFile::planarTrackToJson(const planartrack::PlanarTrack &t)
+{
+    return planartrack::toJson(t);
+}
+
+planartrack::PlanarTrack ProjectFile::planarTrackFromJson(const QJsonObject &obj)
+{
+    planartrack::PlanarTrack t;
+    planartrack::fromJson(obj, t);
+    return t;
 }
