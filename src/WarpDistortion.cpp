@@ -1,7 +1,229 @@
 #include "WarpDistortion.h"
 
+#include <QDebug>
+
 #include <algorithm>
 #include <cmath>
+#include <limits>
+
+namespace {
+
+constexpr double kHomographySingularThreshold = 1e-12;
+constexpr double kHomographyProjectiveThreshold = 1e-12;
+constexpr int kMaxHomographyOversample = 4;
+
+struct PremultipliedSample {
+    double r = 0.0;
+    double g = 0.0;
+    double b = 0.0;
+    double a = 0.0;
+};
+
+struct ImageView {
+    const QRgb *pixels = nullptr;
+    int width = 0;
+    int height = 0;
+    int stride = 0;
+};
+
+ImageView makeImageView(const QImage &image)
+{
+    ImageView view;
+    view.pixels = reinterpret_cast<const QRgb *>(image.constBits());
+    view.width = image.width();
+    view.height = image.height();
+    view.stride = image.bytesPerLine() / static_cast<int>(sizeof(QRgb));
+    return view;
+}
+
+PremultipliedSample bilinearPremultipliedSample(const ImageView &image, double x, double y)
+{
+    PremultipliedSample sample;
+    if (image.pixels == nullptr || image.width <= 0 || image.height <= 0) {
+        return sample;
+    }
+    if (x < 0.0 || y < 0.0
+        || x > static_cast<double>(image.width - 1)
+        || y > static_cast<double>(image.height - 1)) {
+        return sample;
+    }
+
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = static_cast<int>(std::floor(y));
+    const int x1 = std::min(x0 + 1, image.width - 1);
+    const int y1 = std::min(y0 + 1, image.height - 1);
+
+    const double fx = x - static_cast<double>(x0);
+    const double fy = y - static_cast<double>(y0);
+    const double w00 = (1.0 - fx) * (1.0 - fy);
+    const double w10 = fx * (1.0 - fy);
+    const double w01 = (1.0 - fx) * fy;
+    const double w11 = fx * fy;
+
+    const QRgb c00 = image.pixels[y0 * image.stride + x0];
+    const QRgb c10 = image.pixels[y0 * image.stride + x1];
+    const QRgb c01 = image.pixels[y1 * image.stride + x0];
+    const QRgb c11 = image.pixels[y1 * image.stride + x1];
+
+    sample.r = qRed(c00) * w00 + qRed(c10) * w10 + qRed(c01) * w01 + qRed(c11) * w11;
+    sample.g = qGreen(c00) * w00 + qGreen(c10) * w10 + qGreen(c01) * w01 + qGreen(c11) * w11;
+    sample.b = qBlue(c00) * w00 + qBlue(c10) * w10 + qBlue(c01) * w01 + qBlue(c11) * w11;
+    sample.a = qAlpha(c00) * w00 + qAlpha(c10) * w10 + qAlpha(c01) * w01 + qAlpha(c11) * w11;
+    return sample;
+}
+
+QRgb packPremultipliedSample(const PremultipliedSample &sample)
+{
+    const int alpha = std::clamp(static_cast<int>(std::lround(sample.a)), 0, 255);
+    const int red = std::clamp(static_cast<int>(std::lround(sample.r)), 0, alpha);
+    const int green = std::clamp(static_cast<int>(std::lround(sample.g)), 0, alpha);
+    const int blue = std::clamp(static_cast<int>(std::lround(sample.b)), 0, alpha);
+    return qRgba(red, green, blue, alpha);
+}
+
+planartrack::Homography identityHomography()
+{
+    return planartrack::Homography{
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0
+    };
+}
+
+planartrack::Homography invertHomography(const planartrack::Homography &H, bool &usedIdentityFallback)
+{
+    const double a = H[0];
+    const double b = H[1];
+    const double c = H[2];
+    const double d = H[3];
+    const double e = H[4];
+    const double f = H[5];
+    const double g = H[6];
+    const double h = H[7];
+    const double i = H[8];
+
+    const double c00 = e * i - f * h;
+    const double c01 = -(d * i - f * g);
+    const double c02 = d * h - e * g;
+    const double c10 = -(b * i - c * h);
+    const double c11 = a * i - c * g;
+    const double c12 = -(a * h - b * g);
+    const double c20 = b * f - c * e;
+    const double c21 = -(a * f - c * d);
+    const double c22 = a * e - b * d;
+
+    const double det = a * c00 + b * c01 + c * c02;
+    if (std::abs(det) < kHomographySingularThreshold) {
+        usedIdentityFallback = true;
+        return identityHomography();
+    }
+
+    usedIdentityFallback = false;
+    const double invDet = 1.0 / det;
+    return planartrack::Homography{
+        c00 * invDet, c10 * invDet, c20 * invDet,
+        c01 * invDet, c11 * invDet, c21 * invDet,
+        c02 * invDet, c12 * invDet, c22 * invDet
+    };
+}
+
+bool mapPoint(const planartrack::Homography &H, double x, double y, double &outX, double &outY)
+{
+    const double wx = H[0] * x + H[1] * y + H[2];
+    const double wy = H[3] * x + H[4] * y + H[5];
+    const double w = H[6] * x + H[7] * y + H[8];
+    if (std::abs(w) < kHomographyProjectiveThreshold) {
+        outX = std::numeric_limits<double>::quiet_NaN();
+        outY = std::numeric_limits<double>::quiet_NaN();
+        return false;
+    }
+    outX = wx / w;
+    outY = wy / w;
+    return true;
+}
+
+} // namespace
+
+WarpDistortionSettings &warpDistortionSettings()
+{
+    static WarpDistortionSettings settings;
+    return settings;
+}
+
+void applyHomography(const QImage &src, const planartrack::Homography &H, QImage &dst)
+{
+    if (src.isNull()) {
+        dst = QImage();
+        return;
+    }
+
+    const bool isPremultiplied = src.format() == QImage::Format_ARGB32_Premultiplied;
+    const QImage workingSrc = isPremultiplied
+        ? src
+        : src.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+
+    QImage workingDst(src.size(), QImage::Format_ARGB32_Premultiplied);
+    workingDst.fill(Qt::transparent);
+
+    bool usedIdentityFallback = false;
+    const planartrack::Homography inverse = invertHomography(H, usedIdentityFallback);
+    if (usedIdentityFallback) {
+        qWarning() << "applyHomography: near-singular homography, falling back to identity";
+    }
+
+    const int oversample = std::clamp(
+        warpDistortionSettings().homographyOversample,
+        1,
+        kMaxHomographyOversample);
+    const double invSampleCount = 1.0 / static_cast<double>(oversample * oversample);
+
+    const ImageView srcView = makeImageView(workingSrc);
+    QRgb *dstPixels = reinterpret_cast<QRgb *>(workingDst.bits());
+    const int dstStride = workingDst.bytesPerLine() / static_cast<int>(sizeof(QRgb));
+
+    for (int yd = 0; yd < workingDst.height(); ++yd) {
+        QRgb *dstRow = dstPixels + yd * dstStride;
+        for (int xd = 0; xd < workingDst.width(); ++xd) {
+            PremultipliedSample accum;
+            for (int sy = 0; sy < oversample; ++sy) {
+                const double offsetY = oversample == 1
+                    ? 0.0
+                    : ((static_cast<double>(sy) + 0.5) / oversample) - 0.5;
+                for (int sx = 0; sx < oversample; ++sx) {
+                    const double offsetX = oversample == 1
+                        ? 0.0
+                        : ((static_cast<double>(sx) + 0.5) / oversample) - 0.5;
+
+                    double srcX = 0.0;
+                    double srcY = 0.0;
+                    if (!mapPoint(inverse,
+                                  static_cast<double>(xd) + offsetX,
+                                  static_cast<double>(yd) + offsetY,
+                                  srcX,
+                                  srcY)) {
+                        continue;
+                    }
+
+                    const PremultipliedSample sample = bilinearPremultipliedSample(srcView, srcX, srcY);
+                    accum.r += sample.r;
+                    accum.g += sample.g;
+                    accum.b += sample.b;
+                    accum.a += sample.a;
+                }
+            }
+
+            accum.r *= invSampleCount;
+            accum.g *= invSampleCount;
+            accum.b *= invSampleCount;
+            accum.a *= invSampleCount;
+            dstRow[xd] = packPremultipliedSample(accum);
+        }
+    }
+
+    dst = isPremultiplied
+        ? workingDst
+        : workingDst.convertToFormat(src.format());
+}
 
 // ============================================================
 //  Enum <-> String helpers (file-local)

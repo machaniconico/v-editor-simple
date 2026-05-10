@@ -1,13 +1,16 @@
 #pragma once
 
+#include <array>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QMap>
 #include <QPointF>
+#include <QPolygonF>
 #include <QString>
 #include <QVector>
 
 #include "MotionTracker.h"
+#include "PlanarTracker.h"
 #include "TextManager.h"
 
 // --- Link target type ---
@@ -20,6 +23,10 @@ enum class LinkTarget {
     ShapeLayer,
     ParticleEmitter
 };
+
+// --- TrackerLink mode (AC1: Point=0 for backward compat) ---
+
+enum class Mode { Point = 0, Planar };
 
 // --- Linked property ---
 
@@ -88,6 +95,17 @@ public:
     static QVector<QPointF> smoothPositions(const QVector<QPointF> &positions,
                                             int windowSize);
 
+    // --- Planar mode (AC1) ---
+
+    void setMode(Mode mode);
+    Mode mode() const { return m_mode; }
+
+    void setPlanarTrack(const planartrack::PlanarTrack *track);
+    void setRefQuad(const planartrack::Quad &quad) { m_refQuad = quad; }
+    planartrack::Quad refQuad() const { return m_refQuad; }
+
+    QPolygonF computePlanarQuad(int frameIndex) const;
+
     // --- Serialisation ---
 
     QJsonObject toJson() const;
@@ -102,6 +120,25 @@ private:
 
     // Derive rotation from region centre movement direction
     double deriveRotation(const TrackingResult &result, double time) const;
+
+    // --- Per-corner 2D Kalman filter (AC3) ---
+
+    struct KalmanCorner {
+        double x = 0.0, y = 0.0;
+        double vx = 0.0, vy = 0.0;
+        bool initialized = false;
+    };
+
+    QPointF kalmanPredict(KalmanCorner &state, double dt) const;
+    QPointF kalmanUpdate(KalmanCorner &state, const QPointF &measurement,
+                         double smoothingStrength) const;
+    void resetKalmanState() const;
+
+    Mode m_mode = Mode::Point;
+    const planartrack::PlanarTrack *m_planarTrack = nullptr;
+    planartrack::Quad m_refQuad;
+    mutable std::array<KalmanCorner, 4> m_kalmanState;
+    mutable int m_lastPlanarFrame = -1;
 
     QVector<TrackerLinkConfig> m_links;
 };

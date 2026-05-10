@@ -5,6 +5,58 @@
 #include <algorithm>
 #include <cmath>
 
+namespace {
+
+static QPointF transformPoint(const planartrack::Homography &H, double x, double y)
+{
+    double w = H[6] * x + H[7] * y + H[8];
+    if (std::abs(w) < 1e-12)
+        return QPointF(x, y);
+    double nx = (H[0] * x + H[1] * y + H[2]) / w;
+    double ny = (H[3] * x + H[4] * y + H[5]) / w;
+    return QPointF(nx, ny);
+}
+
+static bool isIdentityForPlanar(const planartrack::Homography &H)
+{
+    constexpr double tol = 1e-9;
+    return std::abs(H[0] - 1.0) < tol && std::abs(H[1]) < tol && std::abs(H[2]) < tol
+        && std::abs(H[3]) < tol && std::abs(H[4] - 1.0) < tol && std::abs(H[5]) < tol
+        && std::abs(H[6]) < tol && std::abs(H[7]) < tol && std::abs(H[8] - 1.0) < tol;
+}
+
+static planartrack::Homography findFrameHomography(const planartrack::PlanarTrack *track, int frameIndex)
+{
+    if (!track || track->frames.empty())
+        return {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
+
+    if (frameIndex < 0 || frameIndex >= static_cast<int>(track->frames.size())) {
+        int idx = qBound(0, frameIndex, static_cast<int>(track->frames.size()) - 1);
+        return track->frames[idx].H;
+    }
+
+    const auto &frame = track->frames[frameIndex];
+
+    if (frameIndex == 0 || frameIndex >= static_cast<int>(track->frames.size()) - 1)
+        return frame.H;
+
+    const auto &next = track->frames[frameIndex + 1];
+    double t = static_cast<double>(frameIndex) - frame.frameIndex;
+    double denom = static_cast<double>(next.frameIndex - frame.frameIndex);
+    if (denom > 0.0)
+        t /= denom;
+    else
+        t = 0.0;
+    t = qBound(0.0, t, 1.0);
+
+    planartrack::Homography result;
+    for (int i = 0; i < 9; ++i)
+        result[i] = frame.H[i] * (1.0 - t) + next.H[i] * t;
+    return result;
+}
+
+}
+
 // ---------------------------------------------------------------------------
 // Helper: enum <-> string conversion
 // ---------------------------------------------------------------------------
@@ -390,6 +442,135 @@ QMap<int, QPointF> TrackerLink::applyLinks(const TrackingResult &result,
 }
 
 // ---------------------------------------------------------------------------
+// TrackerLink — planar mode (AC1, AC2)
+// ---------------------------------------------------------------------------
+
+void TrackerLink::setMode(Mode mode)
+{
+    if (m_mode == mode)
+        return;
+    m_mode = mode;
+    if (mode == Mode::Point) {
+        resetKalmanState();
+    }
+}
+
+void TrackerLink::setPlanarTrack(const planartrack::PlanarTrack *track)
+{
+    if (m_planarTrack == track)
+        return;
+    m_planarTrack = track;
+    resetKalmanState();
+    m_lastPlanarFrame = -1;
+}
+
+QPolygonF TrackerLink::computePlanarQuad(int frameIndex) const
+{
+    QPolygonF result;
+    result.resize(4);
+
+    if (!m_planarTrack || m_planarTrack->frames.empty()) {
+        result[0] = QPointF(m_refQuad.tl.x, m_refQuad.tl.y);
+        result[1] = QPointF(m_refQuad.tr.x, m_refQuad.tr.y);
+        result[2] = QPointF(m_refQuad.br.x, m_refQuad.br.y);
+        result[3] = QPointF(m_refQuad.bl.x, m_refQuad.bl.y);
+        return result;
+    }
+
+    planartrack::Homography H = findFrameHomography(m_planarTrack, frameIndex);
+
+    if (isIdentityForPlanar(H)) {
+        result[0] = QPointF(m_refQuad.tl.x, m_refQuad.tl.y);
+        result[1] = QPointF(m_refQuad.tr.x, m_refQuad.tr.y);
+        result[2] = QPointF(m_refQuad.br.x, m_refQuad.br.y);
+        result[3] = QPointF(m_refQuad.bl.x, m_refQuad.bl.y);
+        return result;
+    }
+
+    QPointF raw[4] = {
+        transformPoint(H, m_refQuad.tl.x, m_refQuad.tl.y),
+        transformPoint(H, m_refQuad.tr.x, m_refQuad.tr.y),
+        transformPoint(H, m_refQuad.br.x, m_refQuad.br.y),
+        transformPoint(H, m_refQuad.bl.x, m_refQuad.bl.y),
+    };
+
+    int smoothing = m_links.isEmpty() ? 1 : m_links.first().smoothing;
+    if (smoothing <= 1) {
+        for (int i = 0; i < 4; ++i)
+            result[i] = raw[i];
+        return result;
+    }
+
+    if (m_lastPlanarFrame != frameIndex - 1) {
+        resetKalmanState();
+    }
+    m_lastPlanarFrame = frameIndex;
+
+    double dt = 1.0;
+    for (int i = 0; i < 4; ++i) {
+        kalmanPredict(m_kalmanState[i], dt);
+        result[i] = kalmanUpdate(m_kalmanState[i], raw[i],
+                                 static_cast<double>(smoothing));
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// TrackerLink — Kalman filter (AC3)
+// ---------------------------------------------------------------------------
+
+QPointF TrackerLink::kalmanPredict(KalmanCorner &state, double dt) const
+{
+    if (!state.initialized) {
+        state.initialized = true;
+        return QPointF(state.x, state.y);
+    }
+
+    state.x += state.vx * dt;
+    state.y += state.vy * dt;
+    return QPointF(state.x, state.y);
+}
+
+QPointF TrackerLink::kalmanUpdate(KalmanCorner &state, const QPointF &measurement,
+                                  double smoothingStrength) const
+{
+    double processNoise = 1.0 / qMax(1.0, smoothingStrength);
+    double measurementNoise = qMax(0.01, processNoise * 0.1);
+
+    double Pxx = processNoise;
+    double Pyy = processNoise;
+    double Pvx = processNoise * 0.5;
+    double Pvy = processNoise * 0.5;
+
+    double Sx = Pxx + measurementNoise;
+    double Sy = Pyy + measurementNoise;
+
+    double Kx = Pxx / Sx;
+    double Ky = Pyy / Sy;
+
+    state.x += Kx * (measurement.x() - state.x);
+    state.y += Ky * (measurement.y() - state.y);
+
+    state.vx += Kx * (measurement.x() - state.x) * 0.1;
+    state.vy += Ky * (measurement.y() - state.y) * 0.1;
+
+    return QPointF(state.x, state.y);
+}
+
+void TrackerLink::resetKalmanState() const
+{
+    for (int i = 0; i < 4; ++i) {
+        m_kalmanState[i].x = 0.0;
+        m_kalmanState[i].y = 0.0;
+        m_kalmanState[i].vx = 0.0;
+        m_kalmanState[i].vy = 0.0;
+        m_kalmanState[i].initialized = false;
+    }
+    m_lastPlanarFrame = -1;
+}
+
+// ---------------------------------------------------------------------------
 // TrackerLink — serialisation
 // ---------------------------------------------------------------------------
 
@@ -401,6 +582,7 @@ QJsonObject TrackerLink::toJson() const
 
     QJsonObject obj;
     obj[QStringLiteral("links")] = arr;
+    obj[QStringLiteral("mode")] = static_cast<int>(m_mode);
     return obj;
 }
 
@@ -411,4 +593,7 @@ void TrackerLink::fromJson(const QJsonObject &obj)
     const QJsonArray arr = obj[QStringLiteral("links")].toArray();
     for (const QJsonValue &val : arr)
         m_links.append(TrackerLinkConfig::fromJson(val.toObject()));
+
+    if (obj.contains(QStringLiteral("mode")))
+        m_mode = static_cast<Mode>(obj[QStringLiteral("mode")].toInt(0));
 }

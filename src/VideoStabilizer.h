@@ -1,5 +1,8 @@
 #pragma once
 
+#include "PlanarTracker.h"
+
+#include <QImage>
 #include <QObject>
 #include <QProcess>
 #include <QString>
@@ -36,6 +39,16 @@ class VideoStabilizer : public QObject
     Q_OBJECT
 
 public:
+    enum class Model {
+        Translation = 0,
+        PlanarInversion
+    };
+
+    struct Settings {
+        int planarStabilizeAnchorFrame = 0;
+        double outputCropPercent = 0.0;
+    };
+
     explicit VideoStabilizer(QObject *parent = nullptr);
 
     // Two-pass stabilization: analyze then apply
@@ -44,6 +57,16 @@ public:
 
     // Run only pass 1 (analysis), emits analysisComplete with .trf path
     void analyzeOnly(const QString &inputPath, const StabilizerConfig &config = {});
+
+    void setModel(Model model);
+    Model model() const { return m_model; }
+    void setPlanarTrack(const planartrack::PlanarTrack *track);
+    void setPlanarStabilizeAnchorFrame(int frameIndex);
+    void setOutputCropPercent(double percent);
+    const planartrack::PlanarTrack *planarTrack() const { return m_planarTrack; }
+    int planarStabilizeAnchorFrame() const { return m_settings.planarStabilizeAnchorFrame; }
+    double outputCropPercent() const { return m_settings.outputCropPercent; }
+    QImage stabilizeFrame(const QImage &source, int frameIndex) const;
 
     // Abort current processing
     void cancel();
@@ -54,6 +77,12 @@ signals:
     void analysisComplete(const QString &trfPath);
 
 private:
+    struct VideoStreamInfo {
+        int width = 0;
+        int height = 0;
+        double fps = 0.0;
+    };
+
     // Build vidstabdetect filter string for pass 1
     static QString buildDetectFilter(const StabilizerConfig &config,
                                      const QString &trfPath);
@@ -70,8 +99,25 @@ private:
 
     // Find FFmpeg binary
     static QString findFFmpegBinary();
+    static VideoStreamInfo probeVideoStream(const QString &inputPath);
+    static planartrack::Homography invertHomographyWithFallback(const planartrack::Homography &H,
+                                                                bool &usedIdentityFallback);
+    static planartrack::Homography multiplyHomographies(const planartrack::Homography &lhs,
+                                                        const planartrack::Homography &rhs);
+    static bool isIdentityHomography(const planartrack::Homography &H);
+
+    void refreshAnchorHomography();
+    bool stabilizePlanarInversion(const QString &inputPath, const QString &outputPath);
+    QImage applyPlanarInversion(const QImage &source, int frameIndex) const;
+    static void applyTransparentCrop(QImage &image, double cropPercent);
 
     QProcess *m_process = nullptr;
     bool m_cancelled = false;
     double m_totalDuration = 0.0;  // seconds, parsed from Duration: line
+    Model m_model = Model::Translation;
+    Settings m_settings;
+    const planartrack::PlanarTrack *m_planarTrack = nullptr;
+    planartrack::Homography m_anchorHomography = {1.0, 0.0, 0.0,
+                                                  0.0, 1.0, 0.0,
+                                                  0.0, 0.0, 1.0};
 };

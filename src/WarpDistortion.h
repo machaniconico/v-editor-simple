@@ -1,5 +1,7 @@
 #pragma once
 
+#include "PlanarTracker.h"
+
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -20,6 +22,13 @@ enum class WarpType {
     Ripple,
     Spherize,
     Fisheye
+};
+
+enum class WarpMode {
+    Mesh = 0,
+    Puppet = 1,
+    Parametric = 2,
+    Homography = 3
 };
 
 // --- Puppet pin (anchor point with influence area) ---
@@ -72,6 +81,13 @@ struct WarpConfig {
     QJsonObject toJson() const;
     static WarpConfig fromJson(const QJsonObject &obj);
 };
+
+struct WarpDistortionSettings {
+    int homographyOversample = 1;
+};
+
+WarpDistortionSettings &warpDistortionSettings();
+void applyHomography(const QImage &src, const planartrack::Homography &H, QImage &dst);
 
 // --- Warp & Distortion engine (static-only) ---
 

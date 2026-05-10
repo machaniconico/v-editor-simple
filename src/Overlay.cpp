@@ -156,20 +156,58 @@ void OverlayRenderer::renderImageOverlay(QImage &frame, const ImageOverlay &over
     QImage img(overlay.filePath);
     if (img.isNull()) return;
 
-    int x = static_cast<int>(overlay.rect.x() * frame.width());
-    int y = static_cast<int>(overlay.rect.y() * frame.height());
-    int w = static_cast<int>(overlay.rect.width() * frame.width());
-    int h = static_cast<int>(overlay.rect.height() * frame.height());
-
-    QImage scaled;
-    if (overlay.keepAspectRatio)
-        scaled = img.scaled(w, h, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-    else
-        scaled = img.scaled(w, h, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-
     QPainter painter(&frame);
     painter.setOpacity(overlay.opacity);
-    painter.drawImage(x, y, scaled);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform);
+
+    if (!overlay.renderQuad.isEmpty() && overlay.renderQuad.size() == 4) {
+        QPointF dst[4] = {
+            overlay.renderQuad[0],
+            overlay.renderQuad[1],
+            overlay.renderQuad[2],
+            overlay.renderQuad[3],
+        };
+
+        int srcW = img.width();
+        int srcH = img.height();
+        QPointF src[4] = {
+            QPointF(0, 0),
+            QPointF(srcW, 0),
+            QPointF(srcW, srcH),
+            QPointF(0, srcH),
+        };
+
+        QPolygonF srcPoly;
+        srcPoly << src[0] << src[1] << src[2] << src[3];
+        QPolygonF dstPoly;
+        dstPoly << dst[0] << dst[1] << dst[2] << dst[3];
+        QTransform quadTransform;
+        const bool quadOk = QTransform::quadToQuad(srcPoly, dstPoly, quadTransform);
+        if (quadOk && !quadTransform.isIdentity() && quadTransform.isInvertible()) {
+            painter.setTransform(quadTransform);
+            painter.drawImage(0, 0, img);
+        } else {
+            int x = static_cast<int>(overlay.rect.x() * frame.width());
+            int y = static_cast<int>(overlay.rect.y() * frame.height());
+            int w = static_cast<int>(overlay.rect.width() * frame.width());
+            int h = static_cast<int>(overlay.rect.height() * frame.height());
+            QImage scaled = img.scaled(w, h, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+            painter.drawImage(x, y, scaled);
+        }
+    } else {
+        int x = static_cast<int>(overlay.rect.x() * frame.width());
+        int y = static_cast<int>(overlay.rect.y() * frame.height());
+        int w = static_cast<int>(overlay.rect.width() * frame.width());
+        int h = static_cast<int>(overlay.rect.height() * frame.height());
+
+        QImage scaled;
+        if (overlay.keepAspectRatio)
+            scaled = img.scaled(w, h, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        else
+            scaled = img.scaled(w, h, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+
+        painter.drawImage(x, y, scaled);
+    }
 }
 
 void OverlayRenderer::renderPip(QImage &frame, const QImage &pipSource, const PipConfig &config)

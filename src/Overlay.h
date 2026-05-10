@@ -6,6 +6,7 @@
 #include <QRectF>
 #include <QImage>
 #include <QVector>
+#include <QPolygonF>
 
 // --- Text Overlay (Telop) ---
 
@@ -273,6 +274,12 @@ struct ImageOverlay {
     double opacity = 1.0;
     bool keepAspectRatio = true;
     bool visible = true;
+
+    // Planar tracking render quad (4 corners in pixel coordinates).
+    // When non-empty, overrides the axis-aligned rect for rendering.
+    QPolygonF renderQuad;
+
+    void setRenderQuad(const QPolygonF &quad) { renderQuad = quad; }
 };
 
 // --- Picture in Picture ---
