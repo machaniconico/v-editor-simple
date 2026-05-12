@@ -8,6 +8,7 @@ option(VEDITOR_PLANAR_TRACKER_SELFTEST "Enable the planar tracker synthetic self
 option(VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST "Enable the effect param schema round-trip self-test" OFF)
 option(VEDITOR_BRUSH_SELFTEST "Enable the brush animation synthetic self-test helper" OFF)
 option(VEDITOR_SNSPACK_SELFTEST "Enable the SNS pack synthetic self-test" OFF)
+option(VEDITOR_NODEGRAPH_SELFTEST "Enable the node graph synthetic self-test" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -179,6 +180,18 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/Precompose.cpp
     src/Rotoscope.cpp
     src/WarpDistortion.cpp
+    src/NodeGraph.h
+    src/NodeGraph.cpp
+    src/NodeEvaluator.h
+    src/NodeEvaluator.cpp
+    src/NodeLibrary.h
+    src/NodeLibrary.cpp
+    src/NodePropertiesPanel.h
+    src/NodePropertiesPanel.cpp
+    src/NodeCanvasWidget.h
+    src/NodeCanvasWidget.cpp
+    src/LayerNodeBridge.h
+    src/LayerNodeBridge.cpp
     src/RecentFiles.cpp
     src/ShortcutEditor.cpp
     src/VSTHost.cpp
@@ -227,5 +240,6 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     $<$<BOOL:${VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST}>:VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST=1>
     $<$<BOOL:${VEDITOR_BRUSH_SELFTEST}>:VEDITOR_BRUSH_SELFTEST=1>
     $<$<BOOL:${VEDITOR_SNSPACK_SELFTEST}>:VEDITOR_SNSPACK_SELFTEST=1>
+    $<$<BOOL:${VEDITOR_NODEGRAPH_SELFTEST}>:VEDITOR_NODEGRAPH_SELFTEST=1>
     $<$<STREQUAL:${VEDITOR_EDITION},modern>:VEDITOR_AV1=1>
 )

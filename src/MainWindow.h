@@ -84,6 +84,10 @@ struct ClipMotion;
 class PasteAttributesDialog;
 class LoudnessPanel;
 class QDockWidget;
+class NodeCanvasWidget;
+class NodePropertiesPanel;
+class NodeGraph;
+class NodeEvaluator;
 
 class MainWindow : public QMainWindow
 {
@@ -446,4 +450,21 @@ private:
 
     // Voice-over recording
     voiceover::VoiceOverDialog *m_voiceOverDialog = nullptr;
+
+    // US-NODE-9: Node compositing mode
+    NodeGraph *m_activeNodeGraph = nullptr;
+    NodeCanvasWidget *m_nodeCanvas = nullptr;
+    NodePropertiesPanel *m_nodePropsPanel = nullptr;
+    QDockWidget *m_nodeCanvasDock = nullptr;
+    QDockWidget *m_nodePropsDock = nullptr;
+    NodeEvaluator *m_nodeEvaluator = nullptr;
+    bool m_nodeModeActive = false;
+    QString m_nodeModeClipId;
+
+    QAction *m_nodeModeAction = nullptr;
+
+    void setupNodeCompositingDocks();
+    void toggleNodeCompositingMode(bool on);
+    void onNodeGraphChanged();
+    void onNodeSelected(int id);
 };

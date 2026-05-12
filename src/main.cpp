@@ -31,6 +31,12 @@
 #include <QtMath>
 #endif
 
+#if defined(VEDITOR_NODEGRAPH_SELFTEST)
+#include "NodeGraph.h"
+#include "NodeEvaluator.h"
+#include "NodeLibrary.h"
+#endif
+
 // ──────────────────────────────────────────────────────────────────────────
 // Lightweight file-backed logger + unhandled-exception reporter.
 //
@@ -264,6 +270,50 @@ int main(int argc, char *argv[])
         qDebug() << "  LoudnessAnalyzer integratedLUFS (1kHz sine, 0dBFS):" << analyzer.integratedLUFS();
 
         qDebug() << "=== VEDITOR_SNSPACK_SELFTEST: PASSED ===";
+    }
+#endif
+
+#if defined(VEDITOR_NODEGRAPH_SELFTEST)
+    {
+        qDebug() << "=== VEDITOR_NODEGRAPH_SELFTEST: Node graph synthetic self-test ===";
+
+        nodelib::registerBuiltinNodes();
+
+        NodeGraph graph;
+        int solidId = graph.addNode("SolidColor");
+        GraphNode *solid = graph.node(solidId);
+        solid->params["color"] = QColor(255, 0, 0); // red
+
+        int brightnessId = graph.addNode("BrightnessContrast");
+        GraphNode *brightness = graph.node(brightnessId);
+        brightness->params["brightness"] = 50.0;
+
+        int outputId = graph.addNode("Output");
+
+        graph.connect(solidId, 0, brightnessId, 0);
+        graph.connect(brightnessId, 0, outputId, 0);
+
+        NodeEvaluator evaluator;
+        evaluator.setGraph(&graph);
+        evaluator.setOutputSize(QSize(64, 64));
+
+        QImage result = evaluator.render(0.0);
+
+        bool nonEmpty = !result.isNull() && result.bytesPerLine() != 0;
+        QColor centerPixel;
+        if (!result.isNull() && result.width() > 0 && result.height() > 0) {
+            centerPixel = QColor(result.pixel(result.width() / 2, result.height() / 2));
+        }
+
+        qDebug() << "  output image non-empty:" << nonEmpty;
+        qDebug() << "  output size:" << result.size();
+        qDebug() << "  center pixel color:" << centerPixel.name();
+        qDebug() << "  expected: red-ish (brightness +50 should lighten)";
+
+        Q_ASSERT(nonEmpty);
+        Q_ASSERT(centerPixel.red() > centerPixel.green());
+        Q_ASSERT(centerPixel.red() > centerPixel.blue());
+        qDebug() << "=== VEDITOR_NODEGRAPH_SELFTEST: PASSED ===";
     }
 #endif
 

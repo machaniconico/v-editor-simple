@@ -86,6 +86,12 @@
 #include <QFormLayout>
 #include <QLabel>
 #include <QStandardItemModel>
+#include "NodeGraph.h"
+#include "NodeEvaluator.h"
+#include "NodeLibrary.h"
+#include "NodeCanvasWidget.h"
+#include "NodePropertiesPanel.h"
+#include "LayerNodeBridge.h"
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -190,6 +196,10 @@ MainWindow::MainWindow(QWidget *parent)
     m_timeline->setAudioMixer(m_player->audioMixer());
 
     rebuildAudioMeters();
+
+    nodelib::registerBuiltinNodes();
+    m_activeNodeGraph = new NodeGraph();
+    m_nodeEvaluator = new NodeEvaluator();
 
     qInfo() << "MainWindow::ctor end";
 }
@@ -1568,6 +1578,12 @@ void MainWindow::setupMenuBar()
     connect(historyAction, &QAction::toggled, m_historyDock, &QDockWidget::setVisible);
     connect(m_historyDock, &QDockWidget::visibilityChanged, historyAction, &QAction::setChecked);
 
+    // US-NODE-9: Node compositing mode toggle
+    m_nodeModeAction = viewMenu->addAction("ノードコンポジットモード");
+    m_nodeModeAction->setCheckable(true);
+    m_nodeModeAction->setChecked(false);
+    connect(m_nodeModeAction, &QAction::toggled, this, &MainWindow::toggleNodeCompositingMode);
+
     // 表示メニュー追加項目
     auto *themeAction = viewMenu->addAction("テーマ変更...");
     connect(themeAction, &QAction::triggered, this, &MainWindow::changeTheme);
@@ -2041,6 +2057,15 @@ void MainWindow::saveProject()
     loudnessJson["loudnessGainDb"] = 0.0;
     data.loudnessSettings = loudnessJson;
 
+    // US-NODE-9: Persist active node graph and compositing mode
+    if (m_nodeModeActive && m_activeNodeGraph && !m_nodeModeClipId.isEmpty()) {
+        ClipNodeGraph cng;
+        cng.clipId = m_nodeModeClipId;
+        cng.graph = m_activeNodeGraph->toJson();
+        cng.compositingMode = "node";
+        data.clipNodeGraphs.append(cng);
+    }
+
     if (ProjectFile::save(m_projectFilePath, data)) {
         statusBar()->showMessage("Saved: " + m_projectFilePath);
         updateTitle();
@@ -2111,6 +2136,21 @@ void MainWindow::openProject()
     updateStatusInfo();
     updateEditActions();
     syncBrushAnimationPreviewForClip(0, m_timeline ? m_timeline->selectedVideoClipIndex() : -1);
+
+    // US-NODE-9: Restore node compositing mode
+    for (const auto &cng : data.clipNodeGraphs) {
+        if (cng.compositingMode == "node" && !cng.graph.isEmpty()) {
+            m_nodeModeClipId = cng.clipId;
+            m_activeNodeGraph->fromJson(cng.graph);
+            m_nodeModeActive = true;
+            setupNodeCompositingDocks();
+            m_nodeCanvas->setGraph(m_activeNodeGraph);
+            m_nodeCanvasDock->setVisible(true);
+            m_nodePropsDock->setVisible(true);
+            break;
+        }
+    }
+
     statusBar()->showMessage("Opened: " + filePath);
 }
 
@@ -6865,4 +6905,118 @@ void MainWindow::applyLoudnessNormalize(double targetLUFS, double gainDb)
             .arg(targetLUFS, 0, 'f', 1)
             .arg(gainDb, 0, 'f', 1),
         4000);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// US-NODE-9: Node compositing mode integration
+// ──────────────────────────────────────────────────────────────────────────
+
+void MainWindow::setupNodeCompositingDocks()
+{
+    if (m_nodeCanvasDock || m_nodePropsDock)
+        return; // already created
+
+    m_nodeCanvas = new NodeCanvasWidget(this);
+    m_nodeCanvasDock = new QDockWidget("ノードキャンバス", this);
+    m_nodeCanvasDock->setObjectName("NodeCanvasDock");
+    m_nodeCanvasDock->setWidget(m_nodeCanvas);
+    addDockWidget(Qt::RightDockWidgetArea, m_nodeCanvasDock);
+    m_nodeCanvasDock->setVisible(false);
+
+    m_nodePropsPanel = new NodePropertiesPanel(this);
+    m_nodePropsDock = new QDockWidget("ノードプロパティ", this);
+    m_nodePropsDock->setObjectName("NodePropsDock");
+    m_nodePropsDock->setWidget(m_nodePropsPanel);
+    addDockWidget(Qt::RightDockWidgetArea, m_nodePropsDock);
+    m_nodePropsDock->setVisible(false);
+
+    connect(m_nodeCanvas, &NodeCanvasWidget::nodeSelected,
+            this, &MainWindow::onNodeSelected);
+    connect(m_nodePropsPanel, &NodePropertiesPanel::paramChanged,
+            this, [this](int nodeId, const QString &key, const QVariant &value) {
+        if (!m_activeNodeGraph) return;
+        GraphNode *node = m_activeNodeGraph->node(nodeId);
+        if (!node) return;
+        node->params.insert(key, value);
+        m_activeNodeGraph->markDirty(nodeId);
+        onNodeGraphChanged();
+    });
+}
+
+void MainWindow::toggleNodeCompositingMode(bool on)
+{
+    if (!m_timeline) return;
+
+    if (on) {
+        const int clipIdx = m_timeline->selectedVideoClipIndex();
+        if (clipIdx < 0) {
+            statusBar()->showMessage("ノードモード: クリップを選択してください", 3000);
+            QTimer::singleShot(0, this, [this]() {
+                if (m_nodeModeAction) m_nodeModeAction->setChecked(false);
+            });
+            return;
+        }
+
+        const auto &clips = m_timeline->videoClips();
+        if (clips.isEmpty() || clipIdx >= clips.size()) {
+            statusBar()->showMessage("ノードモード: 有効なクリップがありません", 3000);
+            QTimer::singleShot(0, this, [this]() {
+                if (m_nodeModeAction) m_nodeModeAction->setChecked(false);
+            });
+            return;
+        }
+
+        const QString clipId = QString("clip:%1").arg(clipIdx);
+        m_nodeModeClipId = clipId;
+        m_nodeModeActive = true;
+
+        // Build the node graph from the clip's effect stack
+        *m_activeNodeGraph = layerbridge::fromEffectStack(clipId, m_timeline->clipEffects());
+
+        setupNodeCompositingDocks();
+        m_nodeCanvas->setGraph(m_activeNodeGraph);
+        m_nodeCanvasDock->setVisible(true);
+        m_nodePropsDock->setVisible(true);
+
+        statusBar()->showMessage("ノードコンポジットモード ON", 2000);
+    } else {
+        // Turning off: if the graph is a linear chain, write it back to the effect stack
+        if (m_activeNodeGraph && layerbridge::isLinearChain(*m_activeNodeGraph)) {
+            QVector<VideoEffect> effects;
+            if (layerbridge::toEffectStack(*m_activeNodeGraph, effects)) {
+                m_timeline->setClipEffects(effects);
+            }
+        }
+
+        m_nodeModeActive = false;
+        m_nodeModeClipId.clear();
+
+        if (m_nodeCanvasDock) m_nodeCanvasDock->setVisible(false);
+        if (m_nodePropsDock) m_nodePropsDock->setVisible(false);
+
+        statusBar()->showMessage("ノードコンポジットモード OFF — レイヤーモードに戻りました", 2000);
+    }
+}
+
+void MainWindow::onNodeGraphChanged()
+{
+    if (!m_activeNodeGraph || !m_nodeEvaluator || !m_player)
+        return;
+
+    m_nodeEvaluator->setGraph(m_activeNodeGraph);
+    m_nodeEvaluator->setOutputSize(QSize(m_projectConfig.width, m_projectConfig.height));
+
+    // Quick evaluation at time=0 to push a result to GLPreview
+    QImage result = m_nodeEvaluator->render(0.0);
+    if (!result.isNull() && m_player->glPreview()) {
+        m_player->glPreview()->displayFrame(result);
+        m_player->glPreview()->update();
+    }
+}
+
+void MainWindow::onNodeSelected(int id)
+{
+    if (!m_nodePropsPanel || !m_activeNodeGraph)
+        return;
+    m_nodePropsPanel->setSelection(m_activeNodeGraph, id);
 }
