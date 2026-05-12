@@ -1,11 +1,14 @@
 #include "Text3DLayer.h"
 
 #include "Camera3D.h"
+#include "ExtrudedMesh.h"
+#include "SoftRaster3D.h"
 
 #include <QFontMetricsF>
 #include <QMatrix4x4>
 #include <QPainter>
 #include <QPolygonF>
+#include <QStringList>
 #include <QTransform>
 #include <algorithm>
 #include <cmath>
@@ -14,6 +17,13 @@ namespace {
 
 constexpr double kMinScaleComponent = 0.05;
 constexpr int kGlyphPadding = 6;
+
+// Degrees-per-second of time-based spin applied to the extruded mesh, scaled
+// by the rotation-anim axis components (see Text3DLayer.h).
+constexpr double kExtrudeSpinDegPerSec = 90.0;
+
+// Glyph-contour flattening tolerance passed to mesh3d::glyphContours().
+constexpr double kExtrudeFlatness = 0.5;
 
 struct ProjectedVertex {
     QPointF screen;
@@ -163,6 +173,7 @@ void Text3DLayer::setText(const QString &text, const QFont &font)
 {
     m_text = text;
     m_font = font;
+    m_cacheValid = false;
 }
 
 void Text3DLayer::setPerCharRotation(QVector3D perAxisAmount)
@@ -190,6 +201,94 @@ void Text3DLayer::setRotationAnimAxis(QVector3D tumbleAxis)
     m_rotationAnimAxis = tumbleAxis;
 }
 
+void Text3DLayer::setExtrudeEnabled(bool on)
+{
+    m_extrudeEnabled = on;
+}
+
+bool Text3DLayer::extrudeEnabled() const
+{
+    return m_extrudeEnabled;
+}
+
+void Text3DLayer::setExtrude(double depth, double bevelDepth, double bevelWidth, int bevelSegments)
+{
+    m_extrudeDepth = depth;
+    m_extrudeBevelDepth = bevelDepth;
+    m_extrudeBevelWidth = bevelWidth;
+    m_extrudeBevelSegments = bevelSegments;
+    m_cacheValid = false;
+}
+
+double Text3DLayer::extrudeDepth() const
+{
+    return m_extrudeDepth;
+}
+
+double Text3DLayer::extrudeBevelDepth() const
+{
+    return m_extrudeBevelDepth;
+}
+
+double Text3DLayer::extrudeBevelWidth() const
+{
+    return m_extrudeBevelWidth;
+}
+
+int Text3DLayer::extrudeBevelSegments() const
+{
+    return m_extrudeBevelSegments;
+}
+
+void Text3DLayer::setMaterial(QColor frontColor, QColor sideColor, QColor ambient, QVector3D lightDir)
+{
+    m_frontColor = frontColor;
+    m_sideColor = sideColor;
+    m_ambient = ambient;
+    m_lightDir = lightDir;
+}
+
+QColor Text3DLayer::materialFrontColor() const
+{
+    return m_frontColor;
+}
+
+QColor Text3DLayer::materialSideColor() const
+{
+    return m_sideColor;
+}
+
+QColor Text3DLayer::materialAmbient() const
+{
+    return m_ambient;
+}
+
+QVector3D Text3DLayer::materialLightDir() const
+{
+    return m_lightDir;
+}
+
+void Text3DLayer::setExtrudeYawPitch(double yawDeg, double pitchDeg)
+{
+    m_extrudeBaseYaw = yawDeg;
+    m_extrudeBasePitch = pitchDeg;
+}
+
+double Text3DLayer::extrudeBaseYaw() const
+{
+    return m_extrudeBaseYaw;
+}
+
+double Text3DLayer::extrudeBasePitch() const
+{
+    return m_extrudeBasePitch;
+}
+
+int Text3DLayer::meshBuildCount() const
+{
+    return m_meshBuildCount;
+}
+
 double Text3DLayer::characterProgress(int characterIndex, double time) const
 {
     if (m_staggerDuration <= 0.0)
@@ -201,6 +300,13 @@ double Text3DLayer::characterProgress(int characterIndex, double time) const
 }
 
 QImage Text3DLayer::renderFrame(QSize size, double time, const Camera3D &cam) const
+{
+    if (m_extrudeEnabled)
+        return renderFrameExtruded(size, time);
+    return renderFrameQuads(size, time, cam);
+}
+
+QImage Text3DLayer::renderFrameQuads(QSize size, double time, const Camera3D &cam) const
 {
     QImage frame(size, QImage::Format_ARGB32_Premultiplied);
     frame.fill(Qt::transparent);
@@ -356,6 +462,76 @@ QImage Text3DLayer::renderFrame(QSize size, double time, const Camera3D &cam) co
     return frame;
 }
 
+void Text3DLayer::ensureExtrudedMesh() const
+{
+    QFont font = m_font;
+    if (font.family().isEmpty())
+        font = QFont(QStringLiteral("Sans Serif"), 32);
+    if (font.pointSizeF() <= 0.0 && font.pixelSize() <= 0)
+        font.setPointSize(32);
+
+    const QString fontKey = font.toString();
+    const QString key = QStringLiteral("%1|%2|%3|%4|%5|%6")
+                            .arg(m_text)
+                            .arg(fontKey)
+                            .arg(m_extrudeDepth, 0, 'g', 12)
+                            .arg(m_extrudeBevelDepth, 0, 'g', 12)
+                            .arg(m_extrudeBevelWidth, 0, 'g', 12)
+                            .arg(m_extrudeBevelSegments);
+
+    if (m_cacheValid && m_cacheKey == key)
+        return;
+
+    const QVector<QPolygonF> contours = mesh3d::glyphContours(m_text, font, kExtrudeFlatness);
+    const mesh3d::ExtrudeParams params{
+        m_extrudeDepth,
+        m_extrudeBevelDepth,
+        m_extrudeBevelWidth,
+        m_extrudeBevelSegments,
+        true
+    };
+    m_cachedMesh = mesh3d::buildExtrudedMesh(contours, params);
+    m_cacheKey = key;
+    m_cacheValid = true;
+    ++m_meshBuildCount;
+}
+
+QImage Text3DLayer::renderFrameExtruded(QSize size, double time) const
+{
+    QSize outSize = size;
+    if (!outSize.isValid() || outSize.width() <= 0)
+        outSize.setWidth(1);
+    if (outSize.height() <= 0)
+        outSize.setHeight(1);
+
+    if (m_text.isEmpty()) {
+        QImage frame(outSize, QImage::Format_ARGB32);
+        frame.fill(QColor(0, 0, 0, 0));
+        return frame;
+    }
+
+    ensureExtrudedMesh();
+
+    const double yaw = m_extrudeBaseYaw
+        + static_cast<double>(m_rotationAnimAxis.y()) * time * kExtrudeSpinDegPerSec;
+    const double pitch = m_extrudeBasePitch
+        + static_cast<double>(m_rotationAnimAxis.x()) * time * kExtrudeSpinDegPerSec;
+
+    softras::RenderParams rp;
+    rp.lightDir = m_lightDir;
+    rp.frontColor = m_frontColor;
+    rp.sideColor = m_sideColor;
+    rp.ambient = m_ambient;
+    rp.background = QColor(0, 0, 0, 0);
+    rp.wireframe = false;
+
+    double camDist = m_cameraDistance;
+    if (!std::isfinite(camDist) || camDist <= 0.0)
+        camDist = 3.0;
+
+    return softras::renderMeshAuto(m_cachedMesh, outSize, yaw, pitch, camDist, rp);
+}
+
 QJsonObject Text3DLayer::toJson() const
 {
     QJsonObject obj;
@@ -369,6 +545,19 @@ QJsonObject Text3DLayer::toJson() const
     obj[QStringLiteral("perCharScale")] = vectorToJson(m_perCharScale);
     obj[QStringLiteral("cameraDistance")] = m_cameraDistance;
     obj[QStringLiteral("rotationAnimAxis")] = vectorToJson(m_rotationAnimAxis);
+
+    // --- Extrusion fields (US-3D-3) ---
+    obj[QStringLiteral("extrudeEnabled")] = m_extrudeEnabled;
+    obj[QStringLiteral("extrudeDepth")] = m_extrudeDepth;
+    obj[QStringLiteral("extrudeBevelDepth")] = m_extrudeBevelDepth;
+    obj[QStringLiteral("extrudeBevelWidth")] = m_extrudeBevelWidth;
+    obj[QStringLiteral("extrudeBevelSegments")] = m_extrudeBevelSegments;
+    obj[QStringLiteral("frontColor")] = m_frontColor.name(QColor::HexArgb);
+    obj[QStringLiteral("sideColor")] = m_sideColor.name(QColor::HexArgb);
+    obj[QStringLiteral("ambient")] = m_ambient.name(QColor::HexArgb);
+    obj[QStringLiteral("lightDir")] = vectorToJson(m_lightDir);
+    obj[QStringLiteral("extrudeBaseYaw")] = m_extrudeBaseYaw;
+    obj[QStringLiteral("extrudeBasePitch")] = m_extrudeBasePitch;
     return obj;
 }
 
@@ -401,4 +590,37 @@ void Text3DLayer::fromJson(const QJsonObject &obj)
     m_rotationAnimAxis = vectorFromJson(
         obj[QStringLiteral("rotationAnimAxis")].toObject(),
         m_rotationAnimAxis);
+
+    // --- Extrusion fields (US-3D-3); absent keys keep extrude OFF + defaults ---
+    m_extrudeEnabled = obj[QStringLiteral("extrudeEnabled")].toBool(m_extrudeEnabled);
+    m_extrudeDepth = obj[QStringLiteral("extrudeDepth")].toDouble(m_extrudeDepth);
+    m_extrudeBevelDepth = obj[QStringLiteral("extrudeBevelDepth")].toDouble(m_extrudeBevelDepth);
+    m_extrudeBevelWidth = obj[QStringLiteral("extrudeBevelWidth")].toDouble(m_extrudeBevelWidth);
+    m_extrudeBevelSegments = obj[QStringLiteral("extrudeBevelSegments")].toInt(m_extrudeBevelSegments);
+
+    const QString frontStr = obj[QStringLiteral("frontColor")].toString();
+    if (!frontStr.isEmpty()) {
+        const QColor c(frontStr);
+        if (c.isValid())
+            m_frontColor = c;
+    }
+    const QString sideStr = obj[QStringLiteral("sideColor")].toString();
+    if (!sideStr.isEmpty()) {
+        const QColor c(sideStr);
+        if (c.isValid())
+            m_sideColor = c;
+    }
+    const QString ambientStr = obj[QStringLiteral("ambient")].toString();
+    if (!ambientStr.isEmpty()) {
+        const QColor c(ambientStr);
+        if (c.isValid())
+            m_ambient = c;
+    }
+    if (obj.contains(QStringLiteral("lightDir")))
+        m_lightDir = vectorFromJson(obj[QStringLiteral("lightDir")].toObject(), m_lightDir);
+
+    m_extrudeBaseYaw = obj[QStringLiteral("extrudeBaseYaw")].toDouble(m_extrudeBaseYaw);
+    m_extrudeBasePitch = obj[QStringLiteral("extrudeBasePitch")].toDouble(m_extrudeBasePitch);
+
+    m_cacheValid = false;
 }

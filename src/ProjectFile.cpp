@@ -238,6 +238,32 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     }
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
+    // US-3D-11: motion-graphics sprint persistence
+    {
+        QJsonArray t3Arr;
+        for (const auto &entry : data.text3DClipEntries) {
+            if (!entry.config.isEmpty())
+                t3Arr.append(text3DClipEntryToJson(entry));
+        }
+        root["text3DClipEntries"] = t3Arr;
+    }
+    {
+        QJsonArray exprArr;
+        for (const auto &entry : data.expressionBindingsEntries) {
+            if (!entry.bindings.isEmpty())
+                exprArr.append(expressionBindingsEntryToJson(entry));
+        }
+        root["expressionBindingsEntries"] = exprArr;
+    }
+    {
+        QJsonArray wigArr;
+        for (const auto &entry : data.wiggleClipEntries)
+            wigArr.append(wiggleClipEntryToJson(entry));
+        root["wiggleClipEntries"] = wigArr;
+    }
+    if (!data.projectCamera.isEmpty())
+        root["projectCamera"] = data.projectCamera;
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -393,6 +419,27 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
+
+    // US-3D-11: motion-graphics sprint persistence — backward compat:
+    // missing key = empty / disabled.
+    data.text3DClipEntries.clear();
+    if (root.contains("text3DClipEntries")) {
+        for (const auto &v : root["text3DClipEntries"].toArray())
+            data.text3DClipEntries.append(text3DClipEntryFromJson(v.toObject()));
+    }
+    data.expressionBindingsEntries.clear();
+    if (root.contains("expressionBindingsEntries")) {
+        for (const auto &v : root["expressionBindingsEntries"].toArray())
+            data.expressionBindingsEntries.append(expressionBindingsEntryFromJson(v.toObject()));
+    }
+    data.wiggleClipEntries.clear();
+    if (root.contains("wiggleClipEntries")) {
+        for (const auto &v : root["wiggleClipEntries"].toArray())
+            data.wiggleClipEntries.append(wiggleClipEntryFromJson(v.toObject()));
+    }
+    data.projectCamera = root.contains("projectCamera")
+        ? root["projectCamera"].toObject()
+        : QJsonObject{};
 
     return true;
 }
@@ -552,6 +599,32 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     }
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
+    // US-3D-11: motion-graphics sprint persistence
+    {
+        QJsonArray t3Arr;
+        for (const auto &entry : data.text3DClipEntries) {
+            if (!entry.config.isEmpty())
+                t3Arr.append(text3DClipEntryToJson(entry));
+        }
+        root["text3DClipEntries"] = t3Arr;
+    }
+    {
+        QJsonArray exprArr;
+        for (const auto &entry : data.expressionBindingsEntries) {
+            if (!entry.bindings.isEmpty())
+                exprArr.append(expressionBindingsEntryToJson(entry));
+        }
+        root["expressionBindingsEntries"] = exprArr;
+    }
+    {
+        QJsonArray wigArr;
+        for (const auto &entry : data.wiggleClipEntries)
+            wigArr.append(wiggleClipEntryToJson(entry));
+        root["wiggleClipEntries"] = wigArr;
+    }
+    if (!data.projectCamera.isEmpty())
+        root["projectCamera"] = data.projectCamera;
+
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
 }
@@ -699,6 +772,27 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
+
+    // US-3D-11: motion-graphics sprint persistence — backward compat:
+    // missing key = empty / disabled.
+    data.text3DClipEntries.clear();
+    if (root.contains("text3DClipEntries")) {
+        for (const auto &v : root["text3DClipEntries"].toArray())
+            data.text3DClipEntries.append(text3DClipEntryFromJson(v.toObject()));
+    }
+    data.expressionBindingsEntries.clear();
+    if (root.contains("expressionBindingsEntries")) {
+        for (const auto &v : root["expressionBindingsEntries"].toArray())
+            data.expressionBindingsEntries.append(expressionBindingsEntryFromJson(v.toObject()));
+    }
+    data.wiggleClipEntries.clear();
+    if (root.contains("wiggleClipEntries")) {
+        for (const auto &v : root["wiggleClipEntries"].toArray())
+            data.wiggleClipEntries.append(wiggleClipEntryFromJson(v.toObject()));
+    }
+    data.projectCamera = root.contains("projectCamera")
+        ? root["projectCamera"].toObject()
+        : QJsonObject{};
 
     return true;
 }
@@ -1395,6 +1489,56 @@ TrackMatteClipEntry ProjectFile::trackMatteClipEntryFromJson(const QJsonObject &
     entry.clipId = obj["clipId"].toString();
     entry.matteType = static_cast<TrackMatteType>(obj["matteType"].toInt(static_cast<int>(TrackMatteType::None)));
     entry.matteSourceClipId = obj["matteSourceClipId"].toString();
+    return entry;
+}
+
+// --- US-3D-11: motion-graphics sprint persistence ---
+
+QJsonObject ProjectFile::text3DClipEntryToJson(const Text3DClipEntry &entry)
+{
+    QJsonObject obj;
+    obj["clipId"] = entry.clipId;
+    obj["config"] = entry.config;
+    return obj;
+}
+
+Text3DClipEntry ProjectFile::text3DClipEntryFromJson(const QJsonObject &obj)
+{
+    Text3DClipEntry entry;
+    entry.clipId = obj["clipId"].toString();
+    entry.config = obj["config"].toObject();
+    return entry;
+}
+
+QJsonObject ProjectFile::expressionBindingsEntryToJson(const ExpressionBindingsClipEntry &entry)
+{
+    QJsonObject obj;
+    obj["clipId"] = entry.clipId;
+    obj["bindings"] = entry.bindings.toJson();
+    return obj;
+}
+
+ExpressionBindingsClipEntry ProjectFile::expressionBindingsEntryFromJson(const QJsonObject &obj)
+{
+    ExpressionBindingsClipEntry entry;
+    entry.clipId = obj["clipId"].toString();
+    entry.bindings.fromJson(obj["bindings"].toObject());
+    return entry;
+}
+
+QJsonObject ProjectFile::wiggleClipEntryToJson(const WiggleClipEntry &entry)
+{
+    QJsonObject obj;
+    obj["clipId"] = entry.clipId;
+    obj["params"] = wiggle::toJson(entry.params);
+    return obj;
+}
+
+WiggleClipEntry ProjectFile::wiggleClipEntryFromJson(const QJsonObject &obj)
+{
+    WiggleClipEntry entry;
+    entry.clipId = obj["clipId"].toString();
+    entry.params = wiggle::fromJson(obj["params"].toObject());
     return entry;
 }
 

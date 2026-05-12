@@ -45,6 +45,8 @@
 #include "ParticleSystem.h"
 #include "Camera3D.h"
 #include "Expression.h"
+#include "ClipExpressionBindings.h"
+#include "WiggleTransform.h"
 #include "ShapeLayer.h"
 #include "TextAnimator.h"
 #include "PathText.h"
@@ -77,6 +79,9 @@ class BrushAnimation;
 class RotoToolsDialog;
 class TimeRemapDialog;
 class FavoritesEditDialog;
+class Text3DExtrusionDialog;
+class ExpressionBindingDialog;
+class CameraMotionDialog;
 
 namespace voiceover {
 class VoiceOverDialog;
@@ -288,6 +293,12 @@ private slots:
     void openTimeRemapDialog();
     void configureTrackMatte();
 
+    // US-3D-11: motion-graphics sprint — 4 new menu actions
+    void open3DExtrudedText();
+    void editClipExpressionBindings();
+    void editClipWiggle();
+    void openCameraMotionDialog();
+
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
     void editFavorites();
@@ -358,6 +369,11 @@ private:
     QHash<QString, RotoClipEntry> m_rotoClipEntries;
     QHash<QString, TimeRemapClipEntry> m_timeRemapClipEntries;
     QHash<QString, TrackMatteClipEntry> m_trackMatteClipEntries;
+    // US-3D-11: per-clip motion-graphics sidecars, keyed by "trackIdx:clipIdx"
+    QHash<QString, QJsonObject> m_text3DClipConfigs;          // Text3DLayer::toJson() blobs
+    QHash<QString, exprbind::ClipExpressionBindings> m_clipExpressionBindings;
+    QHash<QString, wiggle::WiggleParams> m_clipWiggleParams;
+    Camera3D m_projectCamera;                                 // single per-project camera
     int m_selectedVideoTrackIndex = -1;
     int m_selectedVideoClipIndexTracked = -1;
 

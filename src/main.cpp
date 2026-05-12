@@ -14,6 +14,11 @@
 #include <QTemporaryDir>
 #include <QPainter>
 #include <cmath>
+#include <algorithm>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -32,6 +37,15 @@
 #include "Rotoscope.h"
 #include "SplashScreen.h"
 #include "TimeRemap.h"
+#include "ExtrudedMesh.h"
+#include "SoftRaster3D.h"
+#include "Text3DLayer.h"
+#include "Camera3D.h"
+#include "Expression.h"
+#include "ClipExpressionBindings.h"
+#include "WiggleTransform.h"
+#include <QFont>
+#include <QVector3D>
 
 #if defined(VEDITOR_BRUSH_SELFTEST)
 #include "BrushAnimation.h"
@@ -603,6 +617,477 @@ int runProSelftest()
     return 0;
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// US-3D-11: motion-graphics sprint self-test (VEDITOR_MOGRAPH_SELFTEST=1)
+// ──────────────────────────────────────────────────────────────────────────
+
+static bool meshNormalsSane(const mesh3d::TriMesh &mesh, QString &why)
+{
+    if (mesh.indices.isEmpty() || (mesh.indices.size() % 3) != 0) {
+        why = QStringLiteral("indices empty or not a multiple of 3");
+        return false;
+    }
+    if (mesh.positions.isEmpty()) {
+        why = QStringLiteral("no positions");
+        return false;
+    }
+    for (quint32 idx : mesh.indices) {
+        if (idx >= static_cast<quint32>(mesh.positions.size())) {
+            why = QStringLiteral("index out of range");
+            return false;
+        }
+    }
+    for (const QVector3D &n : mesh.normals) {
+        const float len = n.length();
+        if (len > 1e-3f && std::abs(len - 1.0f) > 1e-3f) {
+            why = QStringLiteral("normal not unit-length");
+            return false;
+        }
+        if (!std::isfinite(n.x()) || !std::isfinite(n.y()) || !std::isfinite(n.z())) {
+            why = QStringLiteral("normal NaN/inf");
+            return false;
+        }
+    }
+    return true;
+}
+
+static int countNonBackground(const QImage &img, const QColor &background)
+{
+    if (img.isNull())
+        return 0;
+    int count = 0;
+    for (int y = 0; y < img.height(); ++y) {
+        for (int x = 0; x < img.width(); ++x) {
+            const QColor c = img.pixelColor(x, y);
+            if (c.rgba() != background.rgba())
+                ++count;
+        }
+    }
+    return count;
+}
+
+int runMographSelftest()
+{
+    QString error;
+
+    // --- (1) Extruded mesh: square contour + glyph contours ---
+    {
+        QPolygonF square;
+        square << QPointF(-0.5, -0.5) << QPointF(0.5, -0.5)
+               << QPointF(0.5, 0.5) << QPointF(-0.5, 0.5);
+        mesh3d::ExtrudeParams ep;
+        ep.depth = 1.0;
+        ep.bevelDepth = 0.05;
+        ep.bevelWidth = 0.05;
+        ep.bevelSegments = 2;
+        ep.smoothCapNormals = true;
+        const mesh3d::TriMesh squareMesh = mesh3d::buildExtrudedMesh(QVector<QPolygonF>{square}, ep);
+        QString why;
+        if (!requireSelftest(squareMesh.indices.size() >= 3, QStringLiteral("square mesh has no triangles"), &error)
+            || !requireSelftest(meshNormalsSane(squareMesh, why), QStringLiteral("square mesh invalid: ") + why, &error)) {
+            return 1;
+        }
+
+        const QVector<QPolygonF> glyphs = mesh3d::glyphContours(QStringLiteral("A"),
+                                                               QFont(QStringLiteral("Sans Serif"), 32), 0.5);
+        const mesh3d::TriMesh glyphMesh = mesh3d::buildExtrudedMesh(glyphs, ep);
+        if (!requireSelftest(glyphMesh.indices.size() >= 3, QStringLiteral("glyph mesh has no triangles"), &error)
+            || !requireSelftest(meshNormalsSane(glyphMesh, why), QStringLiteral("glyph mesh invalid: ") + why, &error)) {
+            return 1;
+        }
+
+        // --- (2a) Software raster of the glyph mesh into a small image ---
+        softras::RenderParams rp;
+        rp.background = QColor(0, 0, 0, 0);
+        const QImage rendered = softras::renderMeshAuto(glyphMesh, QSize(64, 64), 25.0, 12.0, 3.0, rp);
+        if (!requireSelftest(!rendered.isNull(), QStringLiteral("renderMeshAuto returned null image"), &error)
+            || !requireSelftest(countNonBackground(rendered, rp.background) > 0,
+                                QStringLiteral("renderMeshAuto produced an empty image"), &error)) {
+            return 1;
+        }
+    }
+
+    // --- (2b) Synthetic 2-triangle z-buffer test ---
+    {
+        // Near triangle A at z=0 (small, centred) coloured by frontColor.
+        // Far triangle B at z=-0.6 (bigger, overlapping) coloured by sideColor
+        // via a stored normal whose X dominates Z. Both wound CCW from +Z so
+        // both are front-facing; the z-buffer must keep A in the overlap.
+        auto buildZTestMesh = [](bool nearFirst) {
+            mesh3d::TriMesh m;
+            const QVector3D nA(0.0f, 0.0f, 1.0f);
+            const QVector3D nB(0.92f, 0.0f, 0.39f); // |x| > |z| -> sideColor
+            const QVector3D a0(-0.4f, -0.4f, 0.0f);
+            const QVector3D a1( 0.4f, -0.4f, 0.0f);
+            const QVector3D a2( 0.0f,  0.5f, 0.0f);
+            const QVector3D b0(-0.8f, -0.8f, -0.6f);
+            const QVector3D b1( 0.8f, -0.8f, -0.6f);
+            const QVector3D b2( 0.0f,  0.9f, -0.6f);
+            auto addTri = [&m](const QVector3D &p0, const QVector3D &p1, const QVector3D &p2, const QVector3D &n) {
+                const quint32 base = static_cast<quint32>(m.positions.size());
+                m.positions << p0 << p1 << p2;
+                m.normals << n << n << n;
+                m.indices << base << (base + 1) << (base + 2);
+            };
+            if (nearFirst) {
+                addTri(a0, a1, a2, nA);
+                addTri(b0, b1, b2, nB);
+            } else {
+                addTri(b0, b1, b2, nB);
+                addTri(a0, a1, a2, nA);
+            }
+            return m;
+        };
+
+        softras::RenderParams rp;
+        rp.background = QColor(0, 0, 0, 0);
+        rp.frontColor = QColor(255, 0, 0);          // A == red
+        rp.sideColor = QColor(0, 0, 255);           // B == blue
+        rp.ambient = QColor(20, 20, 20);
+        rp.lightDir = QVector3D(-1.0f, 0.0f, -1.0f).normalized();
+        const softras::Mat4 model = softras::Mat4::identity();
+        const softras::Mat4 view = softras::Mat4::lookAt(QVector3D(0, 0, 5), QVector3D(0, 0, 0), QVector3D(0, 1, 0));
+        const softras::Mat4 proj = softras::Mat4::perspective(45.0, 1.0, 0.1, 100.0);
+        const QSize sz(80, 80);
+
+        for (bool nearFirst : {true, false}) {
+            const QImage img = softras::render(buildZTestMesh(nearFirst), model, view, proj, sz, rp);
+            if (!requireSelftest(!img.isNull(), QStringLiteral("z-buffer test render null"), &error))
+                return 1;
+            // The very centre pixel is inside both triangles -> must be red (A wins).
+            const QColor centre = img.pixelColor(sz.width() / 2, sz.height() / 2);
+            if (!requireSelftest(centre.alpha() > 0 && centre.red() > centre.blue() + 20,
+                                 QStringLiteral("z-buffer overlap pixel is not the near triangle's colour"), &error)) {
+                return 1;
+            }
+            // Somewhere only B is covered -> a bluish pixel must exist.
+            bool foundBlue = false;
+            for (int y = 0; y < sz.height() && !foundBlue; ++y) {
+                for (int x = 0; x < sz.width(); ++x) {
+                    const QColor c = img.pixelColor(x, y);
+                    if (c.alpha() > 0 && c.blue() > c.red() + 20) { foundBlue = true; break; }
+                }
+            }
+            if (!requireSelftest(foundBlue, QStringLiteral("z-buffer test: far triangle not visible anywhere"), &error))
+                return 1;
+        }
+    }
+
+    // --- (3) Expression math ---
+    {
+        ExpressionContext ctx;
+        ctx.time = 2.0;
+        ctx.fps = 30.0;
+        ctx.duration = 5.0;
+        ctx.canvasWidth = 1920;
+        ctx.canvasHeight = 1080;
+
+        auto evalWith = [&](const QString &code, double v) {
+            ExpressionContext c = ctx;
+            c.value = v;
+            return Expression::evaluate(code, c);
+        };
+        const ExpressionResult clampHi = evalWith(QStringLiteral("clamp(value,0,1)"), 2.5);
+        const ExpressionResult clampLo = evalWith(QStringLiteral("clamp(value,0,1)"), -3.0);
+        const ExpressionResult lenR = Expression::evaluate(QStringLiteral("length(3,4)"), ctx);
+        const ExpressionResult mixR = Expression::evaluate(QStringLiteral("mix(0,10,0.25)"), ctx);
+        const ExpressionResult degR = Expression::evaluate(QStringLiteral("degreesToRadians(180)"), ctx);
+        if (!requireSelftest(clampHi.success && std::abs(clampHi.value - 1.0) < 1e-9,
+                             QStringLiteral("clamp(2.5,0,1) != 1"), &error)
+            || !requireSelftest(clampLo.success && std::abs(clampLo.value - 0.0) < 1e-9,
+                                QStringLiteral("clamp(-3,0,1) != 0"), &error)
+            || !requireSelftest(lenR.success && std::abs(lenR.value - 5.0) < 1e-9,
+                                QStringLiteral("length(3,4) != 5"), &error)
+            || !requireSelftest(mixR.success && std::abs(mixR.value - 2.5) < 1e-9,
+                                QStringLiteral("mix(0,10,0.25) != 2.5"), &error)
+            || !requireSelftest(degR.success && std::abs(degR.value - M_PI) < 1e-6,
+                                QStringLiteral("degreesToRadians(180) != pi"), &error)) {
+            return 1;
+        }
+
+        // noise(time): fine steps -> small consecutive deltas, deterministic.
+        double prev = 0.0;
+        double maxDelta = 0.0;
+        bool first = true;
+        for (int i = 0; i <= 200; ++i) {
+            const double t = 1.0 + i * 0.005;
+            const ExpressionResult r = Expression::evaluate(QStringLiteral("noise(time)"),
+                ExpressionContext{t, 0, 30.0, 5.0, 1920, 1080, 0.0, {}});
+            if (!requireSelftest(r.success && std::isfinite(r.value), QStringLiteral("noise(time) failed"), &error))
+                return 1;
+            if (!first)
+                maxDelta = qMax(maxDelta, std::abs(r.value - prev));
+            prev = r.value;
+            first = false;
+        }
+        const ExpressionResult n1 = Expression::evaluate(QStringLiteral("noise(time)"),
+            ExpressionContext{1.234, 0, 30.0, 5.0, 1920, 1080, 0.0, {}});
+        const ExpressionResult n2 = Expression::evaluate(QStringLiteral("noise(time)"),
+            ExpressionContext{1.234, 0, 30.0, 5.0, 1920, 1080, 0.0, {}});
+        if (!requireSelftest(maxDelta < 0.1, QStringLiteral("noise(time) has stairsteps (delta too large)"), &error)
+            || !requireSelftest(n1.success && n2.success && std::abs(n1.value - n2.value) < 1e-12,
+                                QStringLiteral("noise(time) not deterministic"), &error)) {
+            return 1;
+        }
+
+        // smooth(0.5, 5) with a sampleValueAtTime ramp -> value within local min/max.
+        ExpressionContext sctx = ctx;
+        sctx.sampleValueAtTime = [](double t) { return t; };
+        const ExpressionResult sm = Expression::evaluate(QStringLiteral("smooth(0.5,5)"), sctx);
+        const double sLo = sctx.time - 0.25;
+        const double sHi = sctx.time + 0.25;
+        if (!requireSelftest(sm.success && sm.value >= sLo - 1e-6 && sm.value <= sHi + 1e-6,
+                             QStringLiteral("smooth(0.5,5) outside sampled signal min/max"), &error)) {
+            return 1;
+        }
+    }
+
+    // --- (4) ClipExpressionBindings ---
+    {
+        exprbind::ClipExpressionBindings bindings;
+        bindings.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("value*0.5"));
+        ExpressionContext ctx;
+        ctx.time = 0.5;
+        ctx.fps = 30.0;
+        ctx.duration = 3.0;
+        ctx.canvasWidth = 1920;
+        ctx.canvasHeight = 1080;
+        const double opacity = bindings.resolve(QStringLiteral("transform.opacity"), ctx, 80.0);
+        const double posX = bindings.resolve(QStringLiteral("transform.position.x"), ctx, 123.0);
+        // Garbage / division-by-zero expression must fall back to the keyframe value (no NaN/inf).
+        bindings.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("1/0"));
+        const double rot = bindings.resolve(QStringLiteral("transform.rotation"), ctx, 42.0);
+        if (!requireSelftest(std::abs(opacity - 40.0) < 1e-6, QStringLiteral("resolve transform.opacity != 40"), &error)
+            || !requireSelftest(std::abs(posX - 123.0) < 1e-9, QStringLiteral("unbound resolve != keyframe value"), &error)
+            || !requireSelftest(std::isfinite(rot) && std::abs(rot - 42.0) < 1e-9,
+                                QStringLiteral("garbage expression did not fall back to keyframe value"), &error)) {
+            return 1;
+        }
+    }
+
+    // --- (5) Camera3D + CameraShake ---
+    {
+        Camera3D cam;
+        // Shake disabled -> getCameraAt(t) is the (unjittered) base for all t.
+        const Camera3DState base0 = cam.getCameraAt(0.0);
+        for (double t : {0.5, 1.0, 2.5, 7.0}) {
+            const Camera3DState s = cam.getCameraAt(t);
+            if (!requireSelftest(s.position == base0.position && s.target == base0.target
+                                     && std::abs(s.fov - base0.fov) < 1e-9 && std::abs(s.roll - base0.roll) < 1e-9,
+                                 QStringLiteral("camera with disabled shake drifted from base"), &error)) {
+                return 1;
+            }
+        }
+        CameraShake shake;
+        shake.enabled = true;
+        shake.frequency = 4.0;
+        shake.positionAmplitude = QVector3D(0.5f, 0.5f, 0.5f);
+        shake.rotationAmplitudeDeg = 5.0;
+        shake.seed = 1234;
+        shake.smoothness = 1.0;
+        cam.setShake(shake);
+        // Deterministic for fixed seed.
+        const Camera3DState s1 = cam.getCameraAt(1.7);
+        const Camera3DState s2 = cam.getCameraAt(1.7);
+        if (!requireSelftest(s1.position == s2.position && std::abs(s1.roll - s2.roll) < 1e-12,
+                             QStringLiteral("camera shake not deterministic"), &error)) {
+            return 1;
+        }
+        // Bounded around the (unjittered) base by ~positionAmplitude; smoothly varying.
+        double maxAbsDelta = 0.0;
+        double maxRollDelta = 0.0;
+        double maxStep = 0.0;
+        Camera3DState prevState = cam.getCameraAt(0.0);
+        for (int i = 0; i <= 400; ++i) {
+            const double t = i * 0.01;
+            const Camera3DState s = cam.getCameraAt(t);
+            maxAbsDelta = qMax(maxAbsDelta,
+                               qMax(std::abs(double(s.position.x() - base0.position.x())),
+                                    qMax(std::abs(double(s.position.y() - base0.position.y())),
+                                         std::abs(double(s.position.z() - base0.position.z())))));
+            maxRollDelta = qMax(maxRollDelta, std::abs(s.roll - base0.roll));
+            if (i > 0) {
+                maxStep = qMax(maxStep,
+                               qMax(std::abs(double(s.position.x() - prevState.position.x())),
+                                    std::abs(double(s.position.y() - prevState.position.y()))));
+            }
+            prevState = s;
+        }
+        if (!requireSelftest(maxAbsDelta <= 0.5 + 1e-4,
+                             QStringLiteral("camera shake position exceeds amplitude bound"), &error)
+            || !requireSelftest(maxRollDelta <= 5.0 + 1e-4,
+                                QStringLiteral("camera shake roll exceeds amplitude bound"), &error)
+            || !requireSelftest(maxStep < 0.5,
+                                QStringLiteral("camera shake not smooth (large step between fine samples)"), &error)) {
+            return 1;
+        }
+    }
+
+    // --- (6) WiggleTransform ---
+    {
+        wiggle::WiggleParams disabled;
+        const wiggle::WiggleOffset offDisabled = wiggle::evaluate(disabled, 1.23);
+        if (!requireSelftest(offDisabled.positionOffset.isNull()
+                                 && std::abs(offDisabled.rotationOffsetDeg) < 1e-12
+                                 && std::abs(offDisabled.scaleMultiplier - 1.0) < 1e-12,
+                             QStringLiteral("disabled wiggle is not the identity offset"), &error)) {
+            return 1;
+        }
+        wiggle::WiggleParams p = wiggle::handheldPreset(1.0);
+        p.seed = 99;
+        const wiggle::WiggleOffset a = wiggle::evaluate(p, 2.5);
+        const wiggle::WiggleOffset b = wiggle::evaluate(p, 2.5);
+        if (!requireSelftest(a.positionOffset == b.positionOffset
+                                 && std::abs(a.rotationOffsetDeg - b.rotationOffsetDeg) < 1e-12,
+                             QStringLiteral("wiggle not deterministic"), &error)) {
+            return 1;
+        }
+        double maxMag = 0.0;
+        double maxStep = 0.0;
+        wiggle::WiggleOffset prevOff = wiggle::evaluate(p, 0.0);
+        for (int i = 0; i <= 500; ++i) {
+            const double t = i * 0.01;
+            const wiggle::WiggleOffset o = wiggle::evaluate(p, t);
+            if (!requireSelftest(std::isfinite(o.positionOffset.x()) && std::isfinite(o.positionOffset.y())
+                                     && std::isfinite(o.rotationOffsetDeg) && std::isfinite(o.scaleMultiplier),
+                                 QStringLiteral("wiggle produced NaN/inf"), &error)) {
+                return 1;
+            }
+            maxMag = qMax(maxMag, qMax(std::abs(o.positionOffset.x()), std::abs(o.positionOffset.y())));
+            if (i > 0) {
+                maxStep = qMax(maxStep,
+                               qMax(std::abs(o.positionOffset.x() - prevOff.positionOffset.x()),
+                                    std::abs(o.positionOffset.y() - prevOff.positionOffset.y())));
+            }
+            prevOff = o;
+        }
+        // handheldPreset amp is ~6 px; allow generous slack for fbm overshoot.
+        if (!requireSelftest(maxMag <= 30.0, QStringLiteral("wiggle position offset unbounded"), &error)
+            || !requireSelftest(maxStep < maxMag + 1e-6, QStringLiteral("wiggle not smooth"), &error)) {
+            return 1;
+        }
+    }
+
+    // --- (7) ProjectFile round-trip with new sidecars ---
+    {
+        ProjectData saveData;
+        saveData.config.name = QStringLiteral("MOGRAPH Selftest");
+        saveData.config.width = 640;
+        saveData.config.height = 360;
+        saveData.config.fps = 30;
+        ClipInfo clip;
+        clip.filePath = QStringLiteral("synthetic-mograph.mp4");
+        clip.displayName = QStringLiteral("synthetic-mograph.mp4");
+        clip.duration = 4.0;
+        saveData.videoTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{clip}};
+        saveData.audioTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}};
+
+        Text3DLayer text3D;
+        text3D.setText(QStringLiteral("HELLO"), QFont(QStringLiteral("Sans Serif"), 40));
+        text3D.setExtrudeEnabled(true);
+        text3D.setExtrude(0.3, 0.04, 0.04, 3);
+        text3D.setMaterial(QColor(220, 180, 60), QColor(140, 110, 40), QColor(30, 30, 30),
+                           QVector3D(0.2f, 0.3f, -1.0f));
+        text3D.setExtrudeYawPitch(15.0, -7.0);
+        Text3DClipEntry t3Entry;
+        t3Entry.clipId = QStringLiteral("0:0");
+        t3Entry.config = text3D.toJson();
+        saveData.text3DClipEntries.append(t3Entry);
+
+        exprbind::ClipExpressionBindings bindings;
+        bindings.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("time*45"));
+        bindings.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("clamp(value,0,100)"));
+        ExpressionBindingsClipEntry exprEntry;
+        exprEntry.clipId = QStringLiteral("0:0");
+        exprEntry.bindings = bindings;
+        saveData.expressionBindingsEntries.append(exprEntry);
+
+        wiggle::WiggleParams wp = wiggle::nervousPreset(1.0);
+        wp.seed = 4242;
+        WiggleClipEntry wEntry;
+        wEntry.clipId = QStringLiteral("0:0");
+        wEntry.params = wp;
+        saveData.wiggleClipEntries.append(wEntry);
+
+        Camera3D projCam = Camera3D::createDollyZoom(0.0, -5.0, 3.0);
+        CameraShake cs;
+        cs.enabled = true;
+        cs.seed = 7;
+        cs.positionAmplitude = QVector3D(0.3f, 0.3f, 0.0f);
+        cs.rotationAmplitudeDeg = 2.0;
+        projCam.setShake(cs);
+        saveData.projectCamera = projCam.toJson();
+
+        ProjectData loaded;
+        if (!requireSelftest(ProjectFile::fromJsonString(ProjectFile::toJsonString(saveData), loaded),
+                             QStringLiteral("MOGRAPH project string round-trip failed"), &error)
+            || !requireSelftest(loaded.text3DClipEntries.size() == 1
+                                    && loaded.text3DClipEntries.first().clipId == QStringLiteral("0:0")
+                                    && loaded.text3DClipEntries.first().config == t3Entry.config,
+                                QStringLiteral("text3d clip entry round-trip mismatch"), &error)
+            || !requireSelftest(loaded.expressionBindingsEntries.size() == 1
+                                    && !loaded.expressionBindingsEntries.first().bindings.isEmpty()
+                                    && loaded.expressionBindingsEntries.first().bindings.expression(QStringLiteral("transform.rotation"))
+                                           == QStringLiteral("time*45"),
+                                QStringLiteral("expression bindings round-trip mismatch"), &error)
+            || !requireSelftest(loaded.wiggleClipEntries.size() == 1
+                                    && loaded.wiggleClipEntries.first().params.enabled == wp.enabled
+                                    && loaded.wiggleClipEntries.first().params.seed == wp.seed
+                                    && loaded.wiggleClipEntries.first().params.octaves == wp.octaves
+                                    && std::abs(loaded.wiggleClipEntries.first().params.positionAmplitude.x()
+                                                - wp.positionAmplitude.x()) < 1e-6,
+                                QStringLiteral("wiggle params round-trip mismatch"), &error)
+            || !requireSelftest(!loaded.projectCamera.isEmpty(),
+                                QStringLiteral("project camera lost on round-trip"), &error)) {
+            return 1;
+        }
+        // Project camera deep check via fromJson.
+        Camera3D loadedCam;
+        loadedCam.fromJson(loaded.projectCamera);
+        if (!requireSelftest(loadedCam.shake().enabled && loadedCam.shake().seed == cs.seed
+                                 && loadedCam.hasAnimation(),
+                             QStringLiteral("project camera round-trip lost shake/animation"), &error)) {
+            return 1;
+        }
+
+        // Loading a JSON WITHOUT the new keys -> defaults, no crash.
+        ProjectData legacy;
+        const QString legacyJson = QStringLiteral(
+            "{\"version\":1,\"config\":{\"name\":\"legacy-mograph\",\"width\":1920,\"height\":1080,\"fps\":30},"
+            "\"videoTracks\":[[{\"filePath\":\"legacy.mp4\",\"displayName\":\"legacy.mp4\",\"duration\":1.0,"
+            "\"inPoint\":0.0,\"outPoint\":1.0,\"speed\":1.0,\"volume\":1.0}]],"
+            "\"audioTracks\":[[]],\"playheadPos\":0.0,\"markIn\":-1.0,\"markOut\":-1.0,\"zoomLevel\":10}");
+        if (!requireSelftest(ProjectFile::fromJsonString(legacyJson, legacy),
+                             QStringLiteral("legacy MOGRAPH project load failed"), &error)
+            || !requireSelftest(legacy.text3DClipEntries.isEmpty()
+                                    && legacy.expressionBindingsEntries.isEmpty()
+                                    && legacy.wiggleClipEntries.isEmpty()
+                                    && legacy.projectCamera.isEmpty(),
+                                QStringLiteral("legacy MOGRAPH project should default the new fields"), &error)) {
+            return 1;
+        }
+
+        // Also round-trip via a temp file.
+        QTemporaryDir tempDir;
+        if (!requireSelftest(tempDir.isValid(), QStringLiteral("MOGRAPH selftest temp dir invalid"), &error))
+            return 1;
+        const QString projectPath = tempDir.path() + QStringLiteral("/mograph_selftest.veditor");
+        ProjectData fileLoaded;
+        if (!requireSelftest(ProjectFile::save(projectPath, saveData), QStringLiteral("MOGRAPH project save failed"), &error)
+            || !requireSelftest(ProjectFile::load(projectPath, fileLoaded), QStringLiteral("MOGRAPH project load failed"), &error)
+            || !requireSelftest(fileLoaded.text3DClipEntries.size() == 1
+                                    && fileLoaded.expressionBindingsEntries.size() == 1
+                                    && fileLoaded.wiggleClipEntries.size() == 1
+                                    && !fileLoaded.projectCamera.isEmpty(),
+                                QStringLiteral("saved MOGRAPH project reload mismatch"), &error)) {
+            return 1;
+        }
+    }
+
+    qInfo().noquote() << QStringLiteral("MOGRAPH selftest OK");
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -787,6 +1272,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_PRO_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_PRO_SELFTEST");
         return runProSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_MOGRAPH_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_MOGRAPH_SELFTEST");
+        return runMographSelftest();
     }
 
     // スプラッシュ画面

@@ -103,6 +103,11 @@
 #include "RotoToolsDialog.h"
 #include "TimeRemapDialog.h"
 #include "FavoritesEditDialog.h"
+#include "Text3DExtrusionDialog.h"
+#include "ExpressionBindingDialog.h"
+#include "CameraMotionDialog.h"
+#include "ExtrudedMesh.h"
+#include "SoftRaster3D.h"
 #include <QPainter>
 
 extern "C" {
@@ -1882,6 +1887,30 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({precompAction,
         QStringLiteral("複数のレイヤーを 1 つにまとめて扱いやすくします。整理整頓に便利です。")});
 
+    // US-3D-11: motion-graphics sprint — 4 new menu actions (3D extruded text /
+    // expressions / wiggle handheld / camera motion).
+    compMenu->addSeparator();
+
+    auto *extrudeTextAction = compMenu->addAction(QStringLiteral("3D 押し出しテキスト..."));
+    connect(extrudeTextAction, &QAction::triggered, this, &MainWindow::open3DExtrudedText);
+    m_menuHelpEntries.append({extrudeTextAction,
+        QStringLiteral("文字を立体的に「押し出して」厚みや面取りを付け、選択中のクリップに重ねます。")});
+
+    auto *clipExprAction = compMenu->addAction(QStringLiteral("式（エクスプレッション）..."));
+    connect(clipExprAction, &QAction::triggered, this, &MainWindow::editClipExpressionBindings);
+    m_menuHelpEntries.append({clipExprAction,
+        QStringLiteral("位置・大きさ・回転・不透明度を簡単な数式で自動的に動かします。上級者向けです。")});
+
+    auto *clipWiggleAction = compMenu->addAction(QStringLiteral("ウィグル / 手持ちカメラ風..."));
+    connect(clipWiggleAction, &QAction::triggered, this, &MainWindow::editClipWiggle);
+    m_menuHelpEntries.append({clipWiggleAction,
+        QStringLiteral("クリップを小刻みに揺らして、手持ちカメラで撮ったような動きを足します。")});
+
+    auto *cameraMotionAction = compMenu->addAction(QStringLiteral("カメラモーション..."));
+    connect(cameraMotionAction, &QAction::triggered, this, &MainWindow::openCameraMotionDialog);
+    m_menuHelpEntries.append({cameraMotionAction,
+        QStringLiteral("仮想 3D カメラの動き（ドリー・パン・周回・手ぶれ）をプロジェクト全体に設定します。")});
+
     // --- カラーグレーディングパネル ---
     m_colorGradingPanel = new ColorGradingPanel(this);
     m_colorGradingPanel->setVisible(false); // 作成直後に非表示設定
@@ -2896,7 +2925,10 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             hasActiveSpecialData = hasActiveSpecialData
                 || m_rotoClipEntries.contains(clipId)
                 || m_timeRemapClipEntries.contains(clipId)
-                || m_trackMatteClipEntries.contains(clipId);
+                || m_trackMatteClipEntries.contains(clipId)
+                || m_text3DClipConfigs.contains(clipId)
+                || m_clipExpressionBindings.contains(clipId)
+                || (m_clipWiggleParams.contains(clipId) && m_clipWiggleParams.value(clipId).enabled);
             const VideoSourceInfo info = probeVideoSourceInfo(
                 ProxyManager::instance().getProxyPath(clip.filePath),
                 m_projectConfig.fps > 0 ? m_projectConfig.fps : 30.0);
@@ -2928,15 +2960,65 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 continue;
             frame = applyStoredRotoData(clipId, frame, sourceFrameIndex);
 
+            // US-3D-11: alpha-over a rendered 3D extruded-text layer when this
+            // clip carries one. localSeconds is the clip-local time in seconds.
+            if (auto t3It = m_text3DClipConfigs.constFind(clipId);
+                t3It != m_text3DClipConfigs.cend() && !t3It.value().isEmpty()) {
+                Text3DLayer text3D;
+                text3D.fromJson(t3It.value());
+                const QImage textImage = text3D.renderFrame(frame.size(), localSeconds, Camera3D{});
+                if (!textImage.isNull()) {
+                    QImage base = frame.convertToFormat(QImage::Format_ARGB32);
+                    QPainter painter(&base);
+                    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+                    painter.drawImage(QRect(QPoint(0, 0), base.size()), textImage);
+                    painter.end();
+                    frame = base;
+                }
+            }
+
+            // US-3D-11: apply per-clip expression bindings + wiggle on top of
+            // the keyframed transform values (videoDx/videoDy/videoScale/rotation/opacity).
+            double posX = clip.videoDx;
+            double posY = clip.videoDy;
+            double layerScale = clip.videoScale;
+            double layerRotation = clip.rotation2DDegrees;
+            double layerOpacity = qBound(0.0, clip.opacity, 1.0);
+            if (auto exprIt = m_clipExpressionBindings.constFind(clipId);
+                exprIt != m_clipExpressionBindings.cend()) {
+                const exprbind::ClipExpressionBindings &bindings = exprIt.value();
+                ExpressionContext ctx;
+                ctx.time = localSeconds;
+                ctx.fps = m_projectConfig.fps > 0 ? m_projectConfig.fps : 30.0;
+                ctx.duration = clip.effectiveDuration();
+                ctx.canvasWidth = canvasSize.width();
+                ctx.canvasHeight = canvasSize.height();
+                posX = bindings.resolve(QStringLiteral("transform.position.x"), ctx, posX);
+                posY = bindings.resolve(QStringLiteral("transform.position.y"), ctx, posY);
+                layerScale = bindings.resolve(QStringLiteral("transform.scale"), ctx, layerScale);
+                layerRotation = bindings.resolve(QStringLiteral("transform.rotation"), ctx, layerRotation);
+                const double opacityKf = layerOpacity * 100.0;
+                const double opacityVal = bindings.resolve(QStringLiteral("transform.opacity"), ctx, opacityKf);
+                layerOpacity = qBound(0.0, opacityVal / 100.0, 1.0);
+            }
+            if (auto wigIt = m_clipWiggleParams.constFind(clipId);
+                wigIt != m_clipWiggleParams.cend() && wigIt.value().enabled) {
+                const wiggle::WiggleOffset off = wiggle::evaluate(wigIt.value(), localSeconds);
+                posX += off.positionOffset.x();
+                posY += off.positionOffset.y();
+                layerRotation += off.rotationOffsetDeg;
+                layerScale *= off.scaleMultiplier;
+            }
+
             ActiveLayer active;
             active.clipId = clipId;
             active.image = frame;
             active.layer.name = clip.displayName;
-            active.layer.opacity = qBound(0.0, clip.opacity, 1.0);
+            active.layer.opacity = layerOpacity;
             active.layer.blendMode = BlendMode::Normal;
-            active.layer.position = QPointF(clip.videoDx, clip.videoDy);
-            active.layer.scale = QPointF(clip.videoScale, clip.videoScale);
-            active.layer.rotation = clip.rotation2DDegrees;
+            active.layer.position = QPointF(posX, posY);
+            active.layer.scale = QPointF(layerScale, layerScale);
+            active.layer.rotation = layerRotation;
             active.layer.anchorPoint = QPointF(canvasSize.width() / 2.0, canvasSize.height() / 2.0);
             active.layer.zOrder = trackIdx;
             active.layer.inPoint = clipStart;
@@ -3022,7 +3104,13 @@ void MainWindow::refreshSpecialClipPreview()
         return;
 
     const int timelineMs = qRound(m_timeline->playheadPosition() * 1000.0);
-    if (m_rotoClipEntries.isEmpty() && m_timeRemapClipEntries.isEmpty() && m_trackMatteClipEntries.isEmpty()) {
+    bool anyWiggleEnabled = false;
+    for (auto it = m_clipWiggleParams.cbegin(); it != m_clipWiggleParams.cend(); ++it) {
+        if (it.value().enabled) { anyWiggleEnabled = true; break; }
+    }
+    if (m_rotoClipEntries.isEmpty() && m_timeRemapClipEntries.isEmpty()
+        && m_trackMatteClipEntries.isEmpty() && m_text3DClipConfigs.isEmpty()
+        && m_clipExpressionBindings.isEmpty() && !anyWiggleEnabled) {
         if (!m_player->isPlaying()) {
             s_refreshingPreview = true;
             m_player->previewSeek(timelineMs);
@@ -3068,6 +3156,40 @@ void MainWindow::populateProjectData(ProjectData &data)
         data.trackMatteClipEntries.append(it.value());
     std::sort(data.trackMatteClipEntries.begin(), data.trackMatteClipEntries.end(),
               [](const TrackMatteClipEntry &a, const TrackMatteClipEntry &b) { return a.clipId < b.clipId; });
+
+    // US-3D-11: motion-graphics sprint sidecars
+    data.text3DClipEntries.clear();
+    for (auto it = m_text3DClipConfigs.cbegin(); it != m_text3DClipConfigs.cend(); ++it) {
+        if (it.value().isEmpty())
+            continue;
+        Text3DClipEntry entry;
+        entry.clipId = it.key();
+        entry.config = it.value();
+        data.text3DClipEntries.append(entry);
+    }
+    std::sort(data.text3DClipEntries.begin(), data.text3DClipEntries.end(),
+              [](const Text3DClipEntry &a, const Text3DClipEntry &b) { return a.clipId < b.clipId; });
+    data.expressionBindingsEntries.clear();
+    for (auto it = m_clipExpressionBindings.cbegin(); it != m_clipExpressionBindings.cend(); ++it) {
+        if (it.value().isEmpty())
+            continue;
+        ExpressionBindingsClipEntry entry;
+        entry.clipId = it.key();
+        entry.bindings = it.value();
+        data.expressionBindingsEntries.append(entry);
+    }
+    std::sort(data.expressionBindingsEntries.begin(), data.expressionBindingsEntries.end(),
+              [](const ExpressionBindingsClipEntry &a, const ExpressionBindingsClipEntry &b) { return a.clipId < b.clipId; });
+    data.wiggleClipEntries.clear();
+    for (auto it = m_clipWiggleParams.cbegin(); it != m_clipWiggleParams.cend(); ++it) {
+        WiggleClipEntry entry;
+        entry.clipId = it.key();
+        entry.params = it.value();
+        data.wiggleClipEntries.append(entry);
+    }
+    std::sort(data.wiggleClipEntries.begin(), data.wiggleClipEntries.end(),
+              [](const WiggleClipEntry &a, const WiggleClipEntry &b) { return a.clipId < b.clipId; });
+    data.projectCamera = m_projectCamera.toJson();
 
     collectAudioState(data);
 
@@ -3185,6 +3307,25 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
         if (!entry.clipId.isEmpty())
             m_trackMatteClipEntries.insert(entry.clipId, entry);
     }
+    // US-3D-11: motion-graphics sprint sidecars
+    m_text3DClipConfigs.clear();
+    for (const auto &entry : data.text3DClipEntries) {
+        if (!entry.clipId.isEmpty() && !entry.config.isEmpty())
+            m_text3DClipConfigs.insert(entry.clipId, entry.config);
+    }
+    m_clipExpressionBindings.clear();
+    for (const auto &entry : data.expressionBindingsEntries) {
+        if (!entry.clipId.isEmpty() && !entry.bindings.isEmpty())
+            m_clipExpressionBindings.insert(entry.clipId, entry.bindings);
+    }
+    m_clipWiggleParams.clear();
+    for (const auto &entry : data.wiggleClipEntries) {
+        if (!entry.clipId.isEmpty())
+            m_clipWiggleParams.insert(entry.clipId, entry.params);
+    }
+    m_projectCamera = Camera3D{};
+    if (!data.projectCamera.isEmpty())
+        m_projectCamera.fromJson(data.projectCamera);
     m_selectedVideoTrackIndex = -1;
     m_selectedVideoClipIndexTracked = -1;
 
@@ -6518,6 +6659,203 @@ void MainWindow::configureTrackMatte()
     statusBar()->showMessage(QStringLiteral("%1 に %2 を設定しました")
                                  .arg(targetClip.displayName, trackMatteTypeLabel(matteType)),
                              4000);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// US-3D-11: motion-graphics sprint — 4 menu actions
+// ──────────────────────────────────────────────────────────────────────────
+
+void MainWindow::open3DExtrudedText()
+{
+    if (!m_timeline) {
+        QMessageBox::information(this, QStringLiteral("3D 押し出しテキスト"),
+                                 QStringLiteral("タイムラインの初期化が完了していません。"));
+        return;
+    }
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
+        QMessageBox::information(this, QStringLiteral("3D 押し出しテキスト"),
+                                 QStringLiteral("先にビデオクリップを選択してください。"));
+        return;
+    }
+    const QString clipId = brushClipId(trackIdx, clipIdx);
+
+    Text3DExtrusionDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("3D 押し出しテキスト - %1").arg(clip.displayName));
+    if (m_text3DClipConfigs.contains(clipId)) {
+        Text3DLayer seed;
+        seed.fromJson(m_text3DClipConfigs.value(clipId));
+        dialog.setLayer(seed);
+    }
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    Text3DLayer *cfg = dialog.layer(this);
+    if (!cfg) {
+        statusBar()->showMessage(QStringLiteral("3D テキストの設定取得に失敗しました"), 3000);
+        return;
+    }
+    const QJsonObject json = cfg->toJson();
+    delete cfg;
+    if (json.isEmpty())
+        m_text3DClipConfigs.remove(clipId);
+    else
+        m_text3DClipConfigs.insert(clipId, json);
+
+    refreshSpecialClipPreview();
+    statusBar()->showMessage(QStringLiteral("3D 押し出しテキストを %1 に設定しました").arg(clip.displayName), 4000);
+}
+
+void MainWindow::editClipExpressionBindings()
+{
+    if (!m_timeline) {
+        QMessageBox::information(this, QStringLiteral("エクスプレッション"),
+                                 QStringLiteral("タイムラインの初期化が完了していません。"));
+        return;
+    }
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
+        QMessageBox::information(this, QStringLiteral("エクスプレッション"),
+                                 QStringLiteral("先にビデオクリップを選択してください。"));
+        return;
+    }
+    const QString clipId = brushClipId(trackIdx, clipIdx);
+
+    ExpressionBindingDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("エクスプレッション - %1").arg(clip.displayName));
+    if (m_clipExpressionBindings.contains(clipId))
+        dialog.setBindings(m_clipExpressionBindings.value(clipId));
+    const double projFps = (m_projectConfig.fps > 0) ? m_projectConfig.fps : 30.0;
+    const QSize canvas = (m_projectConfig.width > 0 && m_projectConfig.height > 0)
+        ? QSize(m_projectConfig.width, m_projectConfig.height)
+        : QSize(1920, 1080);
+    dialog.setContextHints(clip.effectiveDuration(), projFps, canvas);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    exprbind::ClipExpressionBindings bindings = dialog.bindings();
+    if (bindings.isEmpty())
+        m_clipExpressionBindings.remove(clipId);
+    else
+        m_clipExpressionBindings.insert(clipId, bindings);
+
+    refreshSpecialClipPreview();
+    statusBar()->showMessage(QStringLiteral("エクスプレッションを %1 に設定しました").arg(clip.displayName), 4000);
+}
+
+void MainWindow::editClipWiggle()
+{
+    if (!m_timeline) {
+        QMessageBox::information(this, QStringLiteral("ウィグル"),
+                                 QStringLiteral("タイムラインの初期化が完了していません。"));
+        return;
+    }
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
+        QMessageBox::information(this, QStringLiteral("ウィグル"),
+                                 QStringLiteral("先にビデオクリップを選択してください。"));
+        return;
+    }
+    const QString clipId = brushClipId(trackIdx, clipIdx);
+    wiggle::WiggleParams params = m_clipWiggleParams.value(clipId);
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("ウィグル / 手持ちカメラ風 - %1").arg(clip.displayName));
+    auto *form = new QFormLayout(&dialog);
+
+    auto *presetCombo = new QComboBox(&dialog);
+    presetCombo->addItems({QStringLiteral("なし"), QStringLiteral("手持ち"),
+                           QStringLiteral("神経質"), QStringLiteral("ふわふわ")});
+    auto *enabledCheck = new QCheckBox(QStringLiteral("有効"), &dialog);
+    enabledCheck->setChecked(params.enabled);
+    auto *posAmpXSpin = new QDoubleSpinBox(&dialog);
+    posAmpXSpin->setRange(-200.0, 200.0);
+    posAmpXSpin->setValue(params.positionAmplitude.x());
+    auto *posAmpYSpin = new QDoubleSpinBox(&dialog);
+    posAmpYSpin->setRange(-200.0, 200.0);
+    posAmpYSpin->setValue(params.positionAmplitude.y());
+    auto *rotAmpSpin = new QDoubleSpinBox(&dialog);
+    rotAmpSpin->setRange(-180.0, 180.0);
+    rotAmpSpin->setValue(params.rotationAmplitudeDeg);
+    auto *freqSpin = new QDoubleSpinBox(&dialog);
+    freqSpin->setRange(0.0, 30.0);
+    freqSpin->setValue(params.positionFrequency);
+    auto *octavesSpin = new QSpinBox(&dialog);
+    octavesSpin->setRange(1, 6);
+    octavesSpin->setValue(params.octaves);
+    auto *seedSpin = new QSpinBox(&dialog);
+    seedSpin->setRange(0, 100000);
+    seedSpin->setValue(static_cast<int>(params.seed));
+
+    form->addRow(QStringLiteral("プリセット:"), presetCombo);
+    form->addRow(enabledCheck);
+    form->addRow(QStringLiteral("位置振幅 X (px):"), posAmpXSpin);
+    form->addRow(QStringLiteral("位置振幅 Y (px):"), posAmpYSpin);
+    form->addRow(QStringLiteral("回転振幅 (°):"), rotAmpSpin);
+    form->addRow(QStringLiteral("周波数 (Hz):"), freqSpin);
+    form->addRow(QStringLiteral("オクターブ:"), octavesSpin);
+    form->addRow(QStringLiteral("シード:"), seedSpin);
+
+    connect(presetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog,
+            [posAmpXSpin, posAmpYSpin, rotAmpSpin, freqSpin, octavesSpin, enabledCheck](int idx) {
+        if (idx <= 0)
+            return;
+        wiggle::WiggleParams p;
+        if (idx == 1) p = wiggle::handheldPreset(1.0);
+        else if (idx == 2) p = wiggle::nervousPreset(1.0);
+        else p = wiggle::floatPreset(1.0);
+        posAmpXSpin->setValue(p.positionAmplitude.x());
+        posAmpYSpin->setValue(p.positionAmplitude.y());
+        rotAmpSpin->setValue(p.rotationAmplitudeDeg);
+        freqSpin->setValue(p.positionFrequency);
+        octavesSpin->setValue(p.octaves);
+        enabledCheck->setChecked(true);
+    });
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    form->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    params.enabled = enabledCheck->isChecked();
+    params.positionAmplitude = QPointF(posAmpXSpin->value(), posAmpYSpin->value());
+    params.rotationAmplitudeDeg = rotAmpSpin->value();
+    params.positionFrequency = freqSpin->value();
+    params.rotationFrequency = freqSpin->value();
+    params.scaleFrequency = freqSpin->value();
+    params.octaves = octavesSpin->value();
+    params.seed = static_cast<unsigned int>(seedSpin->value());
+
+    if (!params.enabled
+        && params.positionAmplitude.isNull()
+        && qFuzzyIsNull(params.rotationAmplitudeDeg)
+        && qFuzzyIsNull(params.scaleAmplitude)) {
+        m_clipWiggleParams.remove(clipId);
+    } else {
+        m_clipWiggleParams.insert(clipId, params);
+    }
+
+    refreshSpecialClipPreview();
+    statusBar()->showMessage(QStringLiteral("ウィグルを %1 に設定しました").arg(clip.displayName), 4000);
+}
+
+void MainWindow::openCameraMotionDialog()
+{
+    CameraMotionDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("カメラモーション"));
+    dialog.setCamera(m_projectCamera);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+    m_projectCamera = dialog.camera();
+    statusBar()->showMessage(QStringLiteral("カメラモーションを更新しました"), 4000);
 }
 
 void MainWindow::editTransformKeyframes()

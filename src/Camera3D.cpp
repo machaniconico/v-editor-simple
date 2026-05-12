@@ -3,8 +3,79 @@
 #include <QPainter>
 #include <QTransform>
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <set>
+
+// ============================================================
+// Deterministic value-noise helpers (self-contained, no deps)
+// ============================================================
+
+unsigned int Camera3D::hashMix(unsigned int h)
+{
+    h ^= h >> 16;
+    h *= 0x45d9f3b7u;
+    h ^= h >> 16;
+    h *= 0x45d9f3b7u;
+    h ^= h >> 16;
+    return h;
+}
+
+double Camera3D::hashNoise(double x, unsigned int seed)
+{
+    int ix = static_cast<int>(std::floor(x));
+    unsigned int h = hashMix(static_cast<unsigned int>(ix) ^ seed);
+    return static_cast<double>(h) / static_cast<double>(UINT_MAX);
+}
+
+double Camera3D::smoothStep(double t)
+{
+    return t * t * (3.0 - 2.0 * t);
+}
+
+double Camera3D::interpolatedNoise(double x, unsigned int seed)
+{
+    int ix = static_cast<int>(std::floor(x));
+    double frac = x - std::floor(x);
+    double v0 = hashNoise(ix, seed);
+    double v1 = hashNoise(ix + 1, seed);
+    return v0 + (v1 - v0) * smoothStep(frac);
+}
+
+// FBM (fractional Brownian motion) for smoother, multi-octave noise.
+// smoothness > 1  → more octaves, lower-pass (lazier / smoother)
+// smoothness == 1  → single octave
+// smoothness < 1   → fewer effective octaves / raw noise (jitterier)
+// Result is in [-1, +1].
+double Camera3D::fbmNoise(double x, unsigned int seed, double smoothness)
+{
+    // Determine octave count: clamp to 1-8.  smoothness=1 → 1 octave.
+    int octaves = static_cast<int>(std::round(smoothness));
+    octaves = std::clamp(octaves, 1, 8);
+
+    double value = 0.0;
+    double amplitude = 1.0;
+    double frequency = 1.0;
+    double gain = 0.5;
+
+    for (int i = 0; i < octaves; ++i) {
+        value += amplitude * (interpolatedNoise(x * frequency, seed + static_cast<unsigned int>(i) * 7919u) - 0.5) * 2.0;
+        amplitude *= gain;
+        frequency *= 2.0;
+    }
+
+    // Normalize: sum of amplitudes = 2*(1 - gain^octaves)/(1 - gain) for gain=0.5
+    double totalAmp = 0.0;
+    double a = 1.0;
+    for (int i = 0; i < octaves; ++i) {
+        totalAmp += a;
+        a *= gain;
+    }
+    if (totalAmp > 0.0)
+        value /= totalAmp;
+
+    return value;  // in [-1, +1]
+}
 
 // ============================================================
 // Camera3DState — serialisation
@@ -151,6 +222,15 @@ void Camera3D::ensureLayerIndex(int index)
 void Camera3D::setCamera(const Camera3DState &state)
 {
     m_state = state;
+}
+
+// ============================================================
+// Camera3D — shake
+// ============================================================
+
+void Camera3D::setShake(const CameraShake &s)
+{
+    m_shake = s;
 }
 
 // ============================================================
@@ -388,6 +468,21 @@ Camera3DState Camera3D::getCameraAt(double time) const
     state.nearPlane = m_state.nearPlane;
     state.farPlane  = m_state.farPlane;
 
+    // Layer procedural shake on top of keyframed base
+    if (m_shake.enabled) {
+        double t = time * m_shake.frequency;
+        unsigned int seed = m_shake.seed;
+
+        state.position.setX(state.position.x() + static_cast<float>(
+            fbmNoise(t, seed, m_shake.smoothness) * m_shake.positionAmplitude.x()));
+        state.position.setY(state.position.y() + static_cast<float>(
+            fbmNoise(t, seed + 1u, m_shake.smoothness) * m_shake.positionAmplitude.y()));
+        state.position.setZ(state.position.z() + static_cast<float>(
+            fbmNoise(t, seed + 2u, m_shake.smoothness) * m_shake.positionAmplitude.z()));
+
+        state.roll += fbmNoise(t, seed + 3u, m_shake.smoothness) * m_shake.rotationAmplitudeDeg;
+    }
+
     return state;
 }
 
@@ -517,6 +612,70 @@ Camera3D Camera3D::createZoomShot(double startFov, double endFov, double duratio
 }
 
 // ============================================================
+// Camera3D — shake presets
+// ============================================================
+
+Camera3D Camera3D::createHandheld(const Camera3DState &base, double intensity)
+{
+    Camera3D cam;
+    cam.setCamera(base);
+
+    CameraShake shake;
+    shake.enabled = true;
+    shake.frequency = 3.0;
+    shake.positionAmplitude = QVector3D(
+        static_cast<float>(4.0 * intensity),
+        static_cast<float>(3.0 * intensity),
+        static_cast<float>(1.0 * intensity));
+    shake.rotationAmplitudeDeg = 0.5 * intensity;
+    shake.seed = 42;
+    shake.smoothness = 2.0;  // lazier, more natural handheld feel
+    cam.setShake(shake);
+
+    return cam;
+}
+
+Camera3D Camera3D::createEarthquake(const Camera3DState &base, double intensity)
+{
+    Camera3D cam;
+    cam.setCamera(base);
+
+    CameraShake shake;
+    shake.enabled = true;
+    shake.frequency = 10.0;
+    shake.positionAmplitude = QVector3D(
+        static_cast<float>(30.0 * intensity),
+        static_cast<float>(20.0 * intensity),
+        static_cast<float>(10.0 * intensity));
+    shake.rotationAmplitudeDeg = 5.0 * intensity;
+    shake.seed = 123;
+    shake.smoothness = 0.5;  // jittery, abrupt
+    cam.setShake(shake);
+
+    return cam;
+}
+
+Camera3D Camera3D::createSubtleDrift(const Camera3DState &base, double intensity)
+{
+    Camera3D cam;
+    cam.setCamera(base);
+
+    CameraShake shake;
+    shake.enabled = true;
+    shake.frequency = 0.5;
+    shake.positionAmplitude = QVector3D(
+        static_cast<float>(2.0 * intensity),
+        static_cast<float>(1.5 * intensity),
+        static_cast<float>(0.5 * intensity));
+    shake.rotationAmplitudeDeg = 0.1 * intensity;
+    shake.seed = 7;
+    shake.smoothness = 3.0;  // very smooth, slow drift
+    cam.setShake(shake);
+
+    return cam;
+}
+
+// ============================================================
 // Camera3D — serialisation
 // ============================================================
 
@@ -555,6 +714,20 @@ QJsonObject Camera3D::toJson() const
         layerArr.append(lt.toJson());
     obj[QStringLiteral("layerTransforms")] = layerArr;
 
+    // Camera shake
+    {
+        QJsonObject shakeObj;
+        shakeObj[QStringLiteral("enabled")] = m_shake.enabled;
+        shakeObj[QStringLiteral("frequency")] = m_shake.frequency;
+        shakeObj[QStringLiteral("posAmpX")] = static_cast<double>(m_shake.positionAmplitude.x());
+        shakeObj[QStringLiteral("posAmpY")] = static_cast<double>(m_shake.positionAmplitude.y());
+        shakeObj[QStringLiteral("posAmpZ")] = static_cast<double>(m_shake.positionAmplitude.z());
+        shakeObj[QStringLiteral("rotAmpDeg")] = m_shake.rotationAmplitudeDeg;
+        shakeObj[QStringLiteral("seed")] = static_cast<double>(m_shake.seed);
+        shakeObj[QStringLiteral("smoothness")] = m_shake.smoothness;
+        obj[QStringLiteral("shake")] = shakeObj;
+    }
+
     return obj;
 }
 
@@ -591,4 +764,20 @@ void Camera3D::fromJson(const QJsonObject &obj)
     QJsonArray layerArr = obj[QStringLiteral("layerTransforms")].toArray();
     for (const auto &ltVal : layerArr)
         m_layerTransforms.append(Layer3DTransform::fromJson(ltVal.toObject()));
+
+    // Camera shake (optional key — missing ⇒ shake disabled)
+    if (obj.contains(QStringLiteral("shake"))) {
+        QJsonObject shakeObj = obj[QStringLiteral("shake")].toObject();
+        m_shake.enabled = shakeObj[QStringLiteral("enabled")].toBool(false);
+        m_shake.frequency = shakeObj[QStringLiteral("frequency")].toDouble(4.0);
+        m_shake.positionAmplitude = QVector3D(
+            static_cast<float>(shakeObj[QStringLiteral("posAmpX")].toDouble(0.0)),
+            static_cast<float>(shakeObj[QStringLiteral("posAmpY")].toDouble(0.0)),
+            static_cast<float>(shakeObj[QStringLiteral("posAmpZ")].toDouble(0.0)));
+        m_shake.rotationAmplitudeDeg = shakeObj[QStringLiteral("rotAmpDeg")].toDouble(0.0);
+        m_shake.seed = static_cast<unsigned int>(shakeObj[QStringLiteral("seed")].toDouble(1));
+        m_shake.smoothness = shakeObj[QStringLiteral("smoothness")].toDouble(1.0);
+    } else {
+        m_shake.enabled = false;
+    }
 }

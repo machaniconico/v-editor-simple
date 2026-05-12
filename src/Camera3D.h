@@ -53,6 +53,17 @@ struct Layer3DTransform {
     static Layer3DTransform fromJson(const QJsonObject &obj);
 };
 
+// --- Camera shake — procedural jitter layered on top of keyframed base ---
+
+struct CameraShake {
+    double frequency = 4.0;
+    QVector3D positionAmplitude = {0, 0, 0};
+    double rotationAmplitudeDeg = 0.0;  // applied to roll
+    unsigned int seed = 1;
+    double smoothness = 1.0;            // >1 = lazier handheld, <1 = jittery
+    bool enabled = false;
+};
+
 // --- Camera property enum for keyframe tracks ---
 
 enum class Camera3DProperty {
@@ -118,6 +129,11 @@ public:
     KeyframeTrack *track(Camera3DProperty property);
     const KeyframeTrack *track(Camera3DProperty property) const;
 
+    // --- Camera shake ---
+
+    void setShake(const CameraShake &s);
+    CameraShake shake() const { return m_shake; }
+
     // --- Built-in camera moves (static factory methods) ---
 
     static Camera3D createDollyZoom(double startZ, double endZ, double duration);
@@ -125,6 +141,12 @@ public:
     static Camera3D createOrbitShot(const QVector3D &centerPoint, double radius,
                                     double duration);
     static Camera3D createZoomShot(double startFov, double endFov, double duration);
+
+    // --- Shake presets (static factory methods) ---
+
+    static Camera3D createHandheld(const Camera3DState &base, double intensity = 1.0);
+    static Camera3D createEarthquake(const Camera3DState &base, double intensity = 1.0);
+    static Camera3D createSubtleDrift(const Camera3DState &base, double intensity = 1.0);
 
     // --- Serialisation ---
 
@@ -145,6 +167,16 @@ private:
 
     // Per-layer 3D transforms (indexed by layer index)
     QVector<Layer3DTransform> m_layerTransforms;
+
+    CameraShake m_shake;
+
+    // --- Deterministic value-noise helpers (shake) ---
+
+    static unsigned int hashMix(unsigned int h);
+    static double hashNoise(double x, unsigned int seed);
+    static double smoothStep(double t);
+    static double interpolatedNoise(double x, unsigned int seed);
+    static double fbmNoise(double x, unsigned int seed, double smoothness);
 
     void ensureTracks();
     int trackIndex(Camera3DProperty property) const;

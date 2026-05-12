@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QMap>
@@ -17,6 +19,9 @@ struct ExpressionContext {
     int canvasWidth = 1920;     // composition width
     int canvasHeight = 1080;    // composition height
     double value = 0.0;         // current property value (pre-expression)
+    // Optional: returns underlying animated-property value at time t.
+    // Default empty.  When set, smooth() / loopIn() / loopOut() can sample it.
+    std::function<double(double)> sampleValueAtTime;
 };
 
 // --- Expression evaluation result ---

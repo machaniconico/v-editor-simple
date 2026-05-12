@@ -170,6 +170,20 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/PathText.cpp
     src/Text3DLayer.h
     src/Text3DLayer.cpp
+    src/ExtrudedMesh.h
+    src/ExtrudedMesh.cpp
+    src/SoftRaster3D.h
+    src/SoftRaster3D.cpp
+    src/ClipExpressionBindings.h
+    src/ClipExpressionBindings.cpp
+    src/WiggleTransform.h
+    src/WiggleTransform.cpp
+    src/Text3DExtrusionDialog.h
+    src/Text3DExtrusionDialog.cpp
+    src/ExpressionBindingDialog.h
+    src/ExpressionBindingDialog.cpp
+    src/CameraMotionDialog.h
+    src/CameraMotionDialog.cpp
     src/TextPathWarp.h
     src/TextPathWarp.cpp
     src/BrushAnimation.h

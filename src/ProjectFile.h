@@ -14,6 +14,8 @@
 #include "ParticleSystem.h"
 #include "Rotoscope.h"
 #include "TimeRemap.h"
+#include "ClipExpressionBindings.h"
+#include "WiggleTransform.h"
 
 // --- Audio mixer serialization sub-types ---
 
@@ -133,6 +135,26 @@ struct TrackMatteClipEntry {
     QString matteSourceClipId;
 };
 
+// US-3D-11: per-clip 3D extruded-text layer config. `config` is a
+// Text3DLayer::toJson() blob (Text3DLayer is a non-copyable QObject so we
+// stash the serialized form rather than the object).
+struct Text3DClipEntry {
+    QString clipId;
+    QJsonObject config;
+};
+
+// US-3D-11: per-clip expression bindings (transform.* etc).
+struct ExpressionBindingsClipEntry {
+    QString clipId;
+    exprbind::ClipExpressionBindings bindings;
+};
+
+// US-3D-11: per-clip wiggle / handheld-camera transform jitter.
+struct WiggleClipEntry {
+    QString clipId;
+    wiggle::WiggleParams params;
+};
+
 struct ProjectGlowState {
     bool enabled = false;
     float threshold = 0.5f;
@@ -210,6 +232,12 @@ struct ProjectData {
     QVector<TimeRemapClipEntry> timeRemapClipEntries;
     QVector<TrackMatteClipEntry> trackMatteClipEntries;
     ProjectVfxState vfxState;
+
+    // US-3D-11: motion-graphics sprint persistence
+    QVector<Text3DClipEntry> text3DClipEntries;
+    QVector<ExpressionBindingsClipEntry> expressionBindingsEntries;
+    QVector<WiggleClipEntry> wiggleClipEntries;
+    QJsonObject projectCamera;   // Camera3D::toJson() — single per-project camera
 };
 
 class ProjectFile
@@ -281,6 +309,14 @@ private:
     static TrackMatteClipEntry trackMatteClipEntryFromJson(const QJsonObject &obj);
     static QJsonObject vfxStateToJson(const ProjectVfxState &state);
     static ProjectVfxState vfxStateFromJson(const QJsonObject &obj);
+
+    // US-3D-11: motion-graphics sprint persistence helpers
+    static QJsonObject text3DClipEntryToJson(const Text3DClipEntry &entry);
+    static Text3DClipEntry text3DClipEntryFromJson(const QJsonObject &obj);
+    static QJsonObject expressionBindingsEntryToJson(const ExpressionBindingsClipEntry &entry);
+    static ExpressionBindingsClipEntry expressionBindingsEntryFromJson(const QJsonObject &obj);
+    static QJsonObject wiggleClipEntryToJson(const WiggleClipEntry &entry);
+    static WiggleClipEntry wiggleClipEntryFromJson(const QJsonObject &obj);
 
     // US-AETEXT-12: AE text feature persistence
     static QJsonObject pathTextToJson(const PathTextEntry &e);
