@@ -125,6 +125,12 @@
 #define HAVE_ASPECTREFRAMER 1
 #endif
 
+// US-PT-B: Sprint 15 planar tracker self-test (VEDITOR_PLANAR_SELFTEST=1)
+#if __has_include("PlanarTracker.h")
+#include "PlanarTracker.h"
+#define HAVE_PLANARTRACKER 1
+#endif
+
 // US-CAP-B: Sprint 14 caption self-test (VEDITOR_CAPTION_SELFTEST=1)
 #if __has_include("CaptionTrack.h")
 #include "CaptionTrack.h"
@@ -1855,6 +1861,71 @@ int runCaptionSelftest()
     return 0;
 }
 
+// US-PT-B: Sprint 15 planar tracker self-test (VEDITOR_PLANAR_SELFTEST=1)
+int runPlanarSelftest()
+{
+    QString error;
+#ifdef HAVE_PLANARTRACKER
+    {
+        // 1. CornerSet::rectangle
+        const auto cs = planar::CornerSet::rectangle(QRectF(10, 20, 100, 80));
+        if (!requireSelftest(cs.tl == QPointF(10, 20) && cs.br == QPointF(110, 100)
+                                 && cs.isValid(),
+                             QStringLiteral("CornerSet::rectangle wrong"), &error))
+            return 1;
+
+        // 2. homographyFromCorners(identity) で transformPoint ≈ id
+        const auto idH = planar::homographyFromCorners(cs, cs);
+        const QPointF mapped = planar::transformPoint(QPointF(50, 60), idH);
+        if (!requireSelftest(std::abs(mapped.x() - 50.0) < 1e-2
+                                 && std::abs(mapped.y() - 60.0) < 1e-2,
+                             QStringLiteral("identity homography deviates"), &error))
+            return 1;
+
+        // 3. Tracker init + reset
+        planar::Tracker tracker;
+        if (!requireSelftest(!tracker.isInitialized(),
+                             QStringLiteral("Tracker initially initialized=true"), &error))
+            return 1;
+        QImage refFrame(64, 64, QImage::Format_ARGB32);
+        refFrame.fill(QColor(128, 128, 128, 255));
+        // draw a small rectangle at center to give SAD something to track
+        QPainter p(&refFrame);
+        p.fillRect(QRect(24, 24, 16, 16), QColor(255, 0, 0, 255));
+        p.end();
+        tracker.setReferenceFrame(refFrame, cs);
+        if (!requireSelftest(tracker.isInitialized(),
+                             QStringLiteral("Tracker not initialized after setRef"), &error))
+            return 1;
+        tracker.reset();
+        if (!requireSelftest(!tracker.isInitialized(),
+                             QStringLiteral("Tracker still initialized after reset"), &error))
+            return 1;
+
+        // 4. trackSequence: 1 frame → returns 1 Frame
+        tracker.reset();
+        QList<QImage> frames; frames.append(refFrame);
+        const auto result = tracker.trackSequence(frames, cs, 33);
+        if (!requireSelftest(result.size() == 1,
+                             QStringLiteral("trackSequence(1 frame) returned !=1"), &error))
+            return 1;
+
+        // 5. warpImage で identity → 同じ画像 (pixel-wise compare 一部)
+        QImage warped = planar::warpImage(refFrame, idH, refFrame.size());
+        if (!requireSelftest(warped.size() == refFrame.size(),
+                             QStringLiteral("warpImage identity size mismatch"), &error))
+            return 1;
+        // ピクセルチェックは多少誤差を許容: 中央 pixel が赤に近い
+        const QRgb cp = warped.pixel(32, 32);
+        if (!requireSelftest(qRed(cp) > 200 && qGreen(cp) < 50 && qBlue(cp) < 50,
+                             QStringLiteral("warpImage identity center pixel wrong"), &error))
+            return 1;
+    }
+#endif
+    qInfo().noquote() << QStringLiteral("PLANAR selftest OK");
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -2063,6 +2134,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_CAPTION_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_CAPTION_SELFTEST");
         return runCaptionSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_PLANAR_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_PLANAR_SELFTEST");
+        return runPlanarSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");

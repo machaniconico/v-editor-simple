@@ -142,6 +142,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AudioMixer.cpp
     src/PlanarTracker.cpp
     src/PlanarTracker.h
+    src/PlanarTrackerDialog.cpp
+    src/PlanarTrackerDialog.h
     src/SurfaceTool.cpp
     src/SurfaceTool.h
     src/EqualizerPanel.cpp

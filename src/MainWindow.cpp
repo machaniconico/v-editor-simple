@@ -35,6 +35,7 @@
 #include "AIProcessingDialog.h"
 #include "PluginBrowserDialog.h"
 #include "AIMaskDialog.h"
+#include "PlanarTrackerDialog.h"
 #include "AudioClipEditor.h"
 #include "MagneticTimeline.h"
 #include "ShortcutManager.h"
@@ -1936,6 +1937,14 @@ void MainWindow::setupMenuBar()
     connect(aiMaskAction, &QAction::triggered, this, &MainWindow::openAIMaskDialog);
     m_menuHelpEntries.append({aiMaskAction,
         QStringLiteral("輝度しきい値 / 色域 / 外部プラグインで自動マスクを生成するダイアログを開く。")});
+
+    // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog.
+    auto *planarTrackerAction = toolsMenu->addAction(QStringLiteral("プラナートラッカー…"));
+    planarTrackerAction->setObjectName("action_planar_tracker");
+    connect(planarTrackerAction, &QAction::triggered,
+            this, &MainWindow::openPlanarTrackerDialog);
+    m_menuHelpEntries.append({planarTrackerAction,
+        QStringLiteral("4 点コーナーピンで平面 (看板・画面・顔など) を時系列追跡し、AI マスクや 2D エフェクトを貼り付けに使えます。")});
 
     // US-SNS-7: LoudnessPanel dock (created here so menu action can reference it)
     m_loudnessDock = new QDockWidget("ラウドネスパネル", this);
@@ -7180,6 +7189,17 @@ void MainWindow::openAIMaskDialog()
     m_aiMaskDialog->show();
     m_aiMaskDialog->raise();
     m_aiMaskDialog->activateWindow();
+}
+
+void MainWindow::openPlanarTrackerDialog()
+{
+    if (!m_planarTrackerDialog) {
+        m_planarTrackerDialog = new PlanarTrackerDialog(this);
+        m_planarTrackerDialog->setObjectName(QStringLiteral("planarTrackerDialog"));
+    }
+    m_planarTrackerDialog->show();
+    m_planarTrackerDialog->raise();
+    m_planarTrackerDialog->activateWindow();
 }
 
 void MainWindow::openAudioClipEditorDialog()

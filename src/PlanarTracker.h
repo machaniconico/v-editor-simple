@@ -1,11 +1,22 @@
 #pragma once
 
+#include <QImage>
+#include <QPointF>
+#include <QSize>
+#include <QList>
+#include <QString>
+#include <QRectF>
+
 #include <array>
 #include <cstdint>
 #include <vector>
-#include <QString>
 
 class QJsonObject;
+
+// ---------------------------------------------------------------------------
+// namespace planartrack  — original Lucas-Kanade tracker (used by ProjectFile,
+//                          VideoStabilizer, etc.)
+// ---------------------------------------------------------------------------
 
 namespace planartrack {
 
@@ -105,3 +116,78 @@ bool runSelfTest();
 #endif
 
 } // namespace planartrack
+
+// ---------------------------------------------------------------------------
+// namespace planar  — SAD-based 4-corner planar tracker (Sprint 15, A1)
+// ---------------------------------------------------------------------------
+
+namespace planar {
+
+// 4 corner positions (image coordinate, pixels; order: tl, tr, br, bl)
+struct CornerSet {
+    QPointF tl = QPointF(0, 0);
+    QPointF tr = QPointF(0, 0);
+    QPointF br = QPointF(0, 0);
+    QPointF bl = QPointF(0, 0);
+
+    bool isValid() const;
+    QPointF center() const;
+    static CornerSet rectangle(const QRectF& rect);
+};
+
+// Per-frame track result
+struct Frame {
+    int frameIndex = 0;
+    qint64 timeMs = 0;
+    CornerSet corners;
+    double confidence = 1.0;
+};
+
+struct TrackParams {
+    double searchRadiusPx = 16.0;
+    double patchSizePx = 32.0;
+    double dampingFactor = 0.3;
+    int maxFramesPerCall = 0;
+};
+
+// 3x3 homography (row-major)
+struct Homography {
+    double m[9] = {1,0,0, 0,1,0, 0,0,1};
+};
+
+Homography homographyFromCorners(const CornerSet& src, const CornerSet& dst);
+QPointF transformPoint(const QPointF& pt, const Homography& h);
+QImage warpImage(const QImage& source, const Homography& h, const QSize& outSize);
+
+class Tracker {
+public:
+    Tracker();
+
+    void setParams(const TrackParams& p);
+    TrackParams params() const;
+
+    void setReferenceFrame(const QImage& frame, const CornerSet& corners);
+    Frame trackNextFrame(const QImage& nextFrame, int frameIndex, qint64 timeMs);
+    QList<Frame> trackSequence(const QList<QImage>& frames,
+                                const CornerSet& initialCorners,
+                                qint64 frameDurationMs = 33);
+
+    void reset();
+    bool isInitialized() const { return m_initialized; }
+    CornerSet lastCorners() const { return m_lastCorners; }
+
+private:
+    QPointF refinePoint(const QImage& source, const QPointF& current,
+                        const QImage& templatePatch) const;
+    QImage extractPatch(const QImage& image, const QPointF& center, double size) const;
+
+    TrackParams m_params;
+    bool m_initialized = false;
+    QImage m_refFrame;
+    CornerSet m_lastCorners;
+    QImage m_patches[4];
+};
+
+QString homographyToString(const Homography& h);
+
+} // namespace planar

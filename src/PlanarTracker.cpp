@@ -2,15 +2,22 @@
 
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QRectF>
+#include <QtMath>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <utility>
 #include <vector>
+
+// ===========================================================================
+// namespace planartrack  — original Lucas-Kanade tracker implementation
+// ===========================================================================
 
 namespace planartrack {
 
@@ -565,7 +572,7 @@ FrameResult makeFailureResult(int frameIndex, const Homography& H)
     return result;
 }
 
-} // namespace
+} // namespace (anonymous)
 
 bool isIdentityHomography(const Homography& H, double tolerance)
 {
@@ -714,6 +721,67 @@ bool fromJson(const QJsonObject& obj, PlanarTrack& track)
     return true;
 }
 
+PlanarTracker::PlanarTracker(const LumaImage& ref, const Quad& refQuad)
+{
+    LumaImage normalized = normalizeImage(ref);
+    if (!isValidImage(normalized)) {
+        return;
+    }
+    m_referencePyramid = buildPyramid(normalized);
+    m_templates.reserve(m_referencePyramid.size());
+    for (std::size_t level = 0; level < m_referencePyramid.size(); ++level) {
+        const int divisor = 1 << static_cast<int>(level);
+        const Quad scaledQuad = scaleQuad(refQuad, 1.0 / static_cast<double>(divisor));
+        m_templates.push_back(buildTemplateLevel(m_referencePyramid[level], scaledQuad, divisor));
+    }
+}
+
+FrameResult PlanarTracker::track(const LumaImage& frame, int frameIndex)
+{
+    LumaImage normalized = normalizeImage(frame);
+    if (!isValidImage(normalized) || m_referencePyramid.empty()) {
+        return makeFailureResult(frameIndex, m_lastH);
+    }
+
+    const std::vector<LumaImage> framePyramid = buildPyramid(normalized);
+    Homography H = m_hasLastH ? m_lastH : identityHomography();
+
+    const int topLevel = static_cast<int>(m_templates.size()) - 1;
+    H = toPyramidLevel(H, m_templates[static_cast<std::size_t>(topLevel)].scaleDivisor);
+
+    for (int level = topLevel; level >= 0; --level) {
+        const std::size_t idx = static_cast<std::size_t>(level);
+        if (idx < framePyramid.size() && idx < m_templates.size()) {
+            refineAtLevel(m_templates[idx], framePyramid[idx], H);
+        }
+        if (level > 0) {
+            H = upsampleToFinerLevel(H);
+        }
+    }
+
+    H = normalizeHomography(H);
+
+    EvaluationData eval = evaluateWarp(m_templates[0], framePyramid[0], H);
+    const double residual = eval.rms;
+    const double confidence = residual < kResidualFailureThreshold
+        ? std::max(0.0, 1.0 - residual / kResidualFailureThreshold)
+        : 0.0;
+    const bool uncertain = confidence < kConfidenceFailureThreshold;
+
+    if (!uncertain) {
+        m_lastH = H;
+        m_hasLastH = true;
+    }
+
+    FrameResult result;
+    result.frameIndex = frameIndex;
+    result.H = H;
+    result.residual = residual;
+    result.confidence = confidence;
+    result.uncertain = uncertain;
+    return result;
+}
+
 #ifdef VEDITOR_PLANAR_TRACKER_SELFTEST
 namespace tests {
 
@@ -804,3 +872,446 @@ bool runSelfTest()
 #endif
 
 } // namespace planartrack
+
+// ===========================================================================
+// namespace planar  — SAD-based 4-corner planar tracker (Sprint 15, A1)
+// ===========================================================================
+
+namespace planar {
+
+// ---------------------------------------------------------------------------
+// CornerSet
+// ---------------------------------------------------------------------------
+
+static double cross2D(const QPointF& o, const QPointF& a, const QPointF& b)
+{
+    return (a.x() - o.x()) * (b.y() - o.y()) - (a.y() - o.y()) * (b.x() - o.x());
+}
+
+bool CornerSet::isValid() const
+{
+    if (tl == tr && tr == br && br == bl)
+        return false;
+
+    const QPointF pts[4] = {tl, tr, br, bl};
+    double sign = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        const double c = cross2D(pts[i], pts[(i + 1) % 4], pts[(i + 2) % 4]);
+        if (std::abs(c) < 1e-9)
+            continue;
+        if (sign == 0.0) {
+            sign = c;
+        } else if ((sign > 0.0) != (c > 0.0)) {
+            return false;
+        }
+    }
+    return sign != 0.0;
+}
+
+QPointF CornerSet::center() const
+{
+    return (tl + tr + br + bl) / 4.0;
+}
+
+CornerSet CornerSet::rectangle(const QRectF& rect)
+{
+    CornerSet cs;
+    cs.tl = rect.topLeft();
+    cs.tr = rect.topRight();
+    cs.br = rect.bottomRight();
+    cs.bl = rect.bottomLeft();
+    return cs;
+}
+
+// ---------------------------------------------------------------------------
+// Homography
+// ---------------------------------------------------------------------------
+
+static bool gaussianElim8(double A[8][8], double b[8], double x[8])
+{
+    for (int pivot = 0; pivot < 8; ++pivot) {
+        int maxRow = pivot;
+        double maxVal = std::abs(A[pivot][pivot]);
+        for (int row = pivot + 1; row < 8; ++row) {
+            if (std::abs(A[row][pivot]) > maxVal) {
+                maxVal = std::abs(A[row][pivot]);
+                maxRow = row;
+            }
+        }
+        if (maxVal < 1e-12)
+            return false;
+
+        if (maxRow != pivot) {
+            for (int col = 0; col < 8; ++col)
+                std::swap(A[pivot][col], A[maxRow][col]);
+            std::swap(b[pivot], b[maxRow]);
+        }
+
+        const double diag = A[pivot][pivot];
+        for (int col = pivot; col < 8; ++col)
+            A[pivot][col] /= diag;
+        b[pivot] /= diag;
+
+        for (int row = 0; row < 8; ++row) {
+            if (row == pivot)
+                continue;
+            const double factor = A[row][pivot];
+            if (std::abs(factor) < 1e-18)
+                continue;
+            for (int col = pivot; col < 8; ++col)
+                A[row][col] -= factor * A[pivot][col];
+            b[row] -= factor * b[pivot];
+        }
+    }
+    for (int i = 0; i < 8; ++i)
+        x[i] = b[i];
+    return true;
+}
+
+Homography homographyFromCorners(const CornerSet& src, const CornerSet& dst)
+{
+    const QPointF srcPts[4] = {src.tl, src.tr, src.br, src.bl};
+    const QPointF dstPts[4] = {dst.tl, dst.tr, dst.br, dst.bl};
+
+    double A[8][8] = {};
+    double b[8] = {};
+
+    for (int i = 0; i < 4; ++i) {
+        const double xs = srcPts[i].x();
+        const double ys = srcPts[i].y();
+        const double xd = dstPts[i].x();
+        const double yd = dstPts[i].y();
+
+        const int r0 = i * 2;
+        const int r1 = r0 + 1;
+
+        A[r0][0] = xs;  A[r0][1] = ys;  A[r0][2] = 1.0;
+        A[r0][3] = 0.0; A[r0][4] = 0.0; A[r0][5] = 0.0;
+        A[r0][6] = -xd * xs;
+        A[r0][7] = -xd * ys;
+        b[r0] = xd;
+
+        A[r1][0] = 0.0; A[r1][1] = 0.0; A[r1][2] = 0.0;
+        A[r1][3] = xs;  A[r1][4] = ys;  A[r1][5] = 1.0;
+        A[r1][6] = -yd * xs;
+        A[r1][7] = -yd * ys;
+        b[r1] = yd;
+    }
+
+    double xSol[8] = {};
+    Homography h;
+    if (gaussianElim8(A, b, xSol)) {
+        for (int i = 0; i < 8; ++i)
+            h.m[i] = xSol[i];
+        h.m[8] = 1.0;
+    }
+    return h;
+}
+
+QPointF transformPoint(const QPointF& pt, const Homography& h)
+{
+    const double x = pt.x();
+    const double y = pt.y();
+    const double w = h.m[6] * x + h.m[7] * y + h.m[8];
+    if (std::abs(w) < 1e-10)
+        return QPointF(0, 0);
+    return QPointF((h.m[0] * x + h.m[1] * y + h.m[2]) / w,
+                   (h.m[3] * x + h.m[4] * y + h.m[5]) / w);
+}
+
+static bool invert3x3(const double m[9], double out[9])
+{
+    const double c00 =  (m[4] * m[8] - m[5] * m[7]);
+    const double c01 = -(m[3] * m[8] - m[5] * m[6]);
+    const double c02 =  (m[3] * m[7] - m[4] * m[6]);
+    const double det = m[0] * c00 + m[1] * c01 + m[2] * c02;
+    if (std::abs(det) < 1e-12)
+        return false;
+    const double inv = 1.0 / det;
+    out[0] = c00 * inv;
+    out[1] = -(m[1] * m[8] - m[2] * m[7]) * inv;
+    out[2] =  (m[1] * m[5] - m[2] * m[4]) * inv;
+    out[3] = c01 * inv;
+    out[4] =  (m[0] * m[8] - m[2] * m[6]) * inv;
+    out[5] = -(m[0] * m[5] - m[2] * m[3]) * inv;
+    out[6] = c02 * inv;
+    out[7] = -(m[0] * m[7] - m[1] * m[6]) * inv;
+    out[8] =  (m[0] * m[4] - m[1] * m[3]) * inv;
+    return true;
+}
+
+QImage warpImage(const QImage& source, const Homography& h, const QSize& outSize)
+{
+    if (outSize.isEmpty() || source.isNull())
+        return QImage();
+
+    double inv[9];
+    if (!invert3x3(h.m, inv))
+        std::copy(h.m, h.m + 9, inv);
+
+    const QImage src = source.convertToFormat(QImage::Format_ARGB32);
+    QImage out(outSize, QImage::Format_ARGB32);
+    out.fill(Qt::transparent);
+
+    const int srcW = src.width();
+    const int srcH = src.height();
+    const int outW = outSize.width();
+    const int outH = outSize.height();
+
+    for (int oy = 0; oy < outH; ++oy) {
+        QRgb* outLine = reinterpret_cast<QRgb*>(out.scanLine(oy));
+        for (int ox = 0; ox < outW; ++ox) {
+            const double fx = static_cast<double>(ox);
+            const double fy = static_cast<double>(oy);
+            const double w  = inv[6] * fx + inv[7] * fy + inv[8];
+            if (std::abs(w) < 1e-10) {
+                outLine[ox] = 0;
+                continue;
+            }
+            const double sx = (inv[0] * fx + inv[1] * fy + inv[2]) / w;
+            const double sy = (inv[3] * fx + inv[4] * fy + inv[5]) / w;
+
+            if (sx < 0.0 || sy < 0.0 || sx > static_cast<double>(srcW - 1) || sy > static_cast<double>(srcH - 1)) {
+                outLine[ox] = 0;
+                continue;
+            }
+
+            const int x0 = static_cast<int>(std::floor(sx));
+            const int y0 = static_cast<int>(std::floor(sy));
+            const int x1 = std::min(x0 + 1, srcW - 1);
+            const int y1 = std::min(y0 + 1, srcH - 1);
+            const double fx2 = sx - static_cast<double>(x0);
+            const double fy2 = sy - static_cast<double>(y0);
+
+            const QRgb p00 = src.pixel(x0, y0);
+            const QRgb p10 = src.pixel(x1, y0);
+            const QRgb p01 = src.pixel(x0, y1);
+            const QRgb p11 = src.pixel(x1, y1);
+
+            const auto lerp = [](double a, double b2, double t) { return a + (b2 - a) * t; };
+            const double r  = lerp(lerp(qRed(p00),   qRed(p10),   fx2), lerp(qRed(p01),   qRed(p11),   fx2), fy2);
+            const double g  = lerp(lerp(qGreen(p00), qGreen(p10), fx2), lerp(qGreen(p01), qGreen(p11), fx2), fy2);
+            const double bl = lerp(lerp(qBlue(p00),  qBlue(p10),  fx2), lerp(qBlue(p01),  qBlue(p11),  fx2), fy2);
+            const double a  = lerp(lerp(qAlpha(p00), qAlpha(p10), fx2), lerp(qAlpha(p01), qAlpha(p11), fx2), fy2);
+
+            outLine[ox] = qRgba(static_cast<int>(r + 0.5),
+                                 static_cast<int>(g + 0.5),
+                                 static_cast<int>(bl + 0.5),
+                                 static_cast<int>(a + 0.5));
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Tracker
+// ---------------------------------------------------------------------------
+
+Tracker::Tracker() = default;
+
+void Tracker::setParams(const TrackParams& p)
+{
+    m_params = p;
+}
+
+TrackParams Tracker::params() const
+{
+    return m_params;
+}
+
+void Tracker::reset()
+{
+    m_initialized = false;
+    m_refFrame = QImage();
+    m_lastCorners = CornerSet();
+    for (int i = 0; i < 4; ++i)
+        m_patches[i] = QImage();
+}
+
+QImage Tracker::extractPatch(const QImage& image, const QPointF& center, double size) const
+{
+    const int half = static_cast<int>(size / 2.0);
+    const int patchW = static_cast<int>(size);
+    const int patchH = static_cast<int>(size);
+    const int cx = static_cast<int>(std::round(center.x()));
+    const int cy = static_cast<int>(std::round(center.y()));
+
+    QImage patch(patchW, patchH, QImage::Format_ARGB32);
+    patch.fill(Qt::black);
+
+    for (int py = 0; py < patchH; ++py) {
+        for (int px = 0; px < patchW; ++px) {
+            const int sx = cx - half + px;
+            const int sy = cy - half + py;
+            if (sx >= 0 && sx < image.width() && sy >= 0 && sy < image.height())
+                patch.setPixel(px, py, image.pixel(sx, sy));
+        }
+    }
+    return patch;
+}
+
+void Tracker::setReferenceFrame(const QImage& frame, const CornerSet& corners)
+{
+    m_refFrame = frame.convertToFormat(QImage::Format_ARGB32);
+    m_lastCorners = corners;
+
+    const QPointF cornerPts[4] = {corners.tl, corners.tr, corners.br, corners.bl};
+    for (int i = 0; i < 4; ++i)
+        m_patches[i] = extractPatch(m_refFrame, cornerPts[i], m_params.patchSizePx);
+
+    m_initialized = true;
+}
+
+QPointF Tracker::refinePoint(const QImage& source, const QPointF& current,
+                              const QImage& templatePatch) const
+{
+    const int radius = static_cast<int>(m_params.searchRadiusPx);
+    const int patchW = templatePatch.width();
+    const int patchH = templatePatch.height();
+    const int halfW = patchW / 2;
+    const int halfH = patchH / 2;
+
+    double bestSAD = std::numeric_limits<double>::max();
+    int bestDx = 0;
+    int bestDy = 0;
+
+    for (int dy = -radius; dy <= radius; ++dy) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            const int cx = static_cast<int>(std::round(current.x())) + dx;
+            const int cy = static_cast<int>(std::round(current.y())) + dy;
+
+            double sad = 0.0;
+            for (int py = 0; py < patchH; ++py) {
+                for (int px = 0; px < patchW; ++px) {
+                    const int sx = cx - halfW + px;
+                    const int sy = cy - halfH + py;
+                    QRgb srcPx = 0;
+                    if (sx >= 0 && sx < source.width() && sy >= 0 && sy < source.height())
+                        srcPx = source.pixel(sx, sy);
+                    const QRgb tmplPx = templatePatch.pixel(px, py);
+                    sad += std::abs(qGray(srcPx) - qGray(tmplPx));
+                }
+            }
+            if (sad < bestSAD) {
+                bestSAD = sad;
+                bestDx = dx;
+                bestDy = dy;
+            }
+        }
+    }
+    return QPointF(current.x() + bestDx, current.y() + bestDy);
+}
+
+Frame Tracker::trackNextFrame(const QImage& nextFrame, int frameIndex, qint64 timeMs)
+{
+    Frame result;
+    result.frameIndex = frameIndex;
+    result.timeMs = timeMs;
+    result.corners = m_lastCorners;
+    result.confidence = 0.0;
+
+    if (!m_initialized)
+        return result;
+
+    const QImage frame = nextFrame.convertToFormat(QImage::Format_ARGB32);
+
+    const QPointF* oldPts[4] = {
+        &m_lastCorners.tl, &m_lastCorners.tr, &m_lastCorners.br, &m_lastCorners.bl
+    };
+
+    QPointF newPts[4];
+    double totalSAD = 0.0;
+    const int patchPixels = static_cast<int>(m_params.patchSizePx * m_params.patchSizePx);
+
+    for (int i = 0; i < 4; ++i) {
+        const QPointF candidate = refinePoint(frame, *oldPts[i], m_patches[i]);
+
+        const double alpha = m_params.dampingFactor;
+        newPts[i] = QPointF(
+            oldPts[i]->x() + alpha * (candidate.x() - oldPts[i]->x()),
+            oldPts[i]->y() + alpha * (candidate.y() - oldPts[i]->y())
+        );
+
+        const int halfW = static_cast<int>(m_params.patchSizePx) / 2;
+        const int halfH = static_cast<int>(m_params.patchSizePx) / 2;
+        const int patchW = m_patches[i].width();
+        const int patchH = m_patches[i].height();
+        double sad = 0.0;
+        for (int py = 0; py < patchH; ++py) {
+            for (int px = 0; px < patchW; ++px) {
+                const int sx = static_cast<int>(std::round(newPts[i].x())) - halfW + px;
+                const int sy = static_cast<int>(std::round(newPts[i].y())) - halfH + py;
+                QRgb srcPx = 0;
+                if (sx >= 0 && sx < frame.width() && sy >= 0 && sy < frame.height())
+                    srcPx = frame.pixel(sx, sy);
+                const QRgb tmplPx = m_patches[i].pixel(px, py);
+                sad += std::abs(qGray(srcPx) - qGray(tmplPx));
+            }
+        }
+        totalSAD += sad;
+    }
+
+    CornerSet newCorners;
+    newCorners.tl = newPts[0];
+    newCorners.tr = newPts[1];
+    newCorners.br = newPts[2];
+    newCorners.bl = newPts[3];
+
+    const double validFactor = newCorners.isValid() ? 1.0 : 0.5;
+    const double avgSADPerPixel = (patchPixels > 0)
+        ? (totalSAD / (4.0 * static_cast<double>(patchPixels) * 255.0))
+        : 1.0;
+    const double conf = std::max(0.0, std::min(1.0, (1.0 - avgSADPerPixel) * validFactor));
+
+    if (newCorners.isValid()) {
+        m_lastCorners = newCorners;
+        result.corners = newCorners;
+    } else {
+        result.corners = m_lastCorners;
+    }
+    result.confidence = conf;
+    return result;
+}
+
+QList<Frame> Tracker::trackSequence(const QList<QImage>& frames,
+                                     const CornerSet& initialCorners,
+                                     qint64 frameDurationMs)
+{
+    QList<Frame> results;
+
+    if (frames.isEmpty() || !initialCorners.isValid())
+        return results;
+
+    const int limit = (m_params.maxFramesPerCall > 0)
+        ? std::min(m_params.maxFramesPerCall, static_cast<int>(frames.size()))
+        : static_cast<int>(frames.size());
+
+    setReferenceFrame(frames[0], initialCorners);
+
+    Frame refFrame;
+    refFrame.frameIndex = 0;
+    refFrame.timeMs = 0;
+    refFrame.corners = initialCorners;
+    refFrame.confidence = 1.0;
+    results.append(refFrame);
+
+    for (int i = 1; i < limit; ++i) {
+        results.append(trackNextFrame(frames[i], i, static_cast<qint64>(i) * frameDurationMs));
+    }
+
+    return results;
+}
+
+// ---------------------------------------------------------------------------
+// Debug helper
+// ---------------------------------------------------------------------------
+
+QString homographyToString(const Homography& h)
+{
+    return QString("[%1 %2 %3 | %4 %5 %6 | %7 %8 %9]")
+        .arg(h.m[0], 0, 'f', 4).arg(h.m[1], 0, 'f', 4).arg(h.m[2], 0, 'f', 4)
+        .arg(h.m[3], 0, 'f', 4).arg(h.m[4], 0, 'f', 4).arg(h.m[5], 0, 'f', 4)
+        .arg(h.m[6], 0, 'f', 4).arg(h.m[7], 0, 'f', 4).arg(h.m[8], 0, 'f', 4);
+}
+
+} // namespace planar

@@ -92,6 +92,7 @@ class HDRSettingsDialog;
 class AIProcessingDialog;
 class PluginBrowserDialog;
 class AIMaskDialog;
+class PlanarTrackerDialog;
 class AudioClipEditor;
 class ShortcutCustomizeDialog;
 class SocialExportDialog;
@@ -328,6 +329,9 @@ private slots:
     void openAIMaskDialog();
     void openAudioClipEditorDialog();
     void runMagneticTimelineDemo();
+
+    // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog
+    void openPlanarTrackerDialog();
 
     // US-SC-B: Sprint 12 — ショートカット設定ダイアログ
     void openShortcutCustomizeDialog();
@@ -589,6 +593,9 @@ private:
     // is a lightweight QDialog wrapper around an AudioClipEditor widget.
     class AIMaskDialog *m_aiMaskDialog = nullptr;
     class QDialog *m_audioClipEditorDialog = nullptr;
+
+    // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog, kept alive between invocations.
+    PlanarTrackerDialog *m_planarTrackerDialog = nullptr;
 
     // US-SC-B: Sprint 12 — ショートカット管理 (preset/カスタムバインド)。
     // m_shortcutManager は registerAction で登録した QAction* の弱参照を保ち、
