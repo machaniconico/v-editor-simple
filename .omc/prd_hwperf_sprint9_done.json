@@ -1,0 +1,376 @@
+{
+  "task": "Sprint 9 — Hardware/Performance: (1) NVENC/QSV/AMF ハードウェアビデオエンコード経路を Exporter に追加（CodecDetector.hwAccelVideoEncoders() を使い h264_nvenc/hevc_nvenc 等を解決、HW 用レート制御オプション、オープン失敗時は libx264 へフォールバック）、(2) ExportDialog にハードウェアエンコーダ選択 UI、(3) 既存 SceneDetector を実デコードループに配線するスキャナ + シーンカット検出ダイアログ（カット点をマーカー化／クリップ分割）、(4) オーディオダッキング（サイドチェイン）解析モジュール + プレビュー編集ダイアログ、(5) Collect Files（プロジェクト同梱）— プロジェクトが参照する全メディアを対象フォルダにコピーしパス書き換えた .veditor を保存、(6) ハードウェア/パフォーマンス自己テスト、(7) MainWindow 統合 + ProjectFile 永続化 + CMake 配線。新規アーキは導入せず既存の Exporter / ExportConfig / ExportDialog / CodecDetector / SceneDetector / AudioMixer / ProjectFile / MainWindow を拡張・配線する。既存の public API・関数シグネチャ・メニュー項目・View dock・MainWindow.h 前方宣言・menu-help 機能・「お気に入り」メニュー機能は一切削除・改名しない。",
+  "createdAt": "2026-05-12T20:54:44.144Z",
+  "updatedAt": "2026-05-13T14:59:42.854Z",
+  "model": {
+    "implementation": "qwen-local/qwen-160k-q8",
+    "review": null,
+    "codex": "gpt-5.4",
+    "codexEffort": "xhigh",
+    "codexProfile": null,
+    "tierStrategy": {
+      "enabled": true,
+      "windowSeconds": 18000,
+      "applyToReview": true,
+      "tiers": [
+        {
+          "name": "S",
+          "lazyLoad": false,
+          "models": [
+            {
+              "id": "opencode-go/qwen3.6-plus",
+              "quotaPerWindow": 3300
+            },
+            {
+              "id": "opencode-go/deepseek-v4-pro",
+              "quotaPerWindow": 3450
+            },
+            {
+              "id": "opencode-go/minimax-m2.7",
+              "quotaPerWindow": 3400
+            },
+            {
+              "id": "opencode-go/kimi-k2.6",
+              "quotaPerWindow": 1150
+            }
+          ]
+        },
+        {
+          "name": "A",
+          "lazyLoad": false,
+          "models": [
+            {
+              "id": "opencode-go/qwen3.5-plus",
+              "quotaPerWindow": 10200
+            },
+            {
+              "id": "opencode-go/deepseek-v4-flash",
+              "quotaPerWindow": 31650
+            },
+            {
+              "id": "opencode-go/mimo-v2.5-pro",
+              "quotaPerWindow": 1290
+            },
+            {
+              "id": "opencode-go/glm-5.1",
+              "quotaPerWindow": 880
+            }
+          ]
+        },
+        {
+          "name": "Local",
+          "lazyLoad": true,
+          "models": [
+            {
+              "id": "qwen-local/qwen-160k-q8",
+              "quotaPerWindow": null
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "concurrency": {
+    "maxOpencodeWorkers": 2,
+    "maxCodexWorkers": 2,
+    "maxReviewWorkers": 2
+  },
+  "globalConstraints": [
+    "新規アーキは導入しない。既存の Exporter / ExportConfig (ExportDialog.h) / ExportDialog / CodecDetector / SceneDetector / AudioMixer / Timeline / ClipInfo / MarkerData / ProjectFile / MainWindow を拡張・配線する。",
+    "既存の public API・関数シグネチャ・メニュー項目・View メニューの dock・MainWindow.h の前方宣言は一切削除・改名しない。直前までに入った menu-help 機能 (m_menuHelpEntries / applyMenuHelpTooltips(bool) / 'メニューの説明を表示' トグル / setToolTipsVisible) と『お気に入り』メニュー機能 (FavoritesEditDialog / m_favorites* 系) も保持する。Sprint 8 で入った 3D/Expression/Wiggle 機能・ダイアログも壊さない。",
+    "FFmpeg 連携は既存の Exporter のスタイル (extern \"C\" avformat/avcodec/avutil) に合わせる。HW エンコーダが見つからない/開けない場合は必ず libx264 にフォールバックし、export を失敗させない。新しい外部依存は追加しない。",
+    "新規ファイルの CMake への追加・main.cpp への include・MainWindow への配線は最終ストーリー US-HW-10 が一括で行う。各非統合ストーリーの結果には 'CMake/MainWindow wiring deferred to US-HW-10' と明記する。レビュー前に新規ファイルを `git add -N` すること。",
+    "MSVC + Qt6 ビルド前提。Qt6 の落とし穴に注意: QLabel::pixmap() は値返し / QFormLayout が QWidget::layout() をシャドー / qsizetype↔int の縮小変換 / .cpp 内 Q_OBJECT には #include \"<file>.moc\" フッタ / QOverload<...>::of で多重定義シグナル / MSVC の文字列リテラル長制限 / designated initializer 不可 / QProcess は使わない（FFmpeg はライブラリ呼び出し）。",
+    "全ての新規モジュールは決定的（同入力→同出力）かつ有界（無限ループなし）・NaN/inf を出さないこと。重い処理（デコード走査・メディアコピー）は進捗シグナルを出し、cancel() で中断できること。"
+  ],
+  "stories": [
+    {
+      "id": "US-HW-1",
+      "title": "Exporter — NVENC/QSV/AMF ハードウェアエンコード経路",
+      "description": "Goal: ExportConfig に HW エンコーダ指定を持たせ、Exporter 側で h264_nvenc / hevc_nvenc / h264_qsv / hevc_qsv / h264_amf / hevc_amf を解決して使う。失敗時は libx264 にフォールバック。Files: src/Exporter.cpp, src/Exporter.h, src/ExportDialog.h (ExportConfig 構造体に新フィールド追加のみ). (1) ExportConfig に `QString hwEncoder` を追加（\"\" or \"auto\" = 自動 / \"none\" = ソフトのみ強制 / \"nvenc\" / \"qsv\" / \"amf\" のいずれか）。既存の bool useHardwareAccel は残す（後方互換: true かつ hwEncoder 未設定なら \"auto\" 扱い）。(2) Exporter で encoder 解決ロジックを拡張: 要求コーデックが libx264/libx265 で hwEncoder が auto/nvenc/qsv/amf の時、CodecDetector::hwAccelVideoEncoders() と CodecDetector::isEncoderAvailable() を使って 'h264_nvenc'(or hevc_nvenc for h265 family) → 'h264_qsv' → 'h264_amf' の順（または明示ベンダー）で利用可能なものを探し avcodec_find_encoder_by_name() で取得。見つからなければ既存の libx264 経路にフォールバック。(3) HW エンコーダを使う場合のエンコーダオプション: NVENC は av_dict_set(opts,'preset','p4',0) と 'rc','vbr' と 'cq','23'（もしくは bitrate ベース）; QSV は 'preset','medium'; AMF は 'quality','balanced'。pix_fmt は HW でも nv12/yuv420p で良い（HW フレームは使わずソフトフレーム入力で OK — avcodec が内部変換）。(4) どのエンコーダが最終的に使われたかを progressChanged 前に qInfo ログ + exportFinished のメッセージにも含める（成功時 'Exported via h264_nvenc' 等）。(5) HW エンコーダの avcodec_open2 が失敗したら encCtx を作り直して libx264 で再試行（フォールバック）。新規ファイルなし。CMake/MainWindow wiring not needed (既存ファイル).",
+      "acceptance": [
+        "src/ExportDialog.h の ExportConfig に `QString hwEncoder` フィールドが追加されている（既存フィールドは保持、useHardwareAccel も残る）。",
+        "src/Exporter.cpp でビデオエンコーダ解決時、config.hwEncoder が 'auto'/'nvenc'/'qsv'/'amf' のいずれかかつ useHardwareAccel 相当なら CodecDetector::isEncoderAvailable / hwAccelVideoEncoders を参照して h264_nvenc / hevc_nvenc / h264_qsv / h264_amf 等の名前付きエンコーダを試し、見つかったものを avcodec_find_encoder_by_name で取得する。",
+        "HW エンコーダ選択時、NVENC なら 'preset'(p1..p7) と 'cq' or 'rc'、QSV/AMF なら相当の品質オプションを av_dict_set で設定している。",
+        "HW エンコーダが利用不可、または avcodec_open2 が HW エンコーダで失敗した場合、libx264 でエンコーダコンテキストを作り直して継続し、export 全体は失敗にならない（既存テスト相当の libx264 経路が動く）。",
+        "最終的に使用したエンコーダ名が qInfo ログと exportFinished の成功メッセージに含まれる。",
+        "MSVC + Linux でビルドが通る。決定的（同 config → 同エンコーダ選択結果）。"
+      ],
+      "touchedFiles": [
+        "src/Exporter.cpp",
+        "src/Exporter.h",
+        "src/ExportDialog.h"
+      ],
+      "dependsOn": [],
+      "priority": 10,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-HW-1.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-HW-2",
+      "title": "ExportDialog — ハードウェアエンコーダ選択 UI",
+      "description": "Goal: 書き出しダイアログにハードウェアエンコーダ選択 UI を足し、ExportConfig.hwEncoder に反映。Files: src/ExportDialog.cpp, src/ExportDialog.h. (1) setupUI() 内に新しい QComboBox 'ハードウェアエンコード:' を追加。項目: 'ソフトウェア (libx264/x265)' = value 'none', '自動 (利用可能なら GPU)' = value 'auto', 'NVIDIA NVENC' = 'nvenc', 'Intel QuickSync' = 'qsv', 'AMD AMF' = 'amf'。CodecDetector::hwAccelVideoEncoders() を呼び、対応するベンダーのエンコーダが available でない項目は disable（ツールチップに理由）。利用可能な HW が一つも無ければ combo 全体を disable し 'none' 固定。(2) 選択変更で m_config.hwEncoder を更新、useHardwareAccel は (hwEncoder != 'none') に同期。(3) updateSummary() に選択中の HW エンコード設定を 1 行表示。(4) ProResプロファイル選択中は HW combo を無効化（ProRes は HW 非対象）。デフォルト選択は 'auto'。Q_OBJECT 追加なし（既存）。CMake/MainWindow wiring not needed.",
+      "acceptance": [
+        "ExportDialog の UI に 'ハードウェアエンコード' QComboBox があり、none/auto/nvenc/qsv/amf に対応する 5 項目を持つ。",
+        "CodecDetector::hwAccelVideoEncoders() の結果に基づき、対応 HW が無いベンダー項目が disable され、HW が全く無ければ combo 全体が disable で 'none' になる。",
+        "combo の選択が ExportConfig.hwEncoder に反映され、useHardwareAccel が hwEncoder!='none' に同期する。config() がそれを返す。",
+        "updateSummary() に現在の HW エンコード選択が文字列で出る。ProRes 選択時は HW combo が無効化される。",
+        "MSVC + Qt6 でビルドが通る（QComboBox の currentIndexChanged は QOverload<int>::of で接続 or currentIndex 直読み）。"
+      ],
+      "touchedFiles": [
+        "src/ExportDialog.cpp",
+        "src/ExportDialog.h"
+      ],
+      "dependsOn": [
+        "US-HW-1"
+      ],
+      "priority": 20,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-HW-2.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-HW-3",
+      "title": "SceneCutScanner（新規）— デコードして SceneDetector を回す走査エンジン",
+      "description": "New files src/SceneCutScanner.{h,cpp}. QObject。既存 src/SceneDetector を使ってクリップ（または動画ファイル）の全フレームを時間順にデコードし、シーンカット位置（フレーム番号 + マイクロ秒タイムスタンプ）を集める。FFmpeg は Exporter と同じ extern \"C\" avformat/avcodec/swscale スタイル。(1) `class SceneCutScanner : public QObject` with: `void scanFile(const QString& path, double threshold = 0.35, int minSceneFrames = 24)` — 別スレッド可（QThread; Exporter のパターン参照）。デコードした各フレームを ~256px 幅程度に縮小して QImage(Format_RGB888 or Grayscale8) にし SceneDetector::processFrame() に渡す。完了で結果を保持。(2) signals: `progressChanged(int percent)`, `finished(bool ok, const QString& message)`. (3) accessors: `QVector<int> cutFrames() const`, `QVector<qint64> cutTimestampsUs() const`, `double frameRate() const`, `int totalFrames() const`. (4) `void cancel()` で安全に中断（途中までの結果は破棄、finished(false,...)）。(5) パフォーマンス: フル解像度デコード後 sws_scale で縮小、毎フレーム malloc しない（バッファ再利用）。memory leak なし（av_frame_free / sws_freeContext / avformat_close_input を必ず）。SceneDetector.h/.cpp は基本変更しない（必要なら最小の getter 追加可、既存シグネチャ削除禁止）。CMake/MainWindow wiring deferred to US-HW-10。レビュー前に git add -N。",
+      "acceptance": [
+        "src/SceneCutScanner.h が QObject 派生 `SceneCutScanner` を宣言し、scanFile(QString, double, int) / cancel() / progressChanged(int) / finished(bool,QString) / cutFrames() / cutTimestampsUs() / frameRate() / totalFrames() を持つ。",
+        "scanFile は FFmpeg でファイルをデコードし、各フレームを縮小して SceneDetector::processFrame に渡し、SceneDetector が検出した cut を cutFrames()/cutTimestampsUs() に蓄積する。",
+        "走査中 progressChanged が単調増加で発火し、完了で finished(true, ...) が一度だけ発火する。cancel() 後は finished(false, ...) が発火し結果は空。",
+        "FFmpeg リソース（AVFormatContext / AVCodecContext / AVFrame / AVPacket / SwsContext）が全経路でリークなく解放される。フレームバッファは再利用され毎フレーム新規確保しない。",
+        "存在しない/壊れたファイルパスで finished(false, <理由>) を返し、クラッシュしない。",
+        "MSVC + Linux でビルドが通る。CMake/MainWindow wiring deferred to US-HW-10。"
+      ],
+      "touchedFiles": [
+        "src/SceneCutScanner.cpp",
+        "src/SceneCutScanner.h"
+      ],
+      "dependsOn": [],
+      "priority": 10,
+      "engine": "opencode",
+      "maxRetries": 5,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-HW-3.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-HW-4",
+      "title": "SceneCutDialog（新規）— シーンカット検出 UI（マーカー化／分割）",
+      "description": "New files src/SceneCutDialog.{h,cpp}. QDialog。US-HW-3 の SceneCutScanner を駆動し、検出されたカット一覧を表示、選択したカットを (a) タイムラインマーカーとして適用 (b) クリップ分割点として返す。実際の MainWindow への適用配線は US-HW-10 が行うので、このダイアログは『結果（採用するカットの ms/frame リスト + モード enum）』を accessor で公開するだけにする。(1) コンストラクタ `SceneCutDialog(const QString& clipPath, double clipFps, QWidget* parent=nullptr)`（fps はゼロ可、その場合スキャナの frameRate を使う）。(2) UI: 上に閾値スピンボックス (0.05..0.95, default 0.35)・最小シーン長スピン (フレーム, default 24)・[検出開始] ボタン・QProgressBar、中央に QListWidget（各行 'カット N: 00:01:23.456 (frame 2503)' チェックボックス付き、デフォルト全チェック）、下に [全選択]/[全解除]、ラジオ 'マーカーとして追加' / 'ここでクリップ分割'、[適用] / [閉じる]。(3) [検出開始] で SceneCutScanner を作り scanFile、progressChanged→バー、finished→リスト充填。再実行可能。(4) accessors: `QVector<qint64> acceptedCutTimestampsMs() const`（チェック済みのみ、昇順）、`enum class ApplyMode { AddMarkers, SplitClip }` と `ApplyMode applyMode() const`、`bool wasApplied() const`（[適用] が押されたか）。(5) ダイアログ破棄時にスキャナを cancel。Q_OBJECT を .cpp で使うなら #include \"SceneCutDialog.moc\" は不要（ヘッダに Q_OBJECT を書くこと）。CMake/MainWindow wiring deferred to US-HW-10。git add -N。",
+      "acceptance": [
+        "src/SceneCutDialog.h が QDialog 派生 `SceneCutDialog`（コンストラクタ (QString clipPath, double fps, QWidget*)）を宣言し、acceptedCutTimestampsMs() / applyMode() (ApplyMode::AddMarkers|SplitClip) / wasApplied() を持つ。",
+        "[検出開始] で SceneCutScanner が動き、QProgressBar が進捗を表示、終了後 QListWidget にチェック付きの各カット項目（時刻 + フレーム番号表示）が並ぶ。再実行できる。",
+        "閾値スピン・最小シーン長スピンの値がスキャンに渡る。全選択/全解除ボタンが全項目のチェック状態を切り替える。",
+        "[適用] を押すと wasApplied() が true になり acceptedCutTimestampsMs() がチェック済みカットを昇順で返す。[閉じる]/破棄では wasApplied() は false、スキャナは cancel される。",
+        "MSVC + Qt6 でビルドが通る（ヘッダに Q_OBJECT、シグナル接続は関数ポインタ or QOverload）。CMake/MainWindow wiring deferred to US-HW-10。"
+      ],
+      "touchedFiles": [
+        "src/SceneCutDialog.cpp",
+        "src/SceneCutDialog.h"
+      ],
+      "dependsOn": [
+        "US-HW-3"
+      ],
+      "priority": 20,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-HW-4.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-HW-5",
+      "title": "AudioDucking（新規）— サイドチェイン・ダッキング解析モジュール",
+      "description": "New files src/AudioDucking.{h,cpp}. Pure DSP, NO Qt GUI（QtCore のみ可: QVector）。サイドチェイン信号（例: ナレーション）が鳴っている区間で別の信号（例: BGM）を自動で下げるゲインエンベロープを計算する。リアルタイム適用の配線は別途（US-HW-10 で ProjectFile 永続化のみ、実適用は将来課題で良い — その旨ヘッダコメントに明記）。(1) `struct DuckingParams { double thresholdDb = -30.0; double targetReductionDb = -12.0; double attackMs = 20.0; double releaseMs = 300.0; double holdMs = 200.0; double kneeDb = 6.0; }`. (2) `QVector<float> computeDuckingGain(const QVector<float>& sidechain, int sampleRate, const DuckingParams& p)` — sidechain のサンプル絶対値（または短時間 RMS, ~10ms 窓）を dBFS に変換し、threshold を超えた区間で targetReductionDb まで落ちるゲイン（線形係数, 0..1）を attack/release/hold で滑らかに補間して各サンプル分返す。出力サイズ == sidechain.size()。値域 [10^(targetReductionDb/20), 1.0]。(3) `QVector<float> applyDucking(const QVector<float>& program, const QVector<float>& duckGain)` — program[i] * duckGain[min(i, size-1)] を返すヘルパ（サイズ違いは短い方/clamp）。(4) `double minGainLinear(const DuckingParams&)` 等の小ヘルパ可。決定的・有界・NaN/inf なし。ステレオは呼び出し側でチャンネル毎 or インターリーブ分離して使う前提（モノ float 配列 API）。CMake/MainWindow wiring deferred to US-HW-10。git add -N。",
+      "acceptance": [
+        "src/AudioDucking.h が `DuckingParams`（thresholdDb, targetReductionDb, attackMs, releaseMs, holdMs, kneeDb）、`QVector<float> computeDuckingGain(const QVector<float>&, int, const DuckingParams&)`、`QVector<float> applyDucking(const QVector<float>&, const QVector<float>&)` を宣言する。Qt GUI 依存なし。",
+        "computeDuckingGain の出力サイズは入力 sidechain と同じ。全要素が [10^(targetReductionDb/20) - 1e-4, 1.0 + 1e-4] の範囲。NaN/inf を含まない。",
+        "無音 sidechain（全て 0）に対しては出力が全て ~1.0（ダッキングなし）。一定の大きい sidechain（例 0.5 一定）に対しては attack 経過後 ~10^(targetReductionDb/20) に収束する。",
+        "sidechain が途中で 0 に戻ると release/hold 時間に従ってゲインが ~1.0 に戻る（ステップ的でなく単調 or 滑らかに）。同入力で 2 回呼ぶと完全に同一結果（決定的）。",
+        "applyDucking(program, gain) は要素毎の積を返し、サイズ不一致でもクラッシュしない。",
+        "MSVC + Linux でビルドが通る。CMake/MainWindow wiring deferred to US-HW-10。"
+      ],
+      "touchedFiles": [
+        "src/AudioDucking.cpp",
+        "src/AudioDucking.h"
+      ],
+      "dependsOn": [],
+      "priority": 10,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-HW-5.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-HW-6",
+      "title": "AudioDuckingDialog（新規）— ダッキング設定 + プレビュー UI",
+      "description": "New files src/AudioDuckingDialog.{h,cpp}. QDialog。US-HW-5 の DuckingParams を編集し、合成サイドチェイン（または与えられたサンプル）でゲインエンベロープを可視化プレビューする。MainWindow への実適用配線は US-HW-10。(1) コンストラクタ `AudioDuckingDialog(const DuckingParams& initial, QWidget* parent=nullptr)`。(2) UI: スピン/スライダで thresholdDb (-60..0), targetReductionDb (-40..0), attackMs (1..500), releaseMs (10..2000), holdMs (0..1000), kneeDb (0..24)。enabled チェックボックス。下に簡単なプレビュー用 QWidget（paintEvent で自前描画）: ダミーのサイドチェイン波形（例: 2 秒の音声バースト 2 個を sin*envelope で生成、44.1k or 8k で十分）に対する computeDuckingGain の結果カーブを重ねて描画。パラメータ変更で再描画。(3) accessors: `DuckingParams params() const`, `bool duckingEnabled() const`。OK/Cancel。(4) プレビューのサンプル生成と computeDuckingGain 呼び出しは決定的・軽量（< 数 ms）。ヘッダに Q_OBJECT。CMake/MainWindow wiring deferred to US-HW-10。git add -N。",
+      "acceptance": [
+        "src/AudioDuckingDialog.h が QDialog 派生 `AudioDuckingDialog`（コンストラクタ (DuckingParams, QWidget*)）を宣言し、params() と duckingEnabled() を持つ。",
+        "全 DuckingParams フィールドに対応する編集ウィジェット（範囲付き）と enabled チェックボックスがある。OK で params()/duckingEnabled() が編集後の値を返す。",
+        "プレビュー QWidget が paintEvent で、合成サイドチェイン波形と AudioDucking::computeDuckingGain の結果カーブを描画する。パラメータ変更時に update() で再描画される。",
+        "ダミー波形生成 + computeDuckingGain 呼び出しが決定的で、ダイアログ表示時にハングしない（軽量）。",
+        "MSVC + Qt6 でビルドが通る（ヘッダに Q_OBJECT）。CMake/MainWindow wiring deferred to US-HW-10。"
+      ],
+      "touchedFiles": [
+        "src/AudioDuckingDialog.cpp",
+        "src/AudioDuckingDialog.h"
+      ],
+      "dependsOn": [
+        "US-HW-5"
+      ],
+      "priority": 20,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-HW-6.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-HW-7",
+      "title": "ProjectCollector（新規）— Collect Files（プロジェクト同梱）エンジン",
+      "description": "New files src/ProjectCollector.{h,cpp}. QObject。ProjectData（src/ProjectFile.h の構造体）を受け取り、それが参照する全メディアファイル（クリップの clipFilePath、その他 path 系フィールド — ProjectFile.h を読んで列挙）を対象フォルダ配下 'media/' にコピーし、パスを相対化した ProjectData のコピーを作って 'project.veditor'（or 指定名）として保存する。NO 破壊的操作（元プロジェクトは触らない）。(1) `class ProjectCollector : public QObject` with `void collect(const ProjectData& data, const QString& destDir, const QString& projectFileName = QStringLiteral(\"project.veditor\"))`. (2) 動作: destDir/media を作成 → data の各メディアパスについて、存在すれば destDir/media/<basename> にコピー（同名衝突は <stem>_2.ext 等にリネーム、マップを保持）、存在しなければ警告に積む → ProjectData のディープコピーを作り全メディアパスを 'media/<newbasename>'（destDir 相対）に書き換え → ProjectFile::save(destDir/projectFileName, copy)。(3) signals: `progressChanged(int percent)`, `finished(bool ok, const QString& message)`（message に コピー件数 / スキップ件数 / 警告を含める）。`QStringList warnings() const`、`qint64 bytesCopied() const`。(4) `void cancel()`。(5) 大きいファイルのコピーはチャンク読み書き（QFile, 1MB ずつ）で progress 更新、cancel 反映。ProjectFile.h/.cpp は変更しない（save/load の既存 API を使うだけ）。CMake/MainWindow wiring deferred to US-HW-10。git add -N。",
+      "acceptance": [
+        "src/ProjectCollector.h が QObject 派生 `ProjectCollector` を宣言し、collect(const ProjectData&, const QString& destDir, const QString& projectFileName) / cancel() / progressChanged(int) / finished(bool,QString) / warnings() / bytesCopied() を持つ。",
+        "collect は destDir/media を作り、ProjectData が参照する各実在メディアをそこへコピーし（同名は自動リネーム）、パスを destDir 相対 'media/...' に書き換えた ProjectData を ProjectFile::save で destDir/projectFileName に保存する。元の ProjectData / 元ファイル群は変更しない。",
+        "存在しないメディアパスは warnings() に積まれ、処理は止まらず finished(true, ...) を返す（致命的 IO エラー時のみ finished(false,...)）。message にコピー件数・スキップ件数が含まれる。",
+        "ファイルコピーはチャンク単位で progressChanged を発火し、cancel() で安全に中断（finished(false, 'cancelled')、部分コピーは残ってよいが ProjectFile は書かない）。bytesCopied() が累積コピーバイト数を返す。",
+        "ProjectFile.h/.cpp に変更がない。MSVC + Linux でビルドが通る。CMake/MainWindow wiring deferred to US-HW-10。"
+      ],
+      "touchedFiles": [
+        "src/ProjectCollector.cpp",
+        "src/ProjectCollector.h"
+      ],
+      "dependsOn": [],
+      "priority": 10,
+      "engine": "opencode",
+      "maxRetries": 5,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-HW-7.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-HW-8",
+      "title": "ProjectCollectorDialog（新規）— Collect Files UI",
+      "description": "New files src/ProjectCollectorDialog.{h,cpp}. QDialog。US-HW-7 の ProjectCollector を駆動する UI。MainWindow への配線（メニュー項目 → 現在の ProjectData を渡す）は US-HW-10。(1) コンストラクタ `ProjectCollectorDialog(const ProjectData& data, QWidget* parent=nullptr)`（data のコピーを保持）。(2) UI: '出力先フォルダ:' の QLineEdit + [参照...] (QFileDialog::getExistingDirectory)、'プロジェクトファイル名:' QLineEdit (default 'project.veditor')、参照メディア件数のラベル（data から数える）、[収集開始] ボタン、QProgressBar、結果/警告を出す QPlainTextEdit (readonly)。[閉じる]。(3) [収集開始] で出力先が空 or 不正なら警告ダイアログ。OK なら ProjectCollector::collect、progressChanged→バー、finished→テキストエリアに message + warnings を列挙、成功なら出力先を開くボタン or パス表示。(4) 収集中は [収集開始]/[参照] を disable、[閉じる] で cancel。(5) accessor `bool didCollect() const`、`QString outputProjectPath() const`（成功時のフルパス）。ヘッダに Q_OBJECT。CMake/MainWindow wiring deferred to US-HW-10。git add -N。",
+      "acceptance": [
+        "src/ProjectCollectorDialog.h が QDialog 派生 `ProjectCollectorDialog`（コンストラクタ (const ProjectData&, QWidget*)）を宣言し、didCollect() と outputProjectPath() を持つ。",
+        "出力先フォルダ参照ボタン（QFileDialog::getExistingDirectory）とプロジェクトファイル名入力があり、参照メディア件数ラベルが ProjectData の内容から算出される。",
+        "[収集開始] で ProjectCollector が動き、QProgressBar が進捗を表示し、終了後 QPlainTextEdit に結果 message と warnings 一覧が出る。出力先未指定/不正なら QMessageBox 警告で処理しない。",
+        "収集中はボタンが disable、[閉じる] でコレクタを cancel。成功時 didCollect()==true かつ outputProjectPath() が保存した .veditor のフルパスを返す。",
+        "MSVC + Qt6 でビルドが通る（ヘッダに Q_OBJECT）。CMake/MainWindow wiring deferred to US-HW-10。"
+      ],
+      "touchedFiles": [
+        "src/ProjectCollectorDialog.cpp",
+        "src/ProjectCollectorDialog.h"
+      ],
+      "dependsOn": [
+        "US-HW-7"
+      ],
+      "priority": 20,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-HW-8.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-HW-9",
+      "title": "ハードウェア/パフォーマンス自己テスト（main.cpp）",
+      "description": "Goal: Sprint 9 の新モジュールを env var で起動できる合成自己テストを main.cpp に追加。既存パターン（runVfxSelftest / runProSelftest / runMographSelftest と requireSelftest ヘルパ、qEnvironmentVariableIntValue ゲート）に厳密に倣う。Files: src/main.cpp のみ（include 追加 + 新 runHwPerfSelftest() + ディスパッチ 1 行）。注意: main.cpp は US-HW-10 でも触る — US-HW-9 は include / runHwPerfSelftest() 関数 / `if (qEnvironmentVariableIntValue(\"VEDITOR_HWPERF_SELFTEST\") != 0) return runHwPerfSelftest();` の 1 行だけを足す（既存 selftest ディスパッチ群の隣）。他のストーリーが触る MainWindow 配線・CMake は触らない。(1) `#include` for AudioDucking.h, ExportDialog.h(ExportConfig), SceneDetector.h（SceneCutScanner/Collector は FFmpeg/IO 重なので selftest では SceneDetector の純ロジックを直接叩く程度で良い）。(2) `int runHwPerfSelftest()`: \n  - AudioDucking: 無音 sidechain → ゲイン ~1.0、強い一定 sidechain → 収束値 ~10^(target/20)、サイズ一致、NaN なし、決定性（2 回呼んで一致）を requireSelftest で検証。\n  - SceneDetector: 単色フレームを数十枚 processFrame → カット 0、途中で全く違う単色に切替 → カット >=1、minSceneFrames より短い間隔の連続切替で過剰カットしない、reset() 後カウント 0 を検証。\n  - ExportConfig: hwEncoder フィールドが存在し、デフォルトコンストラクト + hwEncoder='auto' 設定が読み書きできる（コンパイル時点で十分だが軽い assignment テスト）。\n  全部通れば qInfo 'HWPERF selftest OK' を出して 0、失敗で非 0。\n(3) ディスパッチは既存の VEDITOR_VFX_SELFTEST 等の並びに `VEDITOR_HWPERF_SELFTEST` を追加。CMakeLists には新モジュールがまだ無いので、selftest が参照するのは既存ファイル（SceneDetector, ExportDialog）+ AudioDucking（US-HW-5、CMake 追加は US-HW-10）。AudioDucking の CMake 追加が無いとリンクできない場合に備え、AudioDucking 部分は `#if __has_include(\"AudioDucking.h\")` でガードしても良い（ただし US-HW-10 完了後は常に有効）。CMake wiring deferred to US-HW-10。",
+      "acceptance": [
+        "src/main.cpp に `int runHwPerfSelftest()` が追加され、AudioDucking のゲインエンベロープ性質（無音→~1.0、強信号→~target、サイズ一致、NaN なし、決定性）と SceneDetector の振る舞い（同色→0 カット、切替→>=1 カット、minSceneFrames 尊重、reset で 0）を requireSelftest で検証する。",
+        "ディスパッチ部に `if (qEnvironmentVariableIntValue(\"VEDITOR_HWPERF_SELFTEST\") != 0) { ...; return runHwPerfSelftest(); }` が既存 selftest 群の並びに追加されている。",
+        "ExportConfig.hwEncoder の存在を前提とした軽い読み書きテストがある（コンパイルが通ること自体が hwEncoder 追加の検証になる）。",
+        "MainWindow 配線・CMakeLists・他モジュールには手を入れていない（main.cpp のみ）。既存 selftest 関数群は壊していない。",
+        "MSVC + Linux でビルドが通る（AudioDucking 未リンク時は __has_include ガード可、US-HW-10 後は常時有効）。"
+      ],
+      "touchedFiles": [
+        "src/main.cpp"
+      ],
+      "dependsOn": [
+        "US-HW-5"
+      ],
+      "priority": 30,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-HW-9.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-HW-10",
+      "title": "MainWindow 統合 + ProjectFile 永続化 + CMake 配線（最終ストーリー）",
+      "description": "Goal: Sprint 9 の全新規モジュールを CMakeLists.txt に追加し、MainWindow にメニュー項目とダイアログ起動を配線し、ProjectFile にダッキング設定（と必要なら HW エンコード設定の既定）を永続化する。Files: CMakeLists.txt, src/MainWindow.cpp, src/MainWindow.h, src/main.cpp（include のみ追加可、US-HW-9 の selftest 関数は触らない）, src/ProjectFile.cpp, src/ProjectFile.h. (1) CMakeLists.txt: 既存の SOURCES/HEADERS リスト（src/MographText.cpp 等が並ぶ箇所）に src/SceneCutScanner.{h,cpp}, src/SceneCutDialog.{h,cpp}, src/AudioDucking.{h,cpp}, src/AudioDuckingDialog.{h,cpp}, src/ProjectCollector.{h,cpp}, src/ProjectCollectorDialog.{h,cpp} を追加（既存エントリは消さない）。(2) MainWindow: \n  - 既存メニュー構成を尊重しつつ追加: ['ツール'(or 'タイムライン') メニュー] に 'シーンカット検出...' → 現在選択中（or 最初の）クリップのパス + fps で SceneCutDialog を開き、wasApplied() なら applyMode に応じてマーカー追加 or 分割（既存のマーカー追加 API / クリップ分割 API を使う; 見当たらなければ最小実装で TODO コメント可だが UI からは必ず呼べる状態に）。\n  - ['オーディオ'(or 'エフェクト') メニュー] に 'オーディオダッキング設定...' → AudioDuckingDialog を現在の m_duckingParams で開き、OK なら保存（メンバ m_duckingParams / m_duckingEnabled）。\n  - ['ファイル' メニュー] に 'プロジェクトを収集 (Collect Files)...' → 現在の ProjectData を組み立てて（既存の保存処理が作る ProjectData 構築コードを再利用）ProjectCollectorDialog を開く。\n  - 各メニュー項目に menu-help 用ツールチップ文字列を設定（既存の m_menuHelpEntries / applyMenuHelpTooltips パターンに合わせる — 既存機能を壊さない）。「お気に入り」メニューに登録可能になるよう、追加した QAction には objectName か既存の登録機構に沿った識別子を付ける（既存パターン参照）。\n  - 書き出し: ExportDialog は US-HW-2 で HW combo 済み。MainWindow 側の Exporter 呼び出しは config をそのまま渡すだけ（既に通る）。必要なら m_duckingEnabled をエクスポート設定に反映する hook を残す（実適用は将来課題で TODO 可）。\n  - MainWindow.h: 新メンバ（m_duckingParams: DuckingParams, m_duckingEnabled: bool）と前方宣言を追加。既存の前方宣言・メンバ・menu-help・お気に入り関連は一切削除しない。\n (3) ProjectFile: ProjectData に `DuckingParams duckingParams; bool duckingEnabled = false;`（または相当の serializable struct — Expression/Wiggle のエントリ追加と同じ要領）を追加し、toJsonString/fromJsonString に round-trip させる。後方互換: 旧 .veditor（フィールド無し）読み込み時はデフォルト値。AudioDucking.h を ProjectFile.h から include する（ヘッダ肥大が気になるなら DuckingParams を ProjectFile.h 側に小さく再定義せず AudioDucking.h を include — Sprint 8 で Camera3D.h を ProjectFile.h から外した教訓に注意: 循環 include を避ける。AudioDucking.h は QtCore のみ依存なので安全）。\n (4) main.cpp: 新ダイアログ/モジュールの include を追加（US-HW-9 が足した selftest コードはそのまま）。\n (5) ビルド確認: MSVC（cmd.exe 経由）+ Linux。VEDITOR_HWPERF_SELFTEST=1 で起動して 'HWPERF selftest OK' が出ること。\n 重要: MainWindow.h の前方宣言が worker により削除されていないか必ず最後に確認すること（過去の回帰）。",
+      "acceptance": [
+        "CMakeLists.txt に SceneCutScanner / SceneCutDialog / AudioDucking / AudioDuckingDialog / ProjectCollector / ProjectCollectorDialog の .h/.cpp が追加され、既存エントリは保持されている。プロジェクトが MSVC + Linux でリンクまで通る。",
+        "MainWindow に 'シーンカット検出...'、'オーディオダッキング設定...'、'プロジェクトを収集 (Collect Files)...' のメニュー項目があり、それぞれ SceneCutDialog / AudioDuckingDialog / ProjectCollectorDialog を正しい引数で開く。SceneCutDialog の wasApplied() 時はマーカー追加 or クリップ分割が実行される（最低限 UI から呼べる状態）。",
+        "MainWindow.h に m_duckingParams (DuckingParams) と m_duckingEnabled (bool) が追加され、既存の前方宣言・メンバ・menu-help（m_menuHelpEntries / applyMenuHelpTooltips / 'メニューの説明を表示'）・お気に入りメニュー機構・Sprint 8 の 3D/Expression/Wiggle 機能は一切削除・改名されていない。追加 QAction は menu-help ツールチップとお気に入り登録の既存パターンに沿っている。",
+        "ProjectFile の ProjectData に DuckingParams + bool が永続フィールドとして追加され、toJsonString↔fromJsonString で round-trip する。フィールドの無い旧 .veditor を読んでもクラッシュせずデフォルト値になる（後方互換）。AudioDucking.h の include が循環依存を起こさない。",
+        "VEDITOR_HWPERF_SELFTEST=1 で実行すると runHwPerfSelftest が走り 'HWPERF selftest OK' を出して終了する。既存の VFX/PRO/MOGRAPH selftest も壊れていない。",
+        "MSVC（cmd.exe 経由ビルド）+ Linux でビルドが通る。最終確認として MainWindow.h の前方宣言群が削除されていないことを確認済み。"
+      ],
+      "touchedFiles": [
+        "CMakeLists.txt",
+        "src/MainWindow.cpp",
+        "src/MainWindow.h",
+        "src/main.cpp",
+        "src/ProjectFile.cpp",
+        "src/ProjectFile.h"
+      ],
+      "dependsOn": [
+        "US-HW-1",
+        "US-HW-2",
+        "US-HW-3",
+        "US-HW-4",
+        "US-HW-5",
+        "US-HW-6",
+        "US-HW-7",
+        "US-HW-8",
+        "US-HW-9"
+      ],
+      "priority": 90,
+      "engine": "opencode",
+      "maxRetries": 5,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-HW-10.json",
+      "lastFeedback": ""
+    }
+  ]
+}

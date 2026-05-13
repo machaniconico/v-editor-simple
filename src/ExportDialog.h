@@ -7,7 +7,6 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QLabel>
-#include <QCheckBox>
 #include "ProjectSettings.h"
 
 struct ExportPreset {
@@ -33,6 +32,7 @@ struct ExportConfig {
     int height = 1080;
     int fps = 30;
     bool useHardwareAccel = false;
+    QString hwEncoder;       // "", "auto" → auto-detect; "none" → SW only; "nvenc"/"qsv"/"amf" → vendor explicit
     int maxFileSizeMB = 0;
     bool hdr10 = false;  // 10-bit BT.2020/PQ output when true
     int proresProfile = -1;  // -1 = not ProRes; 0..5 = Proxy/LT/SQ/HQ/4444/4444XQ
@@ -68,9 +68,9 @@ private:
     QComboBox *m_presetCombo;
     QComboBox *m_videoCodecCombo;
     QComboBox *m_audioCodecCombo;
+    QComboBox *m_hwEncoderCombo;
     QSpinBox *m_videoBitrateSpin;
     QSpinBox *m_audioBitrateSpin;
-    QCheckBox *m_hwAccelCheck;
     QLineEdit *m_outputEdit;
     QLabel *m_summaryLabel;
     QLabel *m_hdrWarningLabel = nullptr;

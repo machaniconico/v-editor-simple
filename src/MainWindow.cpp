@@ -28,6 +28,9 @@
 #include "ProxyManager.h"
 #include "ProxyProgressDialog.h"
 #include "ProxyManagementDialog.h"
+#include "SceneCutDialog.h"
+#include "AudioDuckingDialog.h"
+#include "ProjectCollectorDialog.h"
 #include <QApplication>
 #include <QMessageBox>
 #include <QMenu>
@@ -984,6 +987,13 @@ void MainWindow::setupMenuBar()
 
     auto *remotionAction = fileMenu->addAction("Remotion形式でエクスポート(&R)...");
     connect(remotionAction, &QAction::triggered, this, &MainWindow::exportToRemotion);
+
+    // US-HW-10: collect project + referenced media into a single folder.
+    auto *collectAction = fileMenu->addAction("プロジェクトを収集 (Collect Files)...");
+    collectAction->setObjectName("action_collect_project");
+    connect(collectAction, &QAction::triggered, this, &MainWindow::onCollectProject);
+    m_menuHelpEntries.append({collectAction,
+        QStringLiteral("プロジェクトと参照メディアを 1 フォルダにまとめる (Collect Files)。")});
     m_menuHelpEntries.append({remotionAction,
         QStringLiteral("プログラム（Remotion）で再編集できる形式に書き出します。上級者向けです。")});
 
@@ -1445,10 +1455,18 @@ void MainWindow::setupMenuBar()
         }
     });
 
-    auto *duckSettingsAction = audioMenu->addAction("Auto-Duck Settings...");
+    auto *duckSettingsAction = audioMenu->addAction("オートダック設定 (AudioMixer)...");
+    duckSettingsAction->setObjectName("action_auto_duck_mixer");
     connect(duckSettingsAction, &QAction::triggered, this, &MainWindow::openAutoDuckSettings);
     m_menuHelpEntries.append({duckSettingsAction,
         QStringLiteral("ナレーションが入っている間だけ BGM を自動で小さくする「自動ダッキング」の細かい設定です。")});
+
+    // US-HW-10: project-level sidechain ducking parameters (AudioDuckingDialog).
+    auto *duckingSettingsAction = audioMenu->addAction("オーディオダッキング設定 (プロジェクト)...");
+    duckingSettingsAction->setObjectName("action_audio_ducking_settings");
+    connect(duckingSettingsAction, &QAction::triggered, this, &MainWindow::onAudioDuckingSettings);
+    m_menuHelpEntries.append({duckingSettingsAction,
+        QStringLiteral("サイドチェイン音声に応じて BGM を自動で下げるダッキング設定を編集する。")});
 
     audioMenu->addSeparator();
 
@@ -1683,6 +1701,13 @@ void MainWindow::setupMenuBar()
     connect(sceneAction, &QAction::triggered, this, &MainWindow::autoSceneDetect);
     m_menuHelpEntries.append({sceneAction,
         QStringLiteral("映像が大きく切り替わる場所を自動で見つけて、そこに目印を付けます。")});
+
+    // US-HW-10: scene-cut detection backed by SceneCutScanner / SceneCutDialog.
+    auto *sceneCutDetectAction = toolsMenu->addAction("シーンカット検出...");
+    sceneCutDetectAction->setObjectName("action_scene_cut_detect");
+    connect(sceneCutDetectAction, &QAction::triggered, this, &MainWindow::onSceneCutDetect);
+    m_menuHelpEntries.append({sceneCutDetectAction,
+        QStringLiteral("シーンカット検出を実行し、マーカー追加またはクリップ分割を行う。")});
 
     toolsMenu->addSeparator();
 
@@ -3191,6 +3216,10 @@ void MainWindow::populateProjectData(ProjectData &data)
               [](const WiggleClipEntry &a, const WiggleClipEntry &b) { return a.clipId < b.clipId; });
     data.projectCamera = m_projectCamera.toJson();
 
+    // US-HW-10: persist project-level sidechain ducking parameters.
+    data.duckingParams  = m_duckingParams;
+    data.duckingEnabled = m_duckingEnabled;
+
     collectAudioState(data);
 
     data.smartReframe = m_smartReframe.toJson();
@@ -3326,6 +3355,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     m_projectCamera = Camera3D{};
     if (!data.projectCamera.isEmpty())
         m_projectCamera.fromJson(data.projectCamera);
+    // US-HW-10: restore project-level sidechain ducking parameters.
+    m_duckingParams  = data.duckingParams;
+    m_duckingEnabled = data.duckingEnabled;
     m_selectedVideoTrackIndex = -1;
     m_selectedVideoClipIndexTracked = -1;
 
@@ -6856,6 +6888,118 @@ void MainWindow::openCameraMotionDialog()
         return;
     m_projectCamera = dialog.camera();
     statusBar()->showMessage(QStringLiteral("カメラモーションを更新しました"), 4000);
+}
+
+// US-HW-10: Sprint 9 — scene-cut detection menu entry.
+//
+// Picks the currently-selected video clip (or falls back to track 0 / clip 0),
+// pops SceneCutDialog modally, and on Accept applies the user's choice:
+//   AddMarkers: feed accepted cut timestamps to Timeline::addMarker as cyan-ish
+//               scene-cut markers (same color used by autoSceneDetect).
+//   SplitClip:  jump the playhead to each cut and call Timeline::splitAtPlayhead.
+//               Sorted descending so earlier splits don't shift later cuts.
+void MainWindow::onSceneCutDetect()
+{
+    ClipInfo current;
+    int trackIdx = -1;
+    int clipIdx  = -1;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &current) || current.filePath.isEmpty()) {
+        QMessageBox::information(this,
+            QStringLiteral("シーンカット検出"),
+            QStringLiteral("クリップを選択してください"));
+        return;
+    }
+
+    double fps = 0.0;
+    if (m_projectConfig.fps > 0.0)
+        fps = m_projectConfig.fps;
+
+    SceneCutDialog dlg(current.filePath, fps, this);
+    if (dlg.exec() != QDialog::Accepted || !dlg.wasApplied())
+        return;
+
+    const QVector<qint64> cutsMs = dlg.acceptedCutTimestampsMs();
+    if (cutsMs.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("検出されたシーンカットはありません"), 3000);
+        return;
+    }
+
+    const QColor sceneCutColor(QStringLiteral("#33ccff"));
+
+    if (dlg.applyMode() == SceneCutDialog::ApplyMode::AddMarkers) {
+        if (!m_timeline) return;
+        int added = 0;
+        const double clipStartSec = clipTimelineStartSeconds(trackIdx, clipIdx);
+        for (qint64 ms : cutsMs) {
+            const double timelineSec =
+                clipStartSec + (static_cast<double>(ms) / 1000.0);
+            const qint64 timeUs = static_cast<qint64>(timelineSec * 1.0e6);
+            m_timeline->addMarker(timeUs,
+                QStringLiteral("Scene Cut"),
+                sceneCutColor);
+            ++added;
+        }
+        statusBar()->showMessage(
+            QStringLiteral("%1 個のシーンカットマーカーを追加しました").arg(added),
+            4000);
+    } else {
+        // SplitClip: walk cuts in descending order so each split is at a
+        // stable timestamp (earlier splits don't displace later cuts within
+        // the same source clip).
+        if (!m_timeline) return;
+        QVector<qint64> sorted = cutsMs;
+        std::sort(sorted.begin(), sorted.end(), std::greater<qint64>());
+        int splits = 0;
+        const double clipStartSec = clipTimelineStartSeconds(trackIdx, clipIdx);
+        for (qint64 ms : sorted) {
+            const double timelineSec =
+                clipStartSec + (static_cast<double>(ms) / 1000.0);
+            m_timeline->setPlayheadPosition(timelineSec);
+            m_timeline->splitAtPlayhead();
+            ++splits;
+        }
+        statusBar()->showMessage(
+            QStringLiteral("%1 箇所でクリップを分割しました").arg(splits),
+            4000);
+        updateEditActions();
+    }
+}
+
+// US-HW-10: Sprint 9 — sidechain ducking dialog entry.
+//
+// Opens AudioDuckingDialog seeded with the project's persisted m_duckingParams.
+// On Accept, copies dialog state into the project members; persistence happens
+// the next time the project is saved through populateProjectData → ProjectFile.
+void MainWindow::onAudioDuckingSettings()
+{
+    AudioDuckingDialog dlg(m_duckingParams, this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+    m_duckingParams  = dlg.params();
+    m_duckingEnabled = dlg.duckingEnabled();
+    statusBar()->showMessage(
+        m_duckingEnabled
+            ? QStringLiteral("オーディオダッキング設定を更新しました (有効)")
+            : QStringLiteral("オーディオダッキング設定を更新しました (無効)"),
+        4000);
+}
+
+// US-HW-10: Sprint 9 — Collect Files entry.
+//
+// Snapshots current project state via the same populateProjectData() path used
+// by saveProject(), then hands it to ProjectCollectorDialog which copies the
+// referenced media + project file into a destination folder.
+void MainWindow::onCollectProject()
+{
+    ProjectData data;
+    populateProjectData(data);
+    ProjectCollectorDialog dlg(data, this);
+    dlg.exec();
+    if (dlg.didCollect()) {
+        statusBar()->showMessage(
+            QStringLiteral("プロジェクトを収集しました: %1").arg(dlg.outputProjectPath()),
+            6000);
+    }
 }
 
 void MainWindow::editTransformKeyframes()

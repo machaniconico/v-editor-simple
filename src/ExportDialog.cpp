@@ -133,8 +133,57 @@ void ExportDialog::setupUI()
     m_audioBitrateSpin->setSuffix(" kbps");
     codecForm->addRow("Audio Bitrate:", m_audioBitrateSpin);
 
-    m_hwAccelCheck = new QCheckBox("Use hardware acceleration (NVENC/QSV)", this);
-    codecForm->addRow("", m_hwAccelCheck);
+    // Hardware encoder combo
+    m_hwEncoderCombo = new QComboBox(this);
+    {
+        // Get available HW encoders to determine which vendors are present
+        auto hwEncoders = CodecDetector::hwAccelVideoEncoders();
+        auto hasVendor = [&hwEncoders](const QString &vendor) {
+            for (const auto &enc : hwEncoders)
+                if (enc.ffmpegName.contains(vendor)) return true;
+            return false;
+        };
+
+        const bool hasNvenc = hasVendor("nvenc");
+        const bool hasQsv   = hasVendor("qsv");
+        const bool hasAmf   = hasVendor("amf");
+        const bool anyHw    = hasNvenc || hasQsv || hasAmf;
+
+        // Add items: index 0=none, 1=auto, 2=nvenc, 3=qsv, 4=amf
+        m_hwEncoderCombo->addItem("ソフトウェア (libx264/x265)", QVariant(QString("none")));
+        m_hwEncoderCombo->addItem("自動 (利用可能なら GPU)",     QVariant(QString("auto")));
+        m_hwEncoderCombo->addItem("NVIDIA NVENC",               QVariant(QString("nvenc")));
+        m_hwEncoderCombo->addItem("Intel QuickSync",            QVariant(QString("qsv")));
+        m_hwEncoderCombo->addItem("AMD AMF",                    QVariant(QString("amf")));
+
+        auto *hwModel = qobject_cast<QStandardItemModel*>(m_hwEncoderCombo->model());
+        if (hwModel) {
+            if (!hasNvenc) {
+                hwModel->item(2)->setEnabled(false);
+                hwModel->item(2)->setToolTip("NVENC not detected");
+            }
+            if (!hasQsv) {
+                hwModel->item(3)->setEnabled(false);
+                hwModel->item(3)->setToolTip("QuickSync not detected");
+            }
+            if (!hasAmf) {
+                hwModel->item(4)->setEnabled(false);
+                hwModel->item(4)->setToolTip("AMD AMF not detected");
+            }
+        }
+
+        if (anyHw) {
+            m_hwEncoderCombo->setCurrentIndex(1); // "auto"
+            m_config.hwEncoder = "auto";
+            m_config.useHardwareAccel = true;
+        } else {
+            m_hwEncoderCombo->setCurrentIndex(0); // "none"
+            m_hwEncoderCombo->setEnabled(false);
+            m_config.hwEncoder = "none";
+            m_config.useHardwareAccel = false;
+        }
+    }
+    codecForm->addRow("ハードウェアエンコード:", m_hwEncoderCombo);
 
     mainLayout->addWidget(codecGroup);
 
@@ -168,6 +217,11 @@ void ExportDialog::setupUI()
     connect(m_videoCodecCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this]() { updateSummary(); });
     connect(m_videoBitrateSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this]() { updateSummary(); });
     connect(m_audioBitrateSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this]() { updateSummary(); });
+    connect(m_hwEncoderCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this]() {
+        m_config.hwEncoder = m_hwEncoderCombo->currentData().toString();
+        m_config.useHardwareAccel = (m_config.hwEncoder != "none");
+        updateSummary();
+    });
 
     onPresetChanged(0);
     updateSummary();
@@ -198,6 +252,22 @@ void ExportDialog::onPresetChanged(int index)
                                   && index < presetList.size()
                                   && presetList[index].hdr10);
         m_hdrWarningLabel->setVisible(presetIsHdr && !m_sourceIsHdr);
+    }
+
+    // ProRes does not support HW encoding — disable combo and force "none"
+    const bool isProRes = (!isCustom
+                           && index < presetList.size()
+                           && presetList[index].proresProfile >= 0);
+    if (isProRes) {
+        m_hwEncoderCombo->setEnabled(false);
+        m_config.hwEncoder = "none";
+        m_config.useHardwareAccel = false;
+    } else {
+        // Re-enable only if there is at least one HW encoder available
+        auto hwEncoders = CodecDetector::hwAccelVideoEncoders();
+        m_hwEncoderCombo->setEnabled(!hwEncoders.isEmpty());
+        m_config.hwEncoder = m_hwEncoderCombo->currentData().toString();
+        m_config.useHardwareAccel = (m_config.hwEncoder != "none");
     }
 
     updateSummary();
@@ -246,7 +316,8 @@ void ExportDialog::onExport()
     m_config.container = defaultExtension();
     m_config.videoBitrate = m_videoBitrateSpin->value();
     m_config.audioBitrate = m_audioBitrateSpin->value();
-    m_config.useHardwareAccel = m_hwAccelCheck->isChecked();
+    m_config.hwEncoder = m_hwEncoderCombo->currentData().toString();
+    m_config.useHardwareAccel = (m_config.hwEncoder != "none");
     m_config.width = m_projectConfig.width;
     m_config.height = m_projectConfig.height;
     m_config.fps = m_projectConfig.fps;
@@ -283,9 +354,14 @@ void ExportDialog::updateSummary()
     else if (vc == "libsvtav1") codecName = "AV1";
     else if (vc == "libvpx-vp9") codecName = "VP9";
 
-    m_summaryLabel->setText(QString("%1x%2 %3fps | %4 %5kbps | %6 %7kbps | .%8")
+    QString hwInfo = QString("HW encode: %1 (%2)")
+        .arg(m_config.hwEncoder.isEmpty() ? "none" : m_config.hwEncoder)
+        .arg(m_hwEncoderCombo->currentText());
+
+    m_summaryLabel->setText(QString("%1x%2 %3fps | %4 %5kbps | %6 %7kbps | .%8 | %9")
         .arg(m_projectConfig.width).arg(m_projectConfig.height).arg(m_projectConfig.fps)
         .arg(codecName).arg(m_videoBitrateSpin->value())
         .arg(m_audioCodecCombo->currentText()).arg(m_audioBitrateSpin->value())
-        .arg(defaultExtension()));
+        .arg(defaultExtension())
+        .arg(hwInfo));
 }

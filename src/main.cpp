@@ -63,6 +63,21 @@
 #include "NodeLibrary.h"
 #endif
 
+// US-HW-9: hardware/perf selftest optional dependencies.
+// US-HW-10 wires AudioDucking.cpp into CMakeLists, so the symbols are now
+// always linked when the header is present. We enable the selftest block
+// whenever AudioDucking.h is reachable; the -DVEDITOR_HWPERF_AUDIODUCKING
+// fallback is kept so users who patch the build can still opt in explicitly.
+#if __has_include("AudioDucking.h")
+#include "AudioDucking.h"
+#define HAVE_AUDIODUCKING 1
+#endif
+
+#if __has_include("SceneDetector.h")
+#include "SceneDetector.h"
+#define HAVE_SCENEDETECTOR 1
+#endif
+
 // ──────────────────────────────────────────────────────────────────────────
 // Lightweight file-backed logger + unhandled-exception reporter.
 //
@@ -1088,6 +1103,149 @@ int runMographSelftest()
     return 0;
 }
 
+// US-HW-9: hardware/performance self-test
+int runHwPerfSelftest()
+{
+    QString error;
+
+#ifdef HAVE_AUDIODUCKING
+    // --- AudioDucking: gain envelope properties ---
+    {
+        const int sampleRate = 8000;
+        const int length = 8000; // 1 second
+
+        // (a) Silent sidechain -> gain stays ~1.0
+        QVector<float> silentSide(length, 0.0f);
+        DuckingParams p;
+        const QVector<float> gainSilent = computeDuckingGain(silentSide, sampleRate, p);
+        if (!requireSelftest(gainSilent.size() == length,
+                             QStringLiteral("AudioDucking: silent sidechain size mismatch"), &error))
+            return 1;
+        bool allNearOne = true;
+        bool anyNanSilent = false;
+        for (float g : gainSilent) {
+            if (std::isnan(g)) { anyNanSilent = true; break; }
+            if (g <= 0.99f) { allNearOne = false; }
+        }
+        if (!requireSelftest(!anyNanSilent,
+                             QStringLiteral("AudioDucking: silent sidechain produced NaN"), &error))
+            return 1;
+        if (!requireSelftest(allNearOne,
+                             QStringLiteral("AudioDucking: silent sidechain -> gain not ~1.0"), &error))
+            return 1;
+
+        // (b) Strong constant sidechain -> tail converges to minGainLinear
+        QVector<float> strongSide(length, 0.5f);
+        const QVector<float> gainStrong = computeDuckingGain(strongSide, sampleRate, p);
+        if (!requireSelftest(gainStrong.size() == length,
+                             QStringLiteral("AudioDucking: strong sidechain size mismatch"), &error))
+            return 1;
+        const double minGain = minGainLinear(p);
+        bool tailConverged = true;
+        bool anyNanStrong = false;
+        const int tailStart = length - 1000;
+        for (int i = tailStart; i < length; ++i) {
+            const float g = gainStrong[i];
+            if (std::isnan(g)) { anyNanStrong = true; break; }
+            if (std::abs(static_cast<double>(g) - minGain) >= 0.05) { tailConverged = false; }
+        }
+        if (!requireSelftest(!anyNanStrong,
+                             QStringLiteral("AudioDucking: strong sidechain produced NaN"), &error))
+            return 1;
+        if (!requireSelftest(tailConverged,
+                             QStringLiteral("AudioDucking: strong sidechain tail did not converge to minGainLinear"), &error))
+            return 1;
+
+        // (c) Output size == input size (already checked above, belt-and-suspenders)
+        if (!requireSelftest(gainSilent.size() == silentSide.size(),
+                             QStringLiteral("AudioDucking: output size != input size"), &error))
+            return 1;
+
+        // (d) NaN check across full silent result (already done above, explicit pass here)
+
+        // (e) Determinism: same input -> identical output
+        const QVector<float> gainSilent2 = computeDuckingGain(silentSide, sampleRate, p);
+        bool deterministic = (gainSilent.size() == gainSilent2.size());
+        if (deterministic) {
+            for (int i = 0; i < gainSilent.size(); ++i) {
+                if (gainSilent[i] != gainSilent2[i]) { deterministic = false; break; }
+            }
+        }
+        if (!requireSelftest(deterministic,
+                             QStringLiteral("AudioDucking: non-deterministic output for identical input"), &error))
+            return 1;
+    }
+#endif // HAVE_AUDIODUCKING
+
+#ifdef HAVE_SCENEDETECTOR
+    // --- SceneDetector: cut detection behavior ---
+    {
+        SceneDetector detector;
+        detector.setThreshold(0.35);
+        detector.setMinSceneFrames(5);
+
+        // (a) Identical frames -> no cuts
+        QImage redFrame(32, 32, QImage::Format_ARGB32);
+        redFrame.fill(QColor(200, 50, 50));
+        for (int i = 0; i < 10; ++i)
+            detector.processFrame(i, redFrame, 24.0);
+        if (!requireSelftest(detector.totalCuts() == 0,
+                             QStringLiteral("SceneDetector: identical frames produced spurious cuts"), &error))
+            return 1;
+
+        // (b) Drastic color change -> at least one cut detected
+        QImage blueFrame(32, 32, QImage::Format_ARGB32);
+        blueFrame.fill(QColor(10, 10, 220));
+        for (int i = 10; i < 20; ++i)
+            detector.processFrame(i, blueFrame, 24.0);
+        if (!requireSelftest(detector.totalCuts() >= 1,
+                             QStringLiteral("SceneDetector: drastic color change produced no cut"), &error))
+            return 1;
+
+        // (c) Rapid alternation respects minSceneFrames gate
+        // Feed alternating colors faster than minSceneFrames=5
+        int cutsBeforeRapid = detector.totalCuts();
+        QImage greenFrame(32, 32, QImage::Format_ARGB32);
+        greenFrame.fill(QColor(10, 220, 10));
+        // 8 rapid alternations between blue/green (interval=1 frame < minSceneFrames=5)
+        for (int i = 20; i < 28; ++i) {
+            const QImage &f = (i % 2 == 0) ? blueFrame : greenFrame;
+            detector.processFrame(i, f, 24.0);
+        }
+        const int cutsAfterRapid = detector.totalCuts();
+        // Should not have added more than 2 cuts (minSceneFrames gate suppresses most)
+        if (!requireSelftest(cutsAfterRapid - cutsBeforeRapid <= 2,
+                             QStringLiteral("SceneDetector: minSceneFrames gate not suppressing rapid alternations"), &error))
+            return 1;
+
+        // (d) reset() clears state
+        detector.reset();
+        if (!requireSelftest(detector.totalCuts() == 0,
+                             QStringLiteral("SceneDetector: reset() did not clear cut count"), &error))
+            return 1;
+        if (!requireSelftest(detector.sceneCutFrames().isEmpty(),
+                             QStringLiteral("SceneDetector: reset() did not clear cut frames"), &error))
+            return 1;
+    }
+#endif // HAVE_SCENEDETECTOR
+
+    // --- ExportConfig: hwEncoder field compile-time presence check ---
+    {
+        ExportConfig cfg;
+        cfg.hwEncoder = QStringLiteral("auto");
+        if (!requireSelftest(cfg.hwEncoder == QStringLiteral("auto"),
+                             QStringLiteral("ExportConfig.hwEncoder writable"), &error))
+            return 1;
+        cfg.hwEncoder = QStringLiteral("none");
+        if (!requireSelftest(cfg.hwEncoder == QStringLiteral("none"),
+                             QStringLiteral("ExportConfig.hwEncoder round-trip"), &error))
+            return 1;
+    }
+
+    qInfo().noquote() << QStringLiteral("HWPERF selftest OK");
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -1276,6 +1434,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_MOGRAPH_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_MOGRAPH_SELFTEST");
         return runMographSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_HWPERF_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_HWPERF_SELFTEST");
+        return runHwPerfSelftest();
     }
 
     // スプラッシュ画面

@@ -71,6 +71,7 @@
 #include "SmartReframe.h"
 #include "LoudnessAnalyzer.h"
 #include "SubtitleTrackRenderer.h"
+#include "AudioDucking.h"
 
 class VideoPlayer;
 class Timeline;
@@ -82,6 +83,9 @@ class FavoritesEditDialog;
 class Text3DExtrusionDialog;
 class ExpressionBindingDialog;
 class CameraMotionDialog;
+class SceneCutDialog;
+class AudioDuckingDialog;
+class ProjectCollectorDialog;
 
 namespace voiceover {
 class VoiceOverDialog;
@@ -299,6 +303,11 @@ private slots:
     void editClipWiggle();
     void openCameraMotionDialog();
 
+    // US-HW-10: Sprint 9 hardware/perf — 3 new menu actions
+    void onSceneCutDetect();
+    void onAudioDuckingSettings();
+    void onCollectProject();
+
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
     void editFavorites();
@@ -376,6 +385,10 @@ private:
     Camera3D m_projectCamera;                                 // single per-project camera
     int m_selectedVideoTrackIndex = -1;
     int m_selectedVideoClipIndexTracked = -1;
+
+    // US-HW-10: project-level audio ducking state, persisted via ProjectFile.
+    DuckingParams m_duckingParams;
+    bool          m_duckingEnabled = false;
 
     // US-AETEXT-12: AE text feature objects
     QVector<PathText *> m_pathTexts;

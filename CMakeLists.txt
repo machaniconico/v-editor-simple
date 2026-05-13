@@ -82,6 +82,18 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/Keyframe.cpp
     src/EffectPlugin.cpp
     src/ProjectFile.cpp
+    src/ProjectCollector.cpp
+    src/ProjectCollector.h
+    src/ProjectCollectorDialog.h
+    src/ProjectCollectorDialog.cpp
+    src/SceneCutScanner.h
+    src/SceneCutScanner.cpp
+    src/SceneCutDialog.h
+    src/SceneCutDialog.cpp
+    src/AudioDucking.h
+    src/AudioDucking.cpp
+    src/AudioDuckingDialog.h
+    src/AudioDuckingDialog.cpp
     src/GLPreview.cpp
     src/D3D11Bridge.cpp
     src/ShaderEffect.cpp

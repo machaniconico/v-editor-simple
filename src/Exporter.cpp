@@ -127,6 +127,54 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
         return;
     }
 
+    // HW encoder resolution: try hardware path when useHardwareAccel or hwEncoder is set
+    // hwEncoder == "none" forces software only; "" or "auto" means auto-detect
+    bool wantHW = (config.useHardwareAccel || !config.hwEncoder.isEmpty())
+                  && config.hwEncoder != "none";
+    bool isH264Family = (config.videoCodec == "libx264"
+                         || config.videoCodec.contains("264"));
+    bool isH265Family = (config.videoCodec == "libx265"
+                         || config.videoCodec.contains("265")
+                         || config.videoCodec.contains("hevc"));
+    QString hwVendor = config.hwEncoder.toLower(); // "nvenc", "qsv", "amf", "auto", ""
+
+    const AVCodec *hwEncoder = nullptr;
+    QString hwEncoderName;
+
+    if (wantHW && (isH264Family || isH265Family)) {
+        // Build candidate list based on codec family and vendor hint
+        QVector<QString> candidates;
+        if (isH264Family) {
+            if (hwVendor == "nvenc") candidates = {"h264_nvenc"};
+            else if (hwVendor == "qsv") candidates = {"h264_qsv"};
+            else if (hwVendor == "amf") candidates = {"h264_amf"};
+            else candidates = {"h264_nvenc", "h264_qsv", "h264_amf"}; // auto
+        } else {
+            if (hwVendor == "nvenc") candidates = {"hevc_nvenc"};
+            else if (hwVendor == "qsv") candidates = {"hevc_qsv"};
+            else if (hwVendor == "amf") candidates = {"hevc_amf"};
+            else candidates = {"hevc_nvenc", "hevc_qsv", "hevc_amf"}; // auto
+        }
+        for (const QString &candidateName : candidates) {
+            if (CodecDetector::isEncoderAvailable(candidateName)) {
+                hwEncoder = avcodec_find_encoder_by_name(candidateName.toUtf8().constData());
+                if (hwEncoder) {
+                    hwEncoderName = candidateName;
+                    break;
+                }
+            }
+        }
+        if (hwEncoder) {
+            encoder = hwEncoder;
+            resolvedCodec = hwEncoderName;
+            qInfo() << "Exporter: HW encoder selected:" << hwEncoderName;
+        } else {
+            qInfo() << "Exporter: no HW encoder available, falling back to SW encoder";
+        }
+    }
+
+    qInfo() << "Exporter: using encoder" << encoder->name;
+
     // Resolve audio encoder — auto-detect best AAC if needed
     QString resolvedAudioCodec = config.audioCodec;
     if (resolvedAudioCodec == "aac" || resolvedAudioCodec.isEmpty()) {
@@ -173,7 +221,15 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
 
     // Codec-specific options
     AVDictionary *opts = nullptr;
-    if (config.videoCodec == "libx264" || config.videoCodec == "libx265") {
+    if (resolvedCodec == "h264_nvenc" || resolvedCodec == "hevc_nvenc") {
+        av_dict_set(&opts, "preset", "p4", 0);
+        av_dict_set(&opts, "rc", "vbr", 0);
+        av_dict_set(&opts, "cq", "23", 0);
+    } else if (resolvedCodec == "h264_qsv" || resolvedCodec == "hevc_qsv") {
+        av_dict_set(&opts, "preset", "medium", 0);
+    } else if (resolvedCodec == "h264_amf" || resolvedCodec == "hevc_amf") {
+        av_dict_set(&opts, "quality", "balanced", 0);
+    } else if (config.videoCodec == "libx264" || config.videoCodec == "libx265") {
         av_dict_set(&opts, "preset", "medium", 0);
         av_dict_set(&opts, "crf", "23", 0);
         if (config.hdr10 && config.videoCodec == "libx265") {
@@ -198,11 +254,61 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
     if (avcodec_open2(encCtx, encoder, &opts) < 0) {
         av_dict_free(&opts);
         avcodec_free_context(&encCtx);
-        avformat_free_context(outFmt);
-        emit exportFinished(false, "Failed to open encoder");
-        return;
+
+        // HW encoder open failed — fall back to SW encoder (libx264/libx265)
+        if (hwEncoder) {
+            qInfo() << "Exporter: HW encoder open failed, falling back to SW encoder";
+            QString swCodec = isH265Family ? "libx265" : "libx264";
+            encoder = avcodec_find_encoder_by_name(swCodec.toUtf8().constData());
+            resolvedCodec = swCodec;
+            if (!encoder) {
+                avformat_free_context(outFmt);
+                emit exportFinished(false, "Video encoder not found (SW fallback failed)");
+                return;
+            }
+            encCtx = avcodec_alloc_context3(encoder);
+            encCtx->width = config.width;
+            encCtx->height = config.height;
+            encCtx->time_base = {1, config.fps};
+            encCtx->framerate = {config.fps, 1};
+            encCtx->pix_fmt = targetPixFmt;
+            encCtx->bit_rate = static_cast<int64_t>(config.videoBitrate) * 1000;
+            if (config.hdr10) {
+                encCtx->color_primaries = AVCOL_PRI_BT2020;
+                encCtx->color_trc = AVCOL_TRC_SMPTE2084;
+                encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
+                encCtx->color_range = AVCOL_RANGE_MPEG;
+            }
+            if (outFmt->oformat->flags & AVFMT_GLOBALHEADER)
+                encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            AVDictionary *swOpts = nullptr;
+            av_dict_set(&swOpts, "preset", "medium", 0);
+            av_dict_set(&swOpts, "crf", "23", 0);
+            if (config.hdr10 && swCodec == "libx265") {
+                av_dict_set(&swOpts, "profile", "main10", 0);
+                av_dict_set(&swOpts,
+                            "x265-params",
+                            "hdr10=1:repeat-headers=1:colorprim=bt2020:"
+                            "transfer=smpte2084:colormatrix=bt2020nc:range=limited",
+                            0);
+            }
+            if (avcodec_open2(encCtx, encoder, &swOpts) < 0) {
+                av_dict_free(&swOpts);
+                avcodec_free_context(&encCtx);
+                avformat_free_context(outFmt);
+                emit exportFinished(false, "Failed to open SW fallback encoder");
+                return;
+            }
+            av_dict_free(&swOpts);
+            qInfo() << "Exporter: using encoder" << encoder->name;
+        } else {
+            avformat_free_context(outFmt);
+            emit exportFinished(false, "Failed to open encoder");
+            return;
+        }
+    } else {
+        av_dict_free(&opts);
     }
-    av_dict_free(&opts);
 
     avcodec_parameters_from_context(outStream->codecpar, encCtx);
     outStream->time_base = encCtx->time_base;
@@ -421,7 +527,9 @@ clip_done:
         emit exportFinished(false, "Export cancelled");
     } else {
         emit progressChanged(100);
-        emit exportFinished(true, "Export completed: " + config.outputPath);
+        emit exportFinished(true, QString("Exported via %1 to %2")
+                                      .arg(QString::fromUtf8(encoder->name))
+                                      .arg(config.outputPath));
     }
 }
 

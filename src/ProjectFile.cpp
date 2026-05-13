@@ -264,6 +264,20 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     if (!data.projectCamera.isEmpty())
         root["projectCamera"] = data.projectCamera;
 
+    // US-HW-10: audio ducking (Sprint 9) — always written so a saved project
+    // round-trips even when the user has never opened the ducking dialog.
+    {
+        QJsonObject duck;
+        duck["thresholdDb"]       = data.duckingParams.thresholdDb;
+        duck["targetReductionDb"] = data.duckingParams.targetReductionDb;
+        duck["attackMs"]          = data.duckingParams.attackMs;
+        duck["releaseMs"]         = data.duckingParams.releaseMs;
+        duck["holdMs"]            = data.duckingParams.holdMs;
+        duck["kneeDb"]            = data.duckingParams.kneeDb;
+        root["duckingParams"]  = duck;
+        root["duckingEnabled"] = data.duckingEnabled;
+    }
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -440,6 +454,24 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.projectCamera = root.contains("projectCamera")
         ? root["projectCamera"].toObject()
         : QJsonObject{};
+
+    // US-HW-10: audio ducking (Sprint 9) — backward compat: missing key keeps
+    // the DuckingParams{} defaults and duckingEnabled=false.
+    {
+        const DuckingParams defaults;
+        const QJsonObject duck = root.contains("duckingParams")
+                                   ? root["duckingParams"].toObject()
+                                   : QJsonObject{};
+        data.duckingParams.thresholdDb       = duck.value("thresholdDb").toDouble(defaults.thresholdDb);
+        data.duckingParams.targetReductionDb = duck.value("targetReductionDb").toDouble(defaults.targetReductionDb);
+        data.duckingParams.attackMs          = duck.value("attackMs").toDouble(defaults.attackMs);
+        data.duckingParams.releaseMs         = duck.value("releaseMs").toDouble(defaults.releaseMs);
+        data.duckingParams.holdMs            = duck.value("holdMs").toDouble(defaults.holdMs);
+        data.duckingParams.kneeDb            = duck.value("kneeDb").toDouble(defaults.kneeDb);
+        data.duckingEnabled = root.contains("duckingEnabled")
+                                ? root["duckingEnabled"].toBool(false)
+                                : false;
+    }
 
     return true;
 }
@@ -625,6 +657,20 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     if (!data.projectCamera.isEmpty())
         root["projectCamera"] = data.projectCamera;
 
+    // US-HW-10: audio ducking (Sprint 9) — always written so a saved project
+    // round-trips even when the user has never opened the ducking dialog.
+    {
+        QJsonObject duck;
+        duck["thresholdDb"]       = data.duckingParams.thresholdDb;
+        duck["targetReductionDb"] = data.duckingParams.targetReductionDb;
+        duck["attackMs"]          = data.duckingParams.attackMs;
+        duck["releaseMs"]         = data.duckingParams.releaseMs;
+        duck["holdMs"]            = data.duckingParams.holdMs;
+        duck["kneeDb"]            = data.duckingParams.kneeDb;
+        root["duckingParams"]  = duck;
+        root["duckingEnabled"] = data.duckingEnabled;
+    }
+
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
 }
@@ -793,6 +839,24 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.projectCamera = root.contains("projectCamera")
         ? root["projectCamera"].toObject()
         : QJsonObject{};
+
+    // US-HW-10: audio ducking (Sprint 9) — backward compat: missing key keeps
+    // the DuckingParams{} defaults and duckingEnabled=false.
+    {
+        const DuckingParams defaults;
+        const QJsonObject duck = root.contains("duckingParams")
+                                   ? root["duckingParams"].toObject()
+                                   : QJsonObject{};
+        data.duckingParams.thresholdDb       = duck.value("thresholdDb").toDouble(defaults.thresholdDb);
+        data.duckingParams.targetReductionDb = duck.value("targetReductionDb").toDouble(defaults.targetReductionDb);
+        data.duckingParams.attackMs          = duck.value("attackMs").toDouble(defaults.attackMs);
+        data.duckingParams.releaseMs         = duck.value("releaseMs").toDouble(defaults.releaseMs);
+        data.duckingParams.holdMs            = duck.value("holdMs").toDouble(defaults.holdMs);
+        data.duckingParams.kneeDb            = duck.value("kneeDb").toDouble(defaults.kneeDb);
+        data.duckingEnabled = root.contains("duckingEnabled")
+                                ? root["duckingEnabled"].toBool(false)
+                                : false;
+    }
 
     return true;
 }

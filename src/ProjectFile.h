@@ -16,6 +16,7 @@
 #include "TimeRemap.h"
 #include "ClipExpressionBindings.h"
 #include "WiggleTransform.h"
+#include "AudioDucking.h"
 
 // --- Audio mixer serialization sub-types ---
 
@@ -238,6 +239,10 @@ struct ProjectData {
     QVector<ExpressionBindingsClipEntry> expressionBindingsEntries;
     QVector<WiggleClipEntry> wiggleClipEntries;
     QJsonObject projectCamera;   // Camera3D::toJson() — single per-project camera
+
+    // US-HW-10: audio ducking project state (Sprint 9)
+    DuckingParams duckingParams;
+    bool duckingEnabled = false;
 };
 
 class ProjectFile
