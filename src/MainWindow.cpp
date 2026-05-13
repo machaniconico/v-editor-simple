@@ -37,6 +37,8 @@
 #include "AIMaskDialog.h"
 #include "AudioClipEditor.h"
 #include "MagneticTimeline.h"
+#include "ShortcutManager.h"
+#include "ShortcutCustomizeDialog.h"
 #include <QApplication>
 #include <QMessageBox>
 #include <QMenu>
@@ -535,7 +537,54 @@ MainWindow::MainWindow(QWidget *parent)
     m_activeNodeGraph = new NodeGraph();
     m_nodeEvaluator = new NodeEvaluator();
 
+    // US-SC-B: Sprint 12 — ショートカット管理 (preset/custom binding)。
+    // setupMenuBar/setupToolBar 完走後に呼ぶことで全 QAction が確実に揃っている。
+    m_shortcutManager = new shortcut::ShortcutManager(this);
+    registerCoreShortcuts();
+    m_shortcutManager->loadFromSettings();
+
     qInfo() << "MainWindow::ctor end";
+}
+
+void MainWindow::registerCoreShortcuts()
+{
+    if (!m_shortcutManager)
+        return;
+    auto reg = [this](QAction *a, const QString &id, const QString &name,
+                      const QString &cat) {
+        if (a)
+            m_shortcutManager->registerAction(a, id, name, cat);
+    };
+
+    // 編集
+    reg(m_undoAction,            "edit.undo",
+        QStringLiteral("元に戻す"),            QStringLiteral("編集"));
+    reg(m_redoAction,            "edit.redo",
+        QStringLiteral("やり直し"),            QStringLiteral("編集"));
+    reg(m_copyAction,            "edit.copy",
+        QStringLiteral("クリップをコピー"),    QStringLiteral("編集"));
+    reg(m_pasteAction,           "edit.paste",
+        QStringLiteral("クリップを貼り付け"),  QStringLiteral("編集"));
+    reg(m_splitAction,           "edit.split",
+        QStringLiteral("再生ヘッドで分割"),    QStringLiteral("編集"));
+    reg(m_deleteAction,          "edit.delete",
+        QStringLiteral("クリップを削除"),      QStringLiteral("編集"));
+    reg(m_rippleDeleteAction,    "timeline.ripple_delete",
+        QStringLiteral("リップル削除"),        QStringLiteral("編集"));
+    reg(m_copyEffectsAction,     "edit.copy_effects",
+        QStringLiteral("エフェクトをコピー"),  QStringLiteral("編集"));
+    reg(m_pasteEffectsAction,    "edit.paste_effects",
+        QStringLiteral("エフェクトを貼り付け"), QStringLiteral("編集"));
+    reg(m_pasteAttributesAction, "edit.paste_attributes",
+        QStringLiteral("属性を貼り付け"),      QStringLiteral("編集"));
+
+    // タイムライン / 表示
+    reg(m_snapAction,         "timeline.snap_toggle",
+        QStringLiteral("スナップ切替"),       QStringLiteral("タイムライン"));
+    reg(m_trackMotionAction,  "tools.track_motion",
+        QStringLiteral("モーション追跡"),     QStringLiteral("ツール"));
+    reg(m_nodeModeAction,     "view.node_mode",
+        QStringLiteral("ノード合成モード"),   QStringLiteral("表示"));
 }
 
 double MainWindow::currentPlayheadSeconds() const
@@ -1162,6 +1211,15 @@ void MainWindow::setupMenuBar()
     prefsMenu->addAction(shortcutAction);
     m_menuHelpEntries.append({shortcutAction,
         QStringLiteral("よく使う操作のキー割り当てを自分好みに変えられます。")});
+
+    // US-SC-B: Sprint 12 — Premiere/FCP/DaVinci 風プリセット切替 + 個別カスタマイズ
+    auto *shortcutCustomizeAction = editMenu->addAction(QStringLiteral("ショートカット設定…"));
+    shortcutCustomizeAction->setObjectName("action_shortcut_customize");
+    connect(shortcutCustomizeAction, &QAction::triggered,
+            this, &MainWindow::openShortcutCustomizeDialog);
+    prefsMenu->addAction(shortcutCustomizeAction);
+    m_menuHelpEntries.append({shortcutCustomizeAction,
+        QStringLiteral("メニューやツールバーのキーボードショートカットをカスタマイズしたり、Premiere/FinalCutPro/DaVinci 風プリセットへ切り替えたりします。")});
 
     // お気に入り メニュー — placed right after 編集 so the user's hand-picked
     // shortcuts sit near the top of the menu bar. Mnemonic &O is unused by the
@@ -7269,6 +7327,21 @@ void MainWindow::about()
             .arg(APP_VERSION));
 }
 
+// US-SC-B: Sprint 12 — open / raise the ショートカット設定 dialog (modeless,
+// kept alive between invocations so layout state survives reopen).
+void MainWindow::openShortcutCustomizeDialog()
+{
+    if (!m_shortcutManager)
+        return;
+    if (!m_shortcutCustomizeDialog) {
+        m_shortcutCustomizeDialog = new ShortcutCustomizeDialog(m_shortcutManager, this);
+        m_shortcutCustomizeDialog->setObjectName("shortcutCustomizeDialog");
+    }
+    m_shortcutCustomizeDialog->show();
+    m_shortcutCustomizeDialog->raise();
+    m_shortcutCustomizeDialog->activateWindow();
+}
+
 // --- Phase 14: New slot implementations ---
 
 void MainWindow::setupRecentFiles()
@@ -7680,6 +7753,8 @@ void MainWindow::closeEvent(QCloseEvent *event)
 {
     saveWindowState();
     if (m_autoSave) m_autoSave->markCleanShutdown();
+    // US-SC-B: Sprint 12 — persist preset + custom bindings before shutdown.
+    if (m_shortcutManager) m_shortcutManager->saveToSettings();
     QMainWindow::closeEvent(event);
 }
 

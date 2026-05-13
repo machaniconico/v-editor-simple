@@ -93,6 +93,9 @@ class AIProcessingDialog;
 class PluginBrowserDialog;
 class AIMaskDialog;
 class AudioClipEditor;
+class ShortcutCustomizeDialog;
+
+namespace shortcut { class ShortcutManager; }
 
 namespace voiceover {
 class VoiceOverDialog;
@@ -324,6 +327,9 @@ private slots:
     void openAIMaskDialog();
     void openAudioClipEditorDialog();
     void runMagneticTimelineDemo();
+
+    // US-SC-B: Sprint 12 — ショートカット設定ダイアログ
+    void openShortcutCustomizeDialog();
 
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
@@ -576,6 +582,13 @@ private:
     // is a lightweight QDialog wrapper around an AudioClipEditor widget.
     class AIMaskDialog *m_aiMaskDialog = nullptr;
     class QDialog *m_audioClipEditorDialog = nullptr;
+
+    // US-SC-B: Sprint 12 — ショートカット管理 (preset/カスタムバインド)。
+    // m_shortcutManager は registerAction で登録した QAction* の弱参照を保ち、
+    // m_shortcutCustomizeDialog はモードレスダイアログとして再利用する。
+    shortcut::ShortcutManager *m_shortcutManager = nullptr;
+    ShortcutCustomizeDialog *m_shortcutCustomizeDialog = nullptr;
+    void registerCoreShortcuts();
 
     // Voice-over recording
     voiceover::VoiceOverDialog *m_voiceOverDialog = nullptr;

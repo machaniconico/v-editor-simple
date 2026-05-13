@@ -109,6 +109,12 @@
 #define HAVE_AUDIOCLIPEDITOR 1
 #endif
 
+// US-SC-B: Sprint 12 shortcut customization self-test dependency.
+#if __has_include("ShortcutManager.h")
+#include "ShortcutManager.h"
+#define HAVE_SHORTCUTMANAGER 1
+#endif
+
 // ──────────────────────────────────────────────────────────────────────────
 // Lightweight file-backed logger + unhandled-exception reporter.
 //
@@ -1588,6 +1594,60 @@ int runWorkflowSelftest()
     return 0;
 }
 
+// US-SC-B: Sprint 12 shortcut customization self-test (VEDITOR_SHORTCUT_SELFTEST=1)
+int runShortcutSelftest()
+{
+    QString error;
+#ifdef HAVE_SHORTCUTMANAGER
+    {
+        QAction dummyA;
+        dummyA.setShortcut(QKeySequence("Ctrl+O"));
+        QAction dummyB;
+        dummyB.setShortcut(QKeySequence("Ctrl+S"));
+
+        shortcut::ShortcutManager mgr;
+        mgr.registerAction(&dummyA, "file.open",
+                           QStringLiteral("ファイルを開く"),
+                           QStringLiteral("ファイル"));
+        mgr.registerAction(&dummyB, "file.save",
+                           QStringLiteral("保存"),
+                           QStringLiteral("ファイル"));
+
+        // 1. registerAction → bindings() に entry
+        if (!requireSelftest(mgr.bindings().size() == 2,
+                             QStringLiteral("ShortcutManager: bindings size != 2"), &error))
+            return 1;
+        // 2. setBinding でカスタム値、bindingFor で取れる
+        mgr.setBinding("file.open", QKeySequence("Ctrl+Shift+O"));
+        if (!requireSelftest(mgr.bindingFor("file.open").sequence ==
+                                 QKeySequence("Ctrl+Shift+O"),
+                             QStringLiteral("setBinding round-trip failed"), &error))
+            return 1;
+        // 3. QAction 自体の shortcut も反映
+        if (!requireSelftest(dummyA.shortcut() == QKeySequence("Ctrl+Shift+O"),
+                             QStringLiteral("QAction::shortcut not updated"), &error))
+            return 1;
+        // 4. applyPreset(Premiere) — presetDisplayName が non-empty。
+        mgr.applyPreset(shortcut::Preset::Premiere);
+        if (!requireSelftest(!shortcut::ShortcutManager::presetDisplayName(
+                                    shortcut::Preset::Premiere).isEmpty(),
+                             QStringLiteral("presetDisplayName(Premiere) empty"), &error))
+            return 1;
+        // 5. availablePresets contains 4
+        if (!requireSelftest(shortcut::ShortcutManager::availablePresets().size() == 4,
+                             QStringLiteral("availablePresets != 4"), &error))
+            return 1;
+        // 6. resetAllToDefaults → default に戻る (Ctrl+O)
+        mgr.resetAllToDefaults();
+        if (!requireSelftest(mgr.bindingFor("file.open").sequence == QKeySequence("Ctrl+O"),
+                             QStringLiteral("resetAllToDefaults didn't restore"), &error))
+            return 1;
+    }
+#endif // HAVE_SHORTCUTMANAGER
+    qInfo().noquote() << QStringLiteral("SHORTCUT selftest OK");
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -1784,6 +1844,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_PROEXT_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_PROEXT_SELFTEST");
         return runProExtSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_SHORTCUT_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_SHORTCUT_SELFTEST");
+        return runShortcutSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");
