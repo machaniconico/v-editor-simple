@@ -44,6 +44,16 @@
 #include "CaptionEditorDialog.h"
 #include "SocialPreset.h"
 #include "AspectReframer.h"
+
+// US-INT-1: Sprint 16 — モバイルエクスポート + 取り込みハブ (optional includes)
+#if __has_include("MobileExportDialog.h")
+  #include "MobileExportDialog.h"
+  #define HAVE_MOBILE_EXPORT 1
+#endif
+#if __has_include("ImportHubDialog.h")
+  #include "ImportHubDialog.h"
+  #define HAVE_IMPORT_HUB 1
+#endif
 #include <QApplication>
 #include <QMessageBox>
 #include <QMenu>
@@ -1054,6 +1064,26 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::openSocialExportDialog);
     m_menuHelpEntries.append({socialExportAction,
         QStringLiteral("Instagram / TikTok / YouTube Shorts などの SNS 向けプリセットでエクスポートします (9:16/1:1/4:5 縦動画自動リフレーミング対応)。")});
+
+    // US-INT-1: Sprint 16 — モバイルデバイス向けエクスポート (iPhone/iPad/Android プロファイル)。
+#ifdef HAVE_MOBILE_EXPORT
+    auto *mobileExportAction = fileMenu->addAction(QStringLiteral("モバイルデバイス向けエクスポート(&M)…"));
+    mobileExportAction->setObjectName("action_mobile_export");
+    connect(mobileExportAction, &QAction::triggered,
+            this, &MainWindow::onMobileExport);
+    m_menuHelpEntries.append({mobileExportAction,
+        QStringLiteral("iPhone / iPad / Android などのモバイルデバイス向けに最適化されたエクスポートプロファイルを開きます。")});
+#endif
+
+    // US-INT-1: Sprint 16 — 外部ツール (OBS / Affinity / Blender) からの取り込みハブ。
+#ifdef HAVE_IMPORT_HUB
+    auto *importHubAction = fileMenu->addAction(QStringLiteral("外部ツール取り込みハブ(&I)…"));
+    importHubAction->setObjectName("action_import_hub");
+    connect(importHubAction, &QAction::triggered,
+            this, &MainWindow::onImportHub);
+    m_menuHelpEntries.append({importHubAction,
+        QStringLiteral("OBS の録画 / Affinity Photo の PSD / Blender のメッシュ・EXR シーケンスをまとめて取り込むハブを開きます。")});
+#endif
 
     // US-EXT-10: HDR (HDR10/HLG) output settings dialog.
     auto *hdrSettingsAction = fileMenu->addAction("HDR 出力設定...");
@@ -7419,6 +7449,147 @@ void MainWindow::openCaptionEditorDialog()
     m_captionEditorDialog->show();
     m_captionEditorDialog->raise();
     m_captionEditorDialog->activateWindow();
+}
+
+// US-INT-1: Sprint 16 — open / raise the mobile-device export dialog (modeless).
+// Lazy-creates MobileExportDialog with the current source size + measured LUFS=0.0;
+// hooks exportRequested into the existing Exporter::startExport pipeline so that
+// pressing 「書き出し」 inside the dialog runs the standard timeline export with
+// the resolved mobile-profile config.
+void MainWindow::onMobileExport()
+{
+#ifdef HAVE_MOBILE_EXPORT
+    if (!m_mobileExportDialog) {
+        // Use the project resolution as the source size; falls back to 1920x1080
+        // when uninitialised (matches ProjectSettings defaults).
+        const QSize sourceSize(m_projectConfig.width  > 0 ? m_projectConfig.width  : 1920,
+                               m_projectConfig.height > 0 ? m_projectConfig.height : 1080);
+        // measuredLufs=0.0: integrated loudness analysis is wired in a follow-up
+        // story; current dialog accepts 0.0 as "unknown / no normalisation".
+        m_mobileExportDialog = new MobileExportDialog(sourceSize, 0.0, this);
+        m_mobileExportDialog->setObjectName(QStringLiteral("mobileExportDialog"));
+        connect(m_mobileExportDialog, &MobileExportDialog::exportRequested,
+                this, [this](const ExportConfig &cfg) {
+                    if (!m_timeline) return;
+                    const auto &clips = m_timeline->videoClips();
+                    if (clips.isEmpty()) {
+                        QMessageBox::warning(this, QStringLiteral("モバイル書き出し"),
+                            QStringLiteral("タイムラインにクリップがありません。"));
+                        return;
+                    }
+                    auto *progress = new QProgressDialog(
+                        QStringLiteral("モバイル向けエクスポート中..."),
+                        QStringLiteral("キャンセル"), 0, 100, this);
+                    progress->setWindowModality(Qt::WindowModal);
+                    progress->setMinimumDuration(0);
+                    connect(m_exporter, &Exporter::progressChanged,
+                            progress, &QProgressDialog::setValue);
+                    connect(m_exporter, &Exporter::exportFinished,
+                            this, [this, progress](bool ok, const QString &msg) {
+                                progress->close();
+                                progress->deleteLater();
+                                if (ok)
+                                    statusBar()->showMessage(msg);
+                                else
+                                    QMessageBox::critical(this,
+                                        QStringLiteral("モバイル書き出し失敗"), msg);
+                            });
+                    connect(progress, &QProgressDialog::canceled,
+                            m_exporter, &Exporter::cancel);
+                    statusBar()->showMessage(
+                        QStringLiteral("モバイル書き出し: ") + cfg.outputPath);
+                    m_exporter->startExport(cfg, clips);
+                });
+    }
+    m_mobileExportDialog->show();
+    m_mobileExportDialog->raise();
+    m_mobileExportDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("モバイルエクスポート"),
+        QStringLiteral("MobileExportDialog がビルドに含まれていません。"));
+#endif
+}
+
+// US-INT-1: Sprint 16 — open / raise the external-tool import hub dialog (modeless).
+// Wires 4 import signals (timeline placements / image / mesh / EXR sequence) into
+// MainWindow. Timeline import maps each placement to a Timeline::addClip call;
+// image / mesh / EXR sequence imports log a TODO + status until the dedicated
+// helper APIs (image overlay loader, 3D mesh ingest, EXR sequence loader) land.
+void MainWindow::onImportHub()
+{
+#ifdef HAVE_IMPORT_HUB
+    if (!m_importHubDialog) {
+        m_importHubDialog = new ImportHubDialog(this);
+        m_importHubDialog->setObjectName(QStringLiteral("importHubDialog"));
+
+        connect(m_importHubDialog, &ImportHubDialog::timelineImportRequested,
+                this, [this](const QList<obs::layout::TimelineClipPlacement> &placements) {
+                    if (!m_timeline) return;
+                    int added = 0;
+                    for (const auto &p : placements) {
+                        if (p.filePath.isEmpty()) continue;
+                        m_timeline->addClip(p.filePath);
+                        ++added;
+                    }
+                    if (statusBar()) {
+                        statusBar()->showMessage(
+                            QStringLiteral("取り込みハブ: %1 件のクリップをタイムラインに追加")
+                                .arg(added),
+                            5000);
+                    }
+                });
+
+        connect(m_importHubDialog, &ImportHubDialog::imageImportRequested,
+                this, [this](const QImage &image, const QString &name) {
+                    // TODO(US-INT-2): wire to addImageOverlay / image-layer ingest helper.
+                    qInfo().noquote() << QStringLiteral(
+                        "ImportHub image: name=%1 size=%2x%3")
+                        .arg(name)
+                        .arg(image.width())
+                        .arg(image.height());
+                    if (statusBar()) {
+                        statusBar()->showMessage(
+                            QStringLiteral("画像取り込み (%1) を受信 (近日 timeline 連携予定)")
+                                .arg(name),
+                            5000);
+                    }
+                });
+
+        connect(m_importHubDialog, &ImportHubDialog::meshImportRequested,
+                this, [this](const blender::mesh::MeshData &meshData) {
+                    // TODO(US-INT-2): wire to 3D mesh layer ingest once available.
+                    qInfo().noquote() << QStringLiteral(
+                        "ImportHub mesh: vertices=%1 triangles=%2")
+                        .arg(meshData.vertices.size())
+                        .arg(meshData.triangleIndices.size() / 3);
+                    if (statusBar()) {
+                        statusBar()->showMessage(
+                            QStringLiteral("メッシュ取り込みを受信 (近日 3D layer 連携予定)"),
+                            5000);
+                    }
+                });
+
+        connect(m_importHubDialog, &ImportHubDialog::exrSequenceImportRequested,
+                this, [this](const QString &folderPath, const QString &pattern) {
+                    // TODO(US-INT-2): wire to EXR sequence loader / image-sequence layer.
+                    qInfo().noquote() << QStringLiteral(
+                        "ImportHub EXR sequence: folder=%1 pattern=%2")
+                        .arg(folderPath, pattern);
+                    if (statusBar()) {
+                        statusBar()->showMessage(
+                            QStringLiteral("EXR シーケンス取り込みを受信 (%1) — 近日対応予定")
+                                .arg(pattern),
+                            5000);
+                    }
+                });
+    }
+    m_importHubDialog->show();
+    m_importHubDialog->raise();
+    m_importHubDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("取り込みハブ"),
+        QStringLiteral("ImportHubDialog がビルドに含まれていません。"));
+#endif
 }
 
 // --- Phase 14: New slot implementations ---

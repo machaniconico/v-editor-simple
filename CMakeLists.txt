@@ -19,6 +19,16 @@ set(CMAKE_AUTOUIC ON)
 # Qt6
 find_package(Qt6 REQUIRED COMPONENTS Widgets Gui Multimedia MultimediaWidgets OpenGL OpenGLWidgets Network Concurrent)
 
+# Sprint 16 / US-AFF-1: SVG rasterization for affinity::vector::loadSvg().
+# Optional: when not present, AffinityVectorImporter.cpp returns a null QImage
+# and the rest of the build still succeeds (the .cpp uses __has_include guards).
+find_package(Qt6 QUIET COMPONENTS Svg)
+find_package(Qt6 QUIET COMPONENTS Pdf)
+
+# Sprint 16 / US-BLE-1: optional FBX/Alembic mesh import via libassimp.
+# When unavailable, BlenderMeshImporter.cpp falls back to OBJ/glTF only.
+find_package(assimp QUIET)
+
 # FFmpeg — find headers and libraries (works with vcpkg on all platforms)
 find_path(FFMPEG_INCLUDE_DIR libavformat/avformat.h)
 find_library(AVFORMAT_LIBRARY avformat)
@@ -293,6 +303,47 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AIProcessingDialog.cpp
     src/PluginBrowserDialog.h
     src/PluginBrowserDialog.cpp
+    src/BlenderBpyBridge.h
+    src/BlenderBpyBridge.cpp
+    src/BlenderExrReader.h
+    src/BlenderExrReader.cpp
+
+    # Sprint 16 — Mobile export pack (US-MOB-1 / US-MOB-2)
+    src/MobileDeviceProfile.h
+    src/MobileDeviceProfile.cpp
+    src/MobileCodecConstraints.h
+    src/MobileCodecConstraints.cpp
+    src/MobileColorSpace.h
+    src/MobileColorSpace.cpp
+    src/MobilePreset.h
+    src/MobilePreset.cpp
+    src/MobileRotate.h
+    src/MobileRotate.cpp
+    src/MobileExportDialog.h
+    src/MobileExportDialog.cpp
+
+    # Sprint 16 — OBS recording importer (US-OBS-1)
+    src/ObsScanner.h
+    src/ObsScanner.cpp
+    src/ObsProfile.h
+    src/ObsProfile.cpp
+    src/ObsLayout.h
+    src/ObsLayout.cpp
+
+    # Sprint 16 — Affinity Photo / Designer / Publisher importers (US-AFF-1)
+    src/AffinityPsdImporter.h
+    src/AffinityPsdImporter.cpp
+    src/AffinityVectorImporter.h
+    src/AffinityVectorImporter.cpp
+
+    # Sprint 16 — Blender mesh importer (US-BLE-1)
+    src/BlenderMeshImporter.h
+    src/BlenderMeshImporter.cpp
+
+    # Sprint 16 — Unified import hub (US-INT-1)
+    src/ImportHubDialog.h
+    src/ImportHubDialog.cpp
+
     resources/resources.qrc
     ${APP_RESOURCES}
 )
@@ -318,6 +369,21 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     ${SWRESAMPLE_LIBRARY}
     ${AVFILTER_LIBRARY}
 )
+
+# Sprint 16 / US-AFF-1 / US-BLE-1: optional Qt6::Svg / Qt6::Pdf / assimp links.
+# All three are guarded so the build works whether or not they are installed.
+if(TARGET Qt6::Svg)
+    target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Svg)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VEDITOR_HAVE_QT_SVG=1)
+endif()
+if(TARGET Qt6::Pdf)
+    target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Pdf)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VEDITOR_HAVE_QT_PDF=1)
+endif()
+if(TARGET assimp::assimp)
+    target_link_libraries(${PROJECT_NAME} PRIVATE assimp::assimp)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VEDITOR_HAVE_ASSIMP=1)
+endif()
 
 if(WIN32)
     # opengl32 — needed for wglGetCurrentDC and the WGL_NV_DX_interop2 entry

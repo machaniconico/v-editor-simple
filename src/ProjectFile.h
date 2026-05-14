@@ -252,6 +252,13 @@ struct ProjectData {
     // restore defaults to keep older project files loadable.
     HDRSettings          hdrSettings;
     AIProcessingSettings aiSettings;
+
+    // US-INT-2: Sprint 16 — last-used mobile export device id (MobileDeviceProfile.id),
+    // empty when never set. Persisted under root["mobileExport"]["lastDeviceId"].
+    QString mobileExportLastDeviceId;
+    // US-INT-2: Sprint 16 — last folder browsed in ImportHubDialog,
+    // empty when never set. Persisted under root["lastImportFolder"].
+    QString lastImportFolder;
 };
 
 class ProjectFile

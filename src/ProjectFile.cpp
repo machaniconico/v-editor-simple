@@ -300,6 +300,16 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["aiSettings"] = ai;
     }
 
+    // US-INT-2: Sprint 16 — mobile export + import-hub UI memory.
+    // Always written so a saved project round-trips, but kept empty by default
+    // so projects without a saved selection compare identical to defaults.
+    {
+        QJsonObject mobile;
+        mobile["lastDeviceId"] = data.mobileExportLastDeviceId;
+        root["mobileExport"] = mobile;
+        root["lastImportFolder"] = data.lastImportFolder;
+    }
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -522,6 +532,16 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
         data.aiSettings.frameInterpFactor  = ai.value("frameInterpFactor").toInt(aiDefaults.frameInterpFactor);
     }
 
+    // US-INT-2: Sprint 16 — mobile export + import-hub UI memory (backward compat).
+    data.mobileExportLastDeviceId = QString();
+    if (root.contains("mobileExport")) {
+        const QJsonObject mobile = root["mobileExport"].toObject();
+        data.mobileExportLastDeviceId = mobile.value("lastDeviceId").toString();
+    }
+    data.lastImportFolder = QString();
+    if (root.contains("lastImportFolder"))
+        data.lastImportFolder = root["lastImportFolder"].toString();
+
     return true;
 }
 
@@ -742,6 +762,14 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["aiSettings"] = ai;
     }
 
+    // US-INT-2: Sprint 16 — mobile export + import-hub UI memory.
+    {
+        QJsonObject mobile;
+        mobile["lastDeviceId"] = data.mobileExportLastDeviceId;
+        root["mobileExport"] = mobile;
+        root["lastImportFolder"] = data.lastImportFolder;
+    }
+
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
 }
@@ -955,6 +983,16 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
         data.aiSettings.frameInterpEngine  = ai.value("frameInterpEngine").toString(aiDefaults.frameInterpEngine);
         data.aiSettings.frameInterpFactor  = ai.value("frameInterpFactor").toInt(aiDefaults.frameInterpFactor);
     }
+
+    // US-INT-2: Sprint 16 — mobile export + import-hub UI memory (backward compat).
+    data.mobileExportLastDeviceId = QString();
+    if (root.contains("mobileExport")) {
+        const QJsonObject mobile = root["mobileExport"].toObject();
+        data.mobileExportLastDeviceId = mobile.value("lastDeviceId").toString();
+    }
+    data.lastImportFolder = QString();
+    if (root.contains("lastImportFolder"))
+        data.lastImportFolder = root["lastImportFolder"].toString();
 
     return true;
 }

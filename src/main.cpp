@@ -11,6 +11,7 @@
 #include <QDebug>
 #include <QTimer>
 #include <QMetaObject>
+#include <QMetaMethod>
 #include <QTemporaryDir>
 #include <QPainter>
 #include <cmath>
@@ -129,6 +130,54 @@
 #if __has_include("PlanarTracker.h")
 #include "PlanarTracker.h"
 #define HAVE_PLANARTRACKER 1
+#endif
+
+// US-MOB-2: Sprint 16 mobile export self-test (VEDITOR_MOBILE_SELFTEST=1)
+#if __has_include("MobilePreset.h")
+#include "MobilePreset.h"
+#define HAVE_MOBILEPRESET 1
+#endif
+#if __has_include("MobileRotate.h")
+#include "MobileRotate.h"
+#define HAVE_MOBILEROTATE 1
+#endif
+
+// US-INT-2: Sprint 16 OBS / Affinity / Blender / Import-hub self-tests.
+#if __has_include("ObsScanner.h")
+#include "ObsScanner.h"
+#define HAVE_OBSSCANNER 1
+#endif
+#if __has_include("ObsProfile.h")
+#include "ObsProfile.h"
+#define HAVE_OBSPROFILE 1
+#endif
+#if __has_include("ObsLayout.h")
+#include "ObsLayout.h"
+#define HAVE_OBSLAYOUT 1
+#endif
+#if __has_include("AffinityPsdImporter.h")
+#include "AffinityPsdImporter.h"
+#define HAVE_AFFINITYPSD 1
+#endif
+#if __has_include("AffinityVectorImporter.h")
+#include "AffinityVectorImporter.h"
+#define HAVE_AFFINITYVECTOR 1
+#endif
+#if __has_include("BlenderMeshImporter.h")
+#include "BlenderMeshImporter.h"
+#define HAVE_BLENDERMESH 1
+#endif
+#if __has_include("BlenderBpyBridge.h")
+#include "BlenderBpyBridge.h"
+#define HAVE_BLENDERBPY 1
+#endif
+#if __has_include("BlenderExrReader.h")
+#include "BlenderExrReader.h"
+#define HAVE_BLENDEREXR 1
+#endif
+#if __has_include("ImportHubDialog.h")
+#include "ImportHubDialog.h"
+#define HAVE_IMPORTHUBDIALOG 1
 #endif
 
 // US-CAP-B: Sprint 14 caption self-test (VEDITOR_CAPTION_SELFTEST=1)
@@ -1926,6 +1975,228 @@ int runPlanarSelftest()
     return 0;
 }
 
+// US-MOB-2: Sprint 16 mobile export self-test (VEDITOR_MOBILE_SELFTEST=1)
+int runMobileSelftest()
+{
+    QString error;
+#ifdef HAVE_MOBILEPRESET
+    {
+        // US-MOB-2 AC-4: configForDevice(iphone_15_pro, 3840x2160, -14.0)
+        const mobile::DeviceProfile dev = mobile::deviceById(QStringLiteral("iphone_15_pro"));
+        const ExportConfig cfg = mobile::preset::configForDevice(dev, QSize(3840, 2160), -14.0);
+
+        if (!requireSelftest(!cfg.videoCodec.isEmpty(),
+                             QStringLiteral("MOB-2 AC-4: videoCodec is empty"), &error))
+            return 1;
+        if (!requireSelftest(cfg.videoBitrate <= dev.maxVideoBitrateKbps,
+                             QStringLiteral("MOB-2 AC-4: videoBitrate exceeds device max"), &error))
+            return 1;
+        if (!requireSelftest(cfg.hdr10,
+                             QStringLiteral("MOB-2 AC-4: hdr10 should be true for iPhone 15 Pro"), &error))
+            return 1;
+        if (!requireSelftest(cfg.container == QStringLiteral("mp4"),
+                             QStringLiteral("MOB-2 AC-4: container should be mp4"), &error))
+            return 1;
+        if (!requireSelftest(cfg.audioBitrate == 192,
+                             QStringLiteral("MOB-2 AC-4: audioBitrate should be 192"), &error))
+            return 1;
+    }
+#endif
+#ifdef HAVE_MOBILEROTATE
+    {
+        // US-MOB-2 AC-5: computeRotation(1920x1080, portrait target) → needsRotate=true
+        // Build a minimal portrait DeviceProfile (height > width)
+        mobile::DeviceProfile portraitDev;
+        portraitDev.id              = QStringLiteral("test_portrait");
+        portraitDev.displayName     = QStringLiteral("Test Portrait");
+        portraitDev.category        = mobile::Category::AndroidPhone;
+        portraitDev.maxResolution   = QSize(1080, 1920);  // portrait
+        portraitDev.maxFrameRate    = 30;
+        portraitDev.preferredCodec  = QStringLiteral("h264");
+        portraitDev.maxVideoBitrateKbps = 20000;
+        portraitDev.supportsHdr     = false;
+
+        const mobile::rotate::RotateDecision dec =
+            mobile::rotate::computeRotation(QSize(1920, 1080), portraitDev);
+
+        if (!requireSelftest(dec.needsRotate,
+                             QStringLiteral("MOB-2 AC-5: landscape→portrait needsRotate should be true"), &error))
+            return 1;
+        if (!requireSelftest(dec.angleDeg == 90,
+                             QStringLiteral("MOB-2 AC-5: angleDeg should be 90"), &error))
+            return 1;
+
+        // Same orientation: landscape source, landscape target → no rotation
+        mobile::DeviceProfile landscapeDev;
+        landscapeDev.maxResolution = QSize(1920, 1080); // landscape
+        const mobile::rotate::RotateDecision dec2 =
+            mobile::rotate::computeRotation(QSize(1920, 1080), landscapeDev);
+        if (!requireSelftest(!dec2.needsRotate,
+                             QStringLiteral("MOB-2: landscape→landscape needsRotate should be false"), &error))
+            return 1;
+
+        // isPortraitTarget
+        if (!requireSelftest(mobile::rotate::isPortraitTarget(portraitDev),
+                             QStringLiteral("MOB-2: isPortraitTarget portrait should be true"), &error))
+            return 1;
+        if (!requireSelftest(!mobile::rotate::isPortraitTarget(landscapeDev),
+                             QStringLiteral("MOB-2: isPortraitTarget landscape should be false"), &error))
+            return 1;
+
+        // applyRotation: 0° → same size; 90° → swapped dimensions
+        QImage img(320, 180, QImage::Format_ARGB32);
+        img.fill(Qt::red);
+        const QImage rot0 = mobile::rotate::applyRotation(img, 0);
+        if (!requireSelftest(rot0.width() == 320 && rot0.height() == 180,
+                             QStringLiteral("MOB-2: applyRotation(0°) size wrong"), &error))
+            return 1;
+        const QImage rot90 = mobile::rotate::applyRotation(img, 90);
+        if (!requireSelftest(rot90.width() == 180 && rot90.height() == 320,
+                             QStringLiteral("MOB-2: applyRotation(90°) size wrong"), &error))
+            return 1;
+    }
+#endif
+    qInfo().noquote() << QStringLiteral("MOBILE selftest OK");
+    return 0;
+}
+
+// US-INT-2: Sprint 16 OBS importer self-test (VEDITOR_OBS_SELFTEST=1).
+// Smoke-checks that scan / profile / layout entry points return empty lists
+// for non-existent inputs without throwing.
+int runObsSelftest()
+{
+    QString error;
+#if defined(HAVE_OBSSCANNER)
+    {
+        const QList<obs::scan::RecordingGroup> groups =
+            obs::scan::scanFolder(QStringLiteral("/nonexistent_obs_folder_xyz"));
+        if (!requireSelftest(groups.isEmpty(),
+                             QStringLiteral("INT-2 OBS: scanFolder('/nonexistent') should be empty"), &error))
+            return 1;
+    }
+#endif
+#if defined(HAVE_OBSPROFILE)
+    {
+        const QList<obs::profile::SceneInfo> scenes =
+            obs::profile::loadSceneCollection(QStringLiteral("/nonexistent_scene.json"));
+        if (!requireSelftest(scenes.isEmpty(),
+                             QStringLiteral("INT-2 OBS: loadSceneCollection('/nonexistent') should be empty"), &error))
+            return 1;
+    }
+#endif
+#if defined(HAVE_OBSLAYOUT)
+    {
+        const QList<obs::layout::TimelineClipPlacement> placements =
+            obs::layout::layoutToTimeline({}, {});
+        if (!requireSelftest(placements.isEmpty(),
+                             QStringLiteral("INT-2 OBS: layoutToTimeline({},{}) should be empty"), &error))
+            return 1;
+    }
+#endif
+    qInfo().noquote() << QStringLiteral("OBS selftest OK");
+    return 0;
+}
+
+// US-INT-2: Sprint 16 Affinity importer self-test (VEDITOR_AFFINITY_SELFTEST=1).
+int runAffinitySelftest()
+{
+    QString error;
+#if defined(HAVE_AFFINITYPSD)
+    {
+        const affinity::psd::PsdDocument doc =
+            affinity::psd::loadPsd(QStringLiteral("/nonexistent_file.psd"));
+        if (!requireSelftest(doc.canvasSize == QSize(0, 0),
+                             QStringLiteral("INT-2 AFF: loadPsd('/nonexistent') canvasSize should be (0,0)"), &error))
+            return 1;
+    }
+#endif
+#if defined(HAVE_AFFINITYVECTOR)
+    {
+        const QImage svg = affinity::vector::loadSvg(QStringLiteral("/nonexistent.svg"), QSize(0, 0));
+        if (!requireSelftest(svg.isNull(),
+                             QStringLiteral("INT-2 AFF: loadSvg('/nonexistent') should be null"), &error))
+            return 1;
+        const QImage tiff = affinity::vector::loadTiff(QStringLiteral("/nonexistent.tiff"));
+        if (!requireSelftest(tiff.isNull(),
+                             QStringLiteral("INT-2 AFF: loadTiff('/nonexistent') should be null"), &error))
+            return 1;
+    }
+#endif
+    qInfo().noquote() << QStringLiteral("AFFINITY selftest OK");
+    return 0;
+}
+
+// US-INT-2: Sprint 16 Blender importer self-test (VEDITOR_BLENDER_SELFTEST=1).
+int runBlenderSelftest()
+{
+    QString error;
+#if defined(HAVE_BLENDERMESH)
+    {
+        const blender::mesh::MeshData mesh =
+            blender::mesh::loadMeshFile(QStringLiteral("/nonexistent_mesh.obj"));
+        if (!requireSelftest(mesh.vertices.isEmpty(),
+                             QStringLiteral("INT-2 BLE: loadMeshFile('/nonexistent') vertices should be empty"), &error))
+            return 1;
+    }
+#endif
+#if defined(HAVE_BLENDERBPY)
+    {
+        const blender::bridge::BridgeResult res =
+            blender::bridge::runBpyScript(QString(), QString(), QStringList(), 1000);
+        if (!requireSelftest(res.exitCode == -1,
+                             QStringLiteral("INT-2 BLE: runBpyScript('','') exitCode should be -1"), &error))
+            return 1;
+    }
+#endif
+#if defined(HAVE_BLENDEREXR)
+    {
+        const QList<blender::exr::ExrFrame> frames =
+            blender::exr::loadExrSequence(QStringLiteral("/nonexistent_exr_dir"),
+                                          QStringLiteral("render_####.exr"));
+        if (!requireSelftest(frames.isEmpty(),
+                             QStringLiteral("INT-2 BLE: loadExrSequence('/nonexistent') should be empty"), &error))
+            return 1;
+    }
+#endif
+    qInfo().noquote() << QStringLiteral("BLENDER selftest OK");
+    return 0;
+}
+
+// US-INT-2: Sprint 16 Import-hub self-test (VEDITOR_IMPORT_SELFTEST=1).
+// Construct the dialog and verify it has its expected signals via QMetaObject.
+int runImportSelftest()
+{
+    QString error;
+#if defined(HAVE_IMPORTHUBDIALOG)
+    {
+        ImportHubDialog dialog;
+        const QMetaObject *mo = dialog.metaObject();
+        if (!requireSelftest(mo != nullptr,
+                             QStringLiteral("INT-2 IMP: metaObject() returned null"), &error))
+            return 1;
+        const int sig = mo->indexOfSignal(
+            "timelineImportRequested(QList<obs::layout::TimelineClipPlacement>)");
+        // The exact normalised signature may vary across Qt versions, so accept
+        // any signal whose name starts with "timelineImportRequested" as well.
+        bool hasTimelineSignal = (sig >= 0);
+        if (!hasTimelineSignal) {
+            for (int i = 0; i < mo->methodCount(); ++i) {
+                if (mo->method(i).methodType() == QMetaMethod::Signal &&
+                    QString::fromLatin1(mo->method(i).name()) == QLatin1String("timelineImportRequested")) {
+                    hasTimelineSignal = true;
+                    break;
+                }
+            }
+        }
+        if (!requireSelftest(hasTimelineSignal,
+                             QStringLiteral("INT-2 IMP: timelineImportRequested signal not found"), &error))
+            return 1;
+    }
+#endif
+    qInfo().noquote() << QStringLiteral("IMPORT selftest OK");
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -2138,6 +2409,26 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_PLANAR_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_PLANAR_SELFTEST");
         return runPlanarSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_MOBILE_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_MOBILE_SELFTEST");
+        return runMobileSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_OBS_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_OBS_SELFTEST");
+        return runObsSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_AFFINITY_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_AFFINITY_SELFTEST");
+        return runAffinitySelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_BLENDER_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_BLENDER_SELFTEST");
+        return runBlenderSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_IMPORT_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_IMPORT_SELFTEST");
+        return runImportSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");

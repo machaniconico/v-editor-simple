@@ -97,6 +97,8 @@ class AudioClipEditor;
 class ShortcutCustomizeDialog;
 class SocialExportDialog;
 class CaptionEditorDialog;
+class MobileExportDialog;
+class ImportHubDialog;
 
 namespace shortcut { class ShortcutManager; }
 
@@ -341,6 +343,12 @@ private slots:
 
     // US-CAP-B: Sprint 14 — 字幕エディタダイアログ
     void openCaptionEditorDialog();
+
+    // US-INT-1: Sprint 16 — モバイルデバイス向けエクスポートダイアログ
+    void onMobileExport();
+
+    // US-INT-1: Sprint 16 — 外部ツール取り込みハブ (OBS/Affinity/Blender)
+    void onImportHub();
 
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
@@ -609,6 +617,10 @@ private:
 
     // US-CAP-B: Sprint 14 — 字幕エディタダイアログ (modeless, 再利用)
     CaptionEditorDialog *m_captionEditorDialog = nullptr;
+
+    // US-INT-1: Sprint 16 — モバイルエクスポート / 取り込みハブ (modeless, 再利用)
+    MobileExportDialog *m_mobileExportDialog = nullptr;
+    ImportHubDialog *m_importHubDialog = nullptr;
 
     // Voice-over recording
     voiceover::VoiceOverDialog *m_voiceOverDialog = nullptr;
