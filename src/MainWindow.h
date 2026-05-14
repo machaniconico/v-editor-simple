@@ -100,6 +100,22 @@ class CaptionEditorDialog;
 class MobileExportDialog;
 class ImportHubDialog;
 
+// Sprint 17/18/19 — final integration (US-INT-3)
+class YoutubeUploadDialog;
+class CommentsDockWidget;
+class CollabHistoryDialog;
+class ColorMatchDialog;
+
+namespace youtube {
+namespace oauth   { class AuthClient; }
+namespace manager { class Manager; }
+}
+
+namespace collab {
+struct CommentTrack;
+namespace history { class HistoryLog; }
+}
+
 namespace shortcut { class ShortcutManager; }
 
 namespace voiceover {
@@ -349,6 +365,12 @@ private slots:
 
     // US-INT-1: Sprint 16 — 外部ツール取り込みハブ (OBS/Affinity/Blender)
     void onImportHub();
+
+    // US-INT-3: Sprint 17/18/19 — final integration menu slots.
+    void onYoutubeUpload();   // Sprint 17 (US-YT-4): YouTube アップロード dialog
+    void onCommentsPanel();   // Sprint 18 (US-COL-2): comment dock widget
+    void onCollabHistory();   // Sprint 18 (US-COL-4): version history dialog
+    void onColorMatch();      // Sprint 19 (US-CMA-3): auto color match dialog
 
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
@@ -621,6 +643,16 @@ private:
     // US-INT-1: Sprint 16 — モバイルエクスポート / 取り込みハブ (modeless, 再利用)
     MobileExportDialog *m_mobileExportDialog = nullptr;
     ImportHubDialog *m_importHubDialog = nullptr;
+
+    // US-INT-3: Sprint 17/18/19 — final integration members (modeless, 再利用 / lazy-create)
+    YoutubeUploadDialog          *m_youtubeUploadDialog = nullptr;
+    CommentsDockWidget           *m_commentsDock        = nullptr;
+    CollabHistoryDialog          *m_collabHistoryDialog = nullptr;
+    ColorMatchDialog             *m_colorMatchDialog    = nullptr;
+    youtube::oauth::AuthClient   *m_youtubeOAuth        = nullptr;
+    youtube::manager::Manager    *m_youtubeManager      = nullptr;
+    collab::CommentTrack         *m_commentTrack        = nullptr;
+    collab::history::HistoryLog  *m_collabHistoryLog    = nullptr;
 
     // Voice-over recording
     voiceover::VoiceOverDialog *m_voiceOverDialog = nullptr;

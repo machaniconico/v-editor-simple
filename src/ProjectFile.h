@@ -259,6 +259,18 @@ struct ProjectData {
     // US-INT-2: Sprint 16 — last folder browsed in ImportHubDialog,
     // empty when never set. Persisted under root["lastImportFolder"].
     QString lastImportFolder;
+
+    // US-INT-3: Sprint 17 — YouTube upload preferences. Persisted under
+    // root["youtube"]. All keys optional; older project files default to "".
+    QString youtubeLastChannelId;
+    QString youtubeLastPrivacy;        // "private" / "unlisted" / "public"
+
+    // US-INT-3: Sprint 18 — Collaboration session info. Persisted under root["collab"].
+    QString collabCurrentUserId;
+    QString collabCurrentDisplayName;
+
+    // US-INT-3: Sprint 19 — Auto color match memory. Persisted under root["colormatch"].
+    QString colorMatchLastReferenceClip;
 };
 
 class ProjectFile

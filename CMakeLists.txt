@@ -154,6 +154,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/PlanarTracker.h
     src/PlanarTrackerDialog.cpp
     src/PlanarTrackerDialog.h
+    src/ColorMatchAnalyzer.cpp
+    src/ColorMatchAnalyzer.h
+    src/ColorMatchLutGenerator.cpp
+    src/ColorMatchLutGenerator.h
     src/SurfaceTool.cpp
     src/SurfaceTool.h
     src/EqualizerPanel.cpp
@@ -343,6 +347,34 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # Sprint 16 — Unified import hub (US-INT-1)
     src/ImportHubDialog.h
     src/ImportHubDialog.cpp
+
+    # Sprint 18 — Collaboration (US-COL-1 / US-COL-2 / US-COL-4)
+    src/CollaborationModel.h
+    src/CollaborationModel.cpp
+    src/CommentsDockWidget.h
+    src/CommentsDockWidget.cpp
+    src/CollabHistoryLog.h
+    src/CollabHistoryLog.cpp
+    src/CollabHistoryDialog.h
+    src/CollabHistoryDialog.cpp
+
+    # Sprint 18 — Collaboration project share (US-COL-3)
+    src/CollabProjectShare.h
+    src/CollabProjectShare.cpp
+
+    # Sprint 17 — YouTube upload pipeline (US-YT-1 .. US-YT-4)
+    src/YoutubeOAuth.h
+    src/YoutubeOAuth.cpp
+    src/YoutubeUploadClient.h
+    src/YoutubeUploadClient.cpp
+    src/YoutubeUploadManager.h
+    src/YoutubeUploadManager.cpp
+    src/YoutubeUploadDialog.h
+    src/YoutubeUploadDialog.cpp
+
+    # Sprint 19 — Auto color matching dialog (US-CMA-3)
+    src/ColorMatchDialog.h
+    src/ColorMatchDialog.cpp
 
     resources/resources.qrc
     ${APP_RESOURCES}

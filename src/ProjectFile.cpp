@@ -310,6 +310,23 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["lastImportFolder"] = data.lastImportFolder;
     }
 
+    // US-INT-3: Sprint 17/18/19 — YouTube / Collab / ColorMatch UI memory.
+    {
+        QJsonObject youtube;
+        youtube["lastChannelId"] = data.youtubeLastChannelId;
+        youtube["lastPrivacy"]   = data.youtubeLastPrivacy;
+        root["youtube"] = youtube;
+
+        QJsonObject collab;
+        collab["currentUserId"]      = data.collabCurrentUserId;
+        collab["currentDisplayName"] = data.collabCurrentDisplayName;
+        root["collab"] = collab;
+
+        QJsonObject colormatch;
+        colormatch["lastReferenceClip"] = data.colorMatchLastReferenceClip;
+        root["colormatch"] = colormatch;
+    }
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -542,6 +559,27 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     if (root.contains("lastImportFolder"))
         data.lastImportFolder = root["lastImportFolder"].toString();
 
+    // US-INT-3: Sprint 17/18/19 — YouTube / Collab / ColorMatch UI memory (backward compat).
+    data.youtubeLastChannelId        = QString();
+    data.youtubeLastPrivacy          = QString();
+    if (root.contains("youtube")) {
+        const QJsonObject youtube = root["youtube"].toObject();
+        data.youtubeLastChannelId   = youtube.value("lastChannelId").toString();
+        data.youtubeLastPrivacy     = youtube.value("lastPrivacy").toString();
+    }
+    data.collabCurrentUserId         = QString();
+    data.collabCurrentDisplayName    = QString();
+    if (root.contains("collab")) {
+        const QJsonObject collab = root["collab"].toObject();
+        data.collabCurrentUserId       = collab.value("currentUserId").toString();
+        data.collabCurrentDisplayName  = collab.value("currentDisplayName").toString();
+    }
+    data.colorMatchLastReferenceClip = QString();
+    if (root.contains("colormatch")) {
+        const QJsonObject colormatch = root["colormatch"].toObject();
+        data.colorMatchLastReferenceClip = colormatch.value("lastReferenceClip").toString();
+    }
+
     return true;
 }
 
@@ -770,6 +808,23 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["lastImportFolder"] = data.lastImportFolder;
     }
 
+    // US-INT-3: Sprint 17/18/19 — YouTube / Collab / ColorMatch UI memory.
+    {
+        QJsonObject youtube;
+        youtube["lastChannelId"] = data.youtubeLastChannelId;
+        youtube["lastPrivacy"]   = data.youtubeLastPrivacy;
+        root["youtube"] = youtube;
+
+        QJsonObject collab;
+        collab["currentUserId"]      = data.collabCurrentUserId;
+        collab["currentDisplayName"] = data.collabCurrentDisplayName;
+        root["collab"] = collab;
+
+        QJsonObject colormatch;
+        colormatch["lastReferenceClip"] = data.colorMatchLastReferenceClip;
+        root["colormatch"] = colormatch;
+    }
+
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
 }
@@ -993,6 +1048,27 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.lastImportFolder = QString();
     if (root.contains("lastImportFolder"))
         data.lastImportFolder = root["lastImportFolder"].toString();
+
+    // US-INT-3: Sprint 17/18/19 — YouTube / Collab / ColorMatch UI memory (backward compat).
+    data.youtubeLastChannelId        = QString();
+    data.youtubeLastPrivacy          = QString();
+    if (root.contains("youtube")) {
+        const QJsonObject youtube = root["youtube"].toObject();
+        data.youtubeLastChannelId   = youtube.value("lastChannelId").toString();
+        data.youtubeLastPrivacy     = youtube.value("lastPrivacy").toString();
+    }
+    data.collabCurrentUserId         = QString();
+    data.collabCurrentDisplayName    = QString();
+    if (root.contains("collab")) {
+        const QJsonObject collab = root["collab"].toObject();
+        data.collabCurrentUserId       = collab.value("currentUserId").toString();
+        data.collabCurrentDisplayName  = collab.value("currentDisplayName").toString();
+    }
+    data.colorMatchLastReferenceClip = QString();
+    if (root.contains("colormatch")) {
+        const QJsonObject colormatch = root["colormatch"].toObject();
+        data.colorMatchLastReferenceClip = colormatch.value("lastReferenceClip").toString();
+    }
 
     return true;
 }

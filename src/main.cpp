@@ -180,6 +180,32 @@
 #define HAVE_IMPORTHUBDIALOG 1
 #endif
 
+// US-INT-3: Sprint 17 YouTube upload self-test (VEDITOR_YOUTUBE_SELFTEST=1)
+#if __has_include("YoutubeOAuth.h")
+#include "YoutubeOAuth.h"
+#define HAVE_YOUTUBE_OAUTH 1
+#endif
+#if __has_include("YoutubeUploadManager.h")
+#include "YoutubeUploadManager.h"
+#define HAVE_YOUTUBE_MANAGER 1
+#endif
+
+// US-INT-3: Sprint 18 Collaboration self-test (VEDITOR_COLLAB_SELFTEST=1)
+#if __has_include("CollaborationModel.h")
+#include "CollaborationModel.h"
+#define HAVE_COLLABMODEL 1
+#endif
+
+// US-INT-3: Sprint 19 Color match self-test (VEDITOR_COLORMATCH_SELFTEST=1)
+#if __has_include("ColorMatchAnalyzer.h")
+#include "ColorMatchAnalyzer.h"
+#define HAVE_COLORMATCH_ANALYZE 1
+#endif
+#if __has_include("ColorMatchLutGenerator.h")
+#include "ColorMatchLutGenerator.h"
+#define HAVE_COLORMATCH_LUT 1
+#endif
+
 // US-CAP-B: Sprint 14 caption self-test (VEDITOR_CAPTION_SELFTEST=1)
 #if __has_include("CaptionTrack.h")
 #include "CaptionTrack.h"
@@ -2197,6 +2223,166 @@ int runImportSelftest()
     return 0;
 }
 
+// US-INT-3: Sprint 17 YouTube upload self-test (VEDITOR_YOUTUBE_SELFTEST=1).
+// Smoke-checks that the OAuth AuthClient + upload Manager can be constructed
+// without a real network connection. Does NOT actually upload anything.
+int runYoutubeSelftest()
+{
+    QString error;
+#if defined(HAVE_YOUTUBE_OAUTH)
+    {
+        const youtube::oauth::YoutubeOAuthConfig cfg =
+            youtube::oauth::YoutubeOAuthConfig::defaultConfig();
+        if (!requireSelftest(!cfg.redirectUri.isEmpty(),
+                             QStringLiteral("YT-1: defaultConfig.redirectUri should not be empty"), &error))
+            return 1;
+        if (!requireSelftest(!cfg.scope.isEmpty(),
+                             QStringLiteral("YT-1: defaultConfig.scope should not be empty"), &error))
+            return 1;
+
+        youtube::oauth::AuthClient client(cfg);
+        if (!requireSelftest(client.callbackPort() == 0,
+                             QStringLiteral("YT-1: callbackPort should be 0 before launchAuthFlow"), &error))
+            return 1;
+        if (!requireSelftest(!client.currentToken().isValid(),
+                             QStringLiteral("YT-1: currentToken should be invalid initially"), &error))
+            return 1;
+
+#if defined(HAVE_YOUTUBE_MANAGER)
+        youtube::manager::Manager mgr(&client);
+        // Static helpers from upload::Client are used by Manager internally;
+        // verify chunk-size constant + addJob early-fail on missing file.
+        if (!requireSelftest(youtube::manager::Manager::kChunkSize > 0,
+                             QStringLiteral("YT-3: kChunkSize must be positive"), &error))
+            return 1;
+        const QByteArray cr = youtube::upload::Client::buildContentRange(0, 1024, 4096);
+        if (!requireSelftest(!cr.isEmpty(),
+                             QStringLiteral("YT-2: buildContentRange should produce a non-empty header"), &error))
+            return 1;
+        const qint64 end = youtube::upload::Client::parseRangeHeaderEnd(
+            QByteArray("bytes=0-1023"));
+        if (!requireSelftest(end == 1023,
+                             QStringLiteral("YT-2: parseRangeHeaderEnd should return 1023"), &error))
+            return 1;
+
+        const youtube::upload::UploadMetadata meta{
+            QStringLiteral("selftest"), QStringLiteral("desc"), {}, QStringLiteral("private"), 22 };
+        const QString jobId = mgr.addJob(QStringLiteral("/nonexistent_video.mp4"), meta);
+        // addJob with missing file → state Failed (sync emit jobFailed)
+        if (!requireSelftest(!jobId.isEmpty(),
+                             QStringLiteral("YT-3: addJob should return a non-empty id even for missing file"), &error))
+            return 1;
+        if (!requireSelftest(mgr.jobState(jobId) == youtube::manager::State::Failed,
+                             QStringLiteral("YT-3: missing-file job should land in Failed state"), &error))
+            return 1;
+#endif
+    }
+#endif
+    qInfo().noquote() << QStringLiteral("YOUTUBE selftest OK");
+    return 0;
+}
+
+// US-INT-3: Sprint 18 Collaboration self-test (VEDITOR_COLLAB_SELFTEST=1).
+// Exercises CommentTrack add/reply/markResolved + JSON round-trip.
+int runCollabSelftest()
+{
+    QString error;
+#if defined(HAVE_COLLABMODEL)
+    {
+        collab::CommentTrack ct;
+        const collab::Comment c1 =
+            ct.addComment(QStringLiteral("u1"), 1000, QStringLiteral("hi"));
+        if (!requireSelftest(!c1.id.isEmpty(),
+                             QStringLiteral("COL: addComment must return a non-empty id"), &error))
+            return 1;
+
+        const collab::Comment r1 =
+            ct.replyTo(c1.id, QStringLiteral("u2"), QStringLiteral("reply"));
+        if (!requireSelftest(!r1.id.isEmpty(),
+                             QStringLiteral("COL: replyTo must return a non-empty id"), &error))
+            return 1;
+        if (!requireSelftest(r1.parentId == c1.id,
+                             QStringLiteral("COL: replyTo parentId mismatch"), &error))
+            return 1;
+
+        if (!requireSelftest(ct.markResolved(c1.id),
+                             QStringLiteral("COL: markResolved should succeed"), &error))
+            return 1;
+
+        if (!requireSelftest(ct.topLevelComments().size() == 1,
+                             QStringLiteral("COL: topLevelComments() should have 1 entry"), &error))
+            return 1;
+        if (!requireSelftest(ct.repliesOf(c1.id).size() == 1,
+                             QStringLiteral("COL: repliesOf(c1) should have 1 entry"), &error))
+            return 1;
+
+        // JSON round-trip
+        const QJsonObject json = ct.toJson();
+        const collab::CommentTrack ct2 = collab::CommentTrack::fromJson(json);
+        if (!requireSelftest(ct2.comments.size() == ct.comments.size(),
+                             QStringLiteral("COL: round-trip comment count mismatch"), &error))
+            return 1;
+        if (!requireSelftest(ct2.topLevelComments().size() == 1,
+                             QStringLiteral("COL: round-trip topLevelComments mismatch"), &error))
+            return 1;
+        if (!requireSelftest(ct2.repliesOf(c1.id).size() == 1,
+                             QStringLiteral("COL: round-trip repliesOf mismatch"), &error))
+            return 1;
+    }
+#endif
+    qInfo().noquote() << QStringLiteral("COLLAB selftest OK");
+    return 0;
+}
+
+// US-INT-3: Sprint 19 Color match self-test (VEDITOR_COLORMATCH_SELFTEST=1).
+// Analyses two solid-colour QImages, generates a 33-step LUT, and writes a
+// .cube file to QDir::tempPath() to confirm the export pipeline works end-to-end.
+int runColorMatchSelftest()
+{
+    QString error;
+#if defined(HAVE_COLORMATCH_ANALYZE) && defined(HAVE_COLORMATCH_LUT)
+    {
+        QImage red(100, 100, QImage::Format_ARGB32);
+        red.fill(qRgb(200, 50, 50));
+        const colormatch::analyze::ColorStats sR =
+            colormatch::analyze::analyzeImage(red);
+        if (!requireSelftest(sR.sampleCount > 0,
+                             QStringLiteral("CMA: analyzeImage(red) should produce samples"), &error))
+            return 1;
+
+        QImage blue(100, 100, QImage::Format_ARGB32);
+        blue.fill(qRgb(50, 50, 200));
+        const colormatch::analyze::ColorStats sB =
+            colormatch::analyze::analyzeImage(blue);
+        if (!requireSelftest(sB.sampleCount > 0,
+                             QStringLiteral("CMA: analyzeImage(blue) should produce samples"), &error))
+            return 1;
+
+        const colormatch::lut::Lut3D lut =
+            colormatch::lut::generateMatchLut(sR, sB, 33);
+        if (!requireSelftest(lut.size == 33,
+                             QStringLiteral("CMA: LUT size should be 33"), &error))
+            return 1;
+        if (!requireSelftest(lut.data.size() == 33 * 33 * 33,
+                             QStringLiteral("CMA: LUT data size should be 33^3"), &error))
+            return 1;
+
+        const QString outPath = QDir::tempPath() + QStringLiteral("/veditor_colormatch_selftest.cube");
+        QFile::remove(outPath);
+        const bool ok = colormatch::lut::exportCube(lut, outPath);
+        if (!requireSelftest(ok,
+                             QStringLiteral("CMA: exportCube should succeed"), &error))
+            return 1;
+        if (!requireSelftest(QFile::exists(outPath),
+                             QStringLiteral("CMA: exported .cube file should exist on disk"), &error))
+            return 1;
+        QFile::remove(outPath);
+    }
+#endif
+    qInfo().noquote() << QStringLiteral("COLORMATCH selftest OK");
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -2429,6 +2615,18 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_IMPORT_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_IMPORT_SELFTEST");
         return runImportSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_YOUTUBE_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_YOUTUBE_SELFTEST");
+        return runYoutubeSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_COLLAB_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_COLLAB_SELFTEST");
+        return runCollabSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_COLORMATCH_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_COLORMATCH_SELFTEST");
+        return runColorMatchSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");

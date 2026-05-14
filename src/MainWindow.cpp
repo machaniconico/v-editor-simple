@@ -54,6 +54,32 @@
   #include "ImportHubDialog.h"
   #define HAVE_IMPORT_HUB 1
 #endif
+
+// US-INT-3: Sprint 17 — YouTube upload pipeline (optional includes).
+// Guarded by __has_include so that workers / partial trees still compile.
+#if __has_include("YoutubeUploadDialog.h")
+  #include "YoutubeOAuth.h"
+  #include "YoutubeUploadClient.h"
+  #include "YoutubeUploadManager.h"
+  #include "YoutubeUploadDialog.h"
+  #define HAVE_YOUTUBE 1
+#endif
+
+// US-INT-3: Sprint 18 — Collaboration (comments / version history) optional includes.
+#if __has_include("CommentsDockWidget.h")
+  #include "CollaborationModel.h"
+  #include "CommentsDockWidget.h"
+  #include "CollabProjectShare.h"
+  #include "CollabHistoryLog.h"
+  #include "CollabHistoryDialog.h"
+  #define HAVE_COLLAB 1
+#endif
+
+// US-INT-3: Sprint 19 — Auto color matching dialog (optional include).
+#if __has_include("ColorMatchDialog.h")
+  #include "ColorMatchDialog.h"
+  #define HAVE_COLORMATCH 1
+#endif
 #include <QApplication>
 #include <QMessageBox>
 #include <QMenu>
@@ -1975,6 +2001,46 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::openPlanarTrackerDialog);
     m_menuHelpEntries.append({planarTrackerAction,
         QStringLiteral("4 点コーナーピンで平面 (看板・画面・顔など) を時系列追跡し、AI マスクや 2D エフェクトを貼り付けに使えます。")});
+
+    // US-INT-3: Sprint 17/18/19 — YouTube upload / collaboration / auto color match.
+    toolsMenu->addSeparator();
+#ifdef HAVE_YOUTUBE
+    auto *youtubeUploadAction = toolsMenu->addAction(
+        QStringLiteral("YouTube アップロード(&Y)…"));
+    youtubeUploadAction->setObjectName("action_youtube_upload");
+    connect(youtubeUploadAction, &QAction::triggered,
+            this, &MainWindow::onYoutubeUpload);
+    m_menuHelpEntries.append({youtubeUploadAction,
+        QStringLiteral("Google アカウントで認証し、書き出し済みの動画を YouTube に直接アップロードします (resumable upload + 自動 retry)。")});
+#endif
+
+#ifdef HAVE_COLLAB
+    auto *commentsPanelAction = toolsMenu->addAction(
+        QStringLiteral("コラボレーションパネル(&L)…"));
+    commentsPanelAction->setObjectName("action_comments_panel");
+    connect(commentsPanelAction, &QAction::triggered,
+            this, &MainWindow::onCommentsPanel);
+    m_menuHelpEntries.append({commentsPanelAction,
+        QStringLiteral("クリップにタイムコード付きコメントを残せる Frame.io 風コラボパネルを表示します (返信/解決/履歴対応)。")});
+
+    auto *collabHistoryAction = toolsMenu->addAction(
+        QStringLiteral("変更履歴(&H)…"));
+    collabHistoryAction->setObjectName("action_collab_history");
+    connect(collabHistoryAction, &QAction::triggered,
+            this, &MainWindow::onCollabHistory);
+    m_menuHelpEntries.append({collabHistoryAction,
+        QStringLiteral("プロジェクトの変更履歴 (誰がいつ何をしたか) を一覧し、過去のスナップショットへ戻すためのダイアログを開きます。")});
+#endif
+
+#ifdef HAVE_COLORMATCH
+    auto *colorMatchAction = toolsMenu->addAction(
+        QStringLiteral("自動カラーマッチ(&C)…"));
+    colorMatchAction->setObjectName("action_color_match");
+    connect(colorMatchAction, &QAction::triggered,
+            this, &MainWindow::onColorMatch);
+    m_menuHelpEntries.append({colorMatchAction,
+        QStringLiteral("基準クリップと対象クリップを選び、平均/分散から 3D LUT を生成して色味を自動的に合わせます (.cube 書き出し対応)。")});
+#endif
 
     // US-SNS-7: LoudnessPanel dock (created here so menu action can reference it)
     m_loudnessDock = new QDockWidget("ラウドネスパネル", this);
@@ -7589,6 +7655,94 @@ void MainWindow::onImportHub()
 #else
     QMessageBox::information(this, QStringLiteral("取り込みハブ"),
         QStringLiteral("ImportHubDialog がビルドに含まれていません。"));
+#endif
+}
+
+// US-INT-3: Sprint 17 — open / raise the YouTube upload dialog (modeless).
+// Lazy-creates a YoutubeOAuth AuthClient + Manager pair (Manager non-owning ref to
+// AuthClient) and a single dialog re-used across invocations.
+void MainWindow::onYoutubeUpload()
+{
+#ifdef HAVE_YOUTUBE
+    if (!m_youtubeOAuth) {
+        m_youtubeOAuth = new youtube::oauth::AuthClient(
+            youtube::oauth::YoutubeOAuthConfig::defaultConfig(), this);
+    }
+    if (!m_youtubeManager) {
+        m_youtubeManager = new youtube::manager::Manager(m_youtubeOAuth, this);
+    }
+    if (!m_youtubeUploadDialog) {
+        m_youtubeUploadDialog = new YoutubeUploadDialog(m_youtubeManager, this);
+        m_youtubeUploadDialog->setObjectName(QStringLiteral("youtubeUploadDialog"));
+    }
+    m_youtubeUploadDialog->show();
+    m_youtubeUploadDialog->raise();
+    m_youtubeUploadDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("YouTube アップロード"),
+        QStringLiteral("YoutubeUploadDialog がビルドに含まれていません。"));
+#endif
+}
+
+// US-INT-3: Sprint 18 — toggle the comment dock (lazy-create on first use).
+// Backed by a single CommentTrack that lives for the lifetime of MainWindow so
+// that multiple invocations of the panel see the same comment list.
+void MainWindow::onCommentsPanel()
+{
+#ifdef HAVE_COLLAB
+    if (!m_commentTrack) {
+        m_commentTrack = new collab::CommentTrack();
+    }
+    if (!m_commentsDock) {
+        m_commentsDock = new CommentsDockWidget(m_commentTrack, this);
+        m_commentsDock->setObjectName(QStringLiteral("commentsDock"));
+        addDockWidget(Qt::RightDockWidgetArea, m_commentsDock);
+    }
+    m_commentsDock->show();
+    m_commentsDock->raise();
+#else
+    QMessageBox::information(this, QStringLiteral("コラボレーションパネル"),
+        QStringLiteral("CommentsDockWidget がビルドに含まれていません。"));
+#endif
+}
+
+// US-INT-3: Sprint 18 — open / raise the version-history dialog (modeless).
+// Backed by a single HistoryLog that lives for the lifetime of MainWindow.
+void MainWindow::onCollabHistory()
+{
+#ifdef HAVE_COLLAB
+    if (!m_collabHistoryLog) {
+        m_collabHistoryLog = new collab::history::HistoryLog();
+    }
+    if (!m_collabHistoryDialog) {
+        m_collabHistoryDialog = new CollabHistoryDialog(m_collabHistoryLog, this);
+        m_collabHistoryDialog->setObjectName(QStringLiteral("collabHistoryDialog"));
+    }
+    m_collabHistoryDialog->show();
+    m_collabHistoryDialog->raise();
+    m_collabHistoryDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("変更履歴"),
+        QStringLiteral("CollabHistoryDialog がビルドに含まれていません。"));
+#endif
+}
+
+// US-INT-3: Sprint 19 — open / raise the auto color match dialog (modeless).
+// The dialog itself is stateless beyond the user-selected images, so a single
+// instance is reused across invocations.
+void MainWindow::onColorMatch()
+{
+#ifdef HAVE_COLORMATCH
+    if (!m_colorMatchDialog) {
+        m_colorMatchDialog = new ColorMatchDialog(this);
+        m_colorMatchDialog->setObjectName(QStringLiteral("colorMatchDialog"));
+    }
+    m_colorMatchDialog->show();
+    m_colorMatchDialog->raise();
+    m_colorMatchDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("自動カラーマッチ"),
+        QStringLiteral("ColorMatchDialog がビルドに含まれていません。"));
 #endif
 }
 
