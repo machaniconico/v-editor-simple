@@ -15,6 +15,7 @@
 #include <QMutexLocker>
 #include <QDebug>
 #include <QTimer>
+#include <QEventLoop>
 #include <QMetaObject>
 #include <QMetaMethod>
 #include <QTemporaryDir>
@@ -279,6 +280,36 @@
 #if __has_include("BatchExportQueue.h")
 #include "BatchExportQueue.h"
 #define HAVE_BATCHEXPORT_QUEUE 1
+#endif
+
+// US-INT-1: Sprint 22 chroma/audio-restore/anim-export/easing/subxlat/lower-third/watermark self-tests.
+#if __has_include("ChromaKeyRefine.h")
+#include "ChromaKeyRefine.h"
+#define HAVE_CHROMA_KEY_REFINE 1
+#endif
+#if __has_include("AudioRestoration.h")
+#include "AudioRestoration.h"
+#define HAVE_AUDIO_RESTORATION 1
+#endif
+#if __has_include("AnimatedExport.h")
+#include "AnimatedExport.h"
+#define HAVE_ANIMATED_EXPORT 1
+#endif
+#if __has_include("EasingCurveModel.h")
+#include "EasingCurveModel.h"
+#define HAVE_EASING_CURVE 1
+#endif
+#if __has_include("SubtitleTranslator.h")
+#include "SubtitleTranslator.h"
+#define HAVE_SUBTITLE_TRANSLATOR 1
+#endif
+#if __has_include("LowerThirdTemplates.h")
+#include "LowerThirdTemplates.h"
+#define HAVE_LOWER_THIRD 1
+#endif
+#if __has_include("WatermarkOverlay.h")
+#include "WatermarkOverlay.h"
+#define HAVE_WATERMARK_OVERLAY 1
 #endif
 
 // US-CAP-B: Sprint 14 caption self-test (VEDITOR_CAPTION_SELFTEST=1)
@@ -2926,6 +2957,250 @@ int runBatchExportSelftest()
     return 0;
 }
 
+// US-INT-1: Sprint 22 chroma-key refine self-test (VEDITOR_CHROMA_SELFTEST=1).
+int runChromaSelftest()
+{
+    QString error;
+#if defined(HAVE_CHROMA_KEY_REFINE)
+    {
+        chromakey::KeyConfig cfg;
+        cfg.keyColor = QColor(0, 255, 0);
+        const double keyedAlpha = chromakey::computeAlpha(cfg.keyColor, cfg);
+        if (!requireSelftest(keyedAlpha < 0.1,
+                             QStringLiteral("CHROMA: key colour should be keyed out (alpha < 0.1)"),
+                             &error))
+            return 1;
+
+        const double magentaAlpha = chromakey::computeAlpha(QColor(255, 0, 255), cfg);
+        if (!requireSelftest(magentaAlpha > 0.9,
+                             QStringLiteral("CHROMA: magenta should stay opaque (alpha > 0.9)"),
+                             &error))
+            return 1;
+    }
+#endif
+    qInfo() << "CHROMA selftest OK";
+    return 0;
+}
+
+// US-INT-1: Sprint 22 audio restoration self-test (VEDITOR_AUDIORESTORE_SELFTEST=1).
+int runAudioRestoreSelftest()
+{
+    QString error;
+#if defined(HAVE_AUDIO_RESTORATION)
+    {
+        const int sampleRate = 48000;
+        const double humHz   = 50.0;
+        QVector<float> buf;
+        buf.reserve(sampleRate);
+        for (int i = 0; i < sampleRate; ++i) {
+            const double t = static_cast<double>(i) / sampleRate;
+            buf.append(static_cast<float>(std::sin(2.0 * M_PI * humHz * t)));
+        }
+
+        auto rms = [](const QVector<float> &v) {
+            double acc = 0.0;
+            for (float s : v)
+                acc += static_cast<double>(s) * static_cast<double>(s);
+            return v.isEmpty() ? 0.0 : std::sqrt(acc / v.size());
+        };
+
+        const double preRms = rms(buf);
+        QVector<float> processed = buf;
+        audiorestore::deHum(processed, sampleRate, humHz, 4);
+        const double postRms = rms(processed);
+
+        if (!requireSelftest(preRms > 1e-6,
+                             QStringLiteral("AUDIORESTORE: synthesized hum should have non-zero RMS"),
+                             &error))
+            return 1;
+        if (!requireSelftest(postRms < preRms * 0.5,
+                             QStringLiteral("AUDIORESTORE: deHum should attenuate 50Hz RMS by >50%"),
+                             &error))
+            return 1;
+    }
+#endif
+    qInfo() << "AUDIORESTORE selftest OK";
+    return 0;
+}
+
+// US-INT-1: Sprint 22 animated export self-test (VEDITOR_ANIMEXPORT_SELFTEST=1).
+int runAnimExportSelftest()
+{
+    QString error;
+#if defined(HAVE_ANIMATED_EXPORT)
+    {
+        QImage img(64, 64, QImage::Format_ARGB32);
+        for (int y = 0; y < img.height(); ++y) {
+            for (int x = 0; x < img.width(); ++x) {
+                img.setPixelColor(x, y,
+                                  QColor((x * 4) % 256, (y * 4) % 256,
+                                         ((x + y) * 2) % 256));
+            }
+        }
+
+        const QVector<QRgb> pal = animexport::medianCutPalette(img, 256);
+        if (!requireSelftest(pal.size() > 0 && pal.size() <= 256,
+                             QStringLiteral("ANIMEXPORT: palette size should be in (0, 256]"),
+                             &error))
+            return 1;
+
+        animexport::ExportConfig cfg;
+        cfg.format = animexport::Format::Gif;
+        cfg.fps    = 12;
+        cfg.width  = 64;
+        if (!requireSelftest(cfg.fps > 0 && cfg.width > 0,
+                             QStringLiteral("ANIMEXPORT: ExportConfig round-trip failed"),
+                             &error))
+            return 1;
+    }
+#endif
+    qInfo() << "ANIMEXPORT selftest OK";
+    return 0;
+}
+
+// US-INT-1: Sprint 22 easing curve self-test (VEDITOR_EASING_SELFTEST=1).
+int runEasingSelftest()
+{
+    QString error;
+#if defined(HAVE_EASING_CURVE)
+    {
+        const double lin = easing::evaluate(easing::EasingType::Linear, 0.5, {});
+        if (!requireSelftest(qFuzzyCompare(lin + 1.0, 0.5 + 1.0),
+                             QStringLiteral("EASING: Linear(0.5) should be 0.5"),
+                             &error))
+            return 1;
+
+        if (!requireSelftest(easing::presets().size() >= 8,
+                             QStringLiteral("EASING: expected >= 8 presets"),
+                             &error))
+            return 1;
+    }
+#endif
+    qInfo() << "EASING selftest OK";
+    return 0;
+}
+
+// US-INT-1: Sprint 22 subtitle translator self-test (VEDITOR_SUBXLAT_SELFTEST=1).
+int runSubXlatSelftest()
+{
+    QString error;
+#if defined(HAVE_SUBTITLE_TRANSLATOR) && defined(HAVE_CAPTIONTRACK)
+    {
+        caption::Track track;
+        caption::Clip c1;
+        c1.startMs = 0;
+        c1.endMs   = 1000;
+        c1.text    = QStringLiteral("hello");
+        track.addClip(c1);
+        caption::Clip c2;
+        c2.startMs = 1000;
+        c2.endMs   = 2000;
+        c2.text    = QStringLiteral("world");
+        track.addClip(c2);
+
+        subxlat::TranslateConfig cfg;
+        cfg.provider   = subxlat::Provider::Stub;
+        cfg.targetLang = QStringLiteral("ja");
+
+        subxlat::TranslatorClient client;
+        caption::Track captured;
+        bool gotResult = false;
+        QObject::connect(&client, &subxlat::TranslatorClient::translateFinished,
+                         [&](const caption::Track &t) {
+                             captured  = t;
+                             gotResult = true;
+                         });
+
+        // Stub provider emits translateFinished synchronously from translateTrack.
+        client.translateTrack(track, cfg);
+
+        if (!gotResult) {
+            QEventLoop loop;
+            QTimer::singleShot(2000, &loop, &QEventLoop::quit);
+            QObject::connect(&client, &subxlat::TranslatorClient::translateFinished,
+                             &loop, &QEventLoop::quit);
+            loop.exec();
+        }
+
+        if (!requireSelftest(gotResult,
+                             QStringLiteral("SUBXLAT: translateFinished was not emitted"),
+                             &error))
+            return 1;
+        if (!requireSelftest(captured.clipCount() == 2,
+                             QStringLiteral("SUBXLAT: translated track should hold 2 clips"),
+                             &error))
+            return 1;
+        if (!requireSelftest(captured.clipAt(0).text.startsWith(QStringLiteral("[ja]")),
+                             QStringLiteral("SUBXLAT: clip text should start with \"[ja]\""),
+                             &error))
+            return 1;
+    }
+#endif
+    qInfo() << "SUBXLAT selftest OK";
+    return 0;
+}
+
+// US-INT-1: Sprint 22 lower-third templates self-test (VEDITOR_LOWERTHIRD_SELFTEST=1).
+int runLowerThirdSelftest()
+{
+    QString error;
+#if defined(HAVE_LOWER_THIRD)
+    {
+        const QVector<lowerthird::LowerThirdStyle> styles = lowerthird::builtInStyles();
+        if (!requireSelftest(styles.size() >= 10,
+                             QStringLiteral("LOWERTHIRD: expected >= 10 built-in styles"),
+                             &error))
+            return 1;
+
+        auto countOpaque = [](const QImage &img) {
+            int n = 0;
+            for (int y = 0; y < img.height(); ++y) {
+                for (int x = 0; x < img.width(); ++x) {
+                    if (qAlpha(img.pixel(x, y)) > 0)
+                        ++n;
+                }
+            }
+            return n;
+        };
+
+        const QImage a = lowerthird::renderFrame(styles[0], 0.0, QSize(640, 360));
+        const QImage b = lowerthird::renderFrame(styles[0], 1.0, QSize(640, 360));
+        const int na = countOpaque(a);
+        const int nb = countOpaque(b);
+        if (!requireSelftest(nb > na,
+                             QStringLiteral("LOWERTHIRD: progress=1.0 should be more visible than 0.0"),
+                             &error))
+            return 1;
+    }
+#endif
+    qInfo() << "LOWERTHIRD selftest OK";
+    return 0;
+}
+
+// US-INT-1: Sprint 22 watermark overlay self-test (VEDITOR_WATERMARK_SELFTEST=1).
+int runWatermarkSelftest()
+{
+    QString error;
+#if defined(HAVE_WATERMARK_OVERLAY)
+    {
+        QImage img(320, 240, QImage::Format_ARGB32);
+        img.fill(QColor(40, 80, 120));
+
+        watermark::WmConfig cfg;
+        cfg.mode = watermark::Mode::Text;
+        cfg.text = QStringLiteral("X");
+
+        const QImage out = watermark::applyWatermark(img, cfg);
+        if (!requireSelftest(!out.isNull() && out.size() == img.size(),
+                             QStringLiteral("WATERMARK: output must be non-null and same size"),
+                             &error))
+            return 1;
+    }
+#endif
+    qInfo() << "WATERMARK selftest OK";
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -3226,6 +3501,34 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_BATCHEXPORT_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_BATCHEXPORT_SELFTEST");
         return runBatchExportSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_CHROMA_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_CHROMA_SELFTEST");
+        return runChromaSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_AUDIORESTORE_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_AUDIORESTORE_SELFTEST");
+        return runAudioRestoreSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_ANIMEXPORT_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_ANIMEXPORT_SELFTEST");
+        return runAnimExportSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_EASING_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_EASING_SELFTEST");
+        return runEasingSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_SUBXLAT_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_SUBXLAT_SELFTEST");
+        return runSubXlatSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_LOWERTHIRD_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_LOWERTHIRD_SELFTEST");
+        return runLowerThirdSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_WATERMARK_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_WATERMARK_SELFTEST");
+        return runWatermarkSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");

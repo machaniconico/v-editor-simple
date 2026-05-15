@@ -113,6 +113,16 @@ class HdrGradingDialog;
 class MultiCamSyncDialog;
 class BatchExportDialog;
 
+// US-INT-2: Sprint 22 — keying / restoration / animated export / easing /
+// subtitle translation / lower-third / watermark.
+class ChromaKeyRefineDialog;
+class AudioRestorationDialog;
+class AnimatedExportDialog;
+class EasingCurveEditorDialog;
+class SubtitleTranslatorDialog;
+class LowerThirdDialog;
+class WatermarkDialog;
+
 // Sprint 17/18/19 — final integration (US-INT-3)
 class YoutubeUploadDialog;
 class CommentsDockWidget;
@@ -414,6 +424,16 @@ private slots:
     void openMultiCamSyncDialog();
     void openBatchExportDialog();
 
+    // US-INT-2: Sprint 22 — keying / restoration / animated export / easing /
+    // subtitle translation / lower-third / watermark.
+    void openChromaKeyDialog();
+    void openAudioRestoreDialog();
+    void openAnimExportDialog();
+    void openEasingEditorDialog();
+    void openSubtitleTranslatorDialog();
+    void openLowerThirdDialog();
+    void openWatermarkDialog();
+
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
     void editFavorites();
@@ -714,6 +734,16 @@ private:
     HdrGradingDialog                   *m_hdrDialog;
     MultiCamSyncDialog                 *m_multiCamSyncDialog;
     BatchExportDialog                  *m_batchExportDialog;
+
+    // US-INT-2: Sprint 22 — keying / restoration / animated export / easing /
+    // subtitle translation / lower-third / watermark.
+    ChromaKeyRefineDialog              *m_chromaKeyDialog;
+    AudioRestorationDialog             *m_audioRestoreDialog;
+    AnimatedExportDialog               *m_animExportDialog;
+    EasingCurveEditorDialog            *m_easingEditorDialog;
+    SubtitleTranslatorDialog           *m_subtitleTranslatorDialog;
+    LowerThirdDialog                   *m_lowerThirdDialog;
+    WatermarkDialog                    *m_watermarkDialog;
 
     // Voice-over recording
     voiceover::VoiceOverDialog *m_voiceOverDialog = nullptr;

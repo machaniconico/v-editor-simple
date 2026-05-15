@@ -434,6 +434,36 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/BatchExportDialog.h
     src/BatchExportDialog.cpp
 
+    # Sprint 22 — chroma-key refine, audio restoration, animated export, easing editor, subtitle translate, lower-thirds, watermark
+    src/ChromaKeyRefine.h
+    src/ChromaKeyRefine.cpp
+    src/ChromaKeyRefineDialog.h
+    src/ChromaKeyRefineDialog.cpp
+    src/AudioRestoration.h
+    src/AudioRestoration.cpp
+    src/AudioRestorationDialog.h
+    src/AudioRestorationDialog.cpp
+    src/AnimatedExport.h
+    src/AnimatedExport.cpp
+    src/AnimatedExportDialog.h
+    src/AnimatedExportDialog.cpp
+    src/EasingCurveModel.h
+    src/EasingCurveModel.cpp
+    src/EasingCurveEditorDialog.h
+    src/EasingCurveEditorDialog.cpp
+    src/SubtitleTranslator.h
+    src/SubtitleTranslator.cpp
+    src/SubtitleTranslatorDialog.h
+    src/SubtitleTranslatorDialog.cpp
+    src/LowerThirdTemplates.h
+    src/LowerThirdTemplates.cpp
+    src/LowerThirdDialog.h
+    src/LowerThirdDialog.cpp
+    src/WatermarkOverlay.h
+    src/WatermarkOverlay.cpp
+    src/WatermarkDialog.h
+    src/WatermarkDialog.cpp
+
     resources/resources.qrc
     ${APP_RESOURCES}
 )

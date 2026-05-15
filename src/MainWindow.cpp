@@ -143,6 +143,36 @@
   #include "BatchExportDialog.h"
   #define HAVE_BATCH_EXPORT 1
 #endif
+// US-INT-2: Sprint 22 — keying / restoration / animated export / easing /
+// subtitle translation / lower-third / watermark.
+#if __has_include("ChromaKeyRefineDialog.h")
+  #include "ChromaKeyRefineDialog.h"
+  #define HAVE_CHROMA_KEY_REFINE_DIALOG 1
+#endif
+#if __has_include("AudioRestorationDialog.h")
+  #include "AudioRestorationDialog.h"
+  #define HAVE_AUDIO_RESTORATION_DIALOG 1
+#endif
+#if __has_include("AnimatedExportDialog.h")
+  #include "AnimatedExportDialog.h"
+  #define HAVE_ANIMATED_EXPORT_DIALOG 1
+#endif
+#if __has_include("EasingCurveEditorDialog.h")
+  #include "EasingCurveEditorDialog.h"
+  #define HAVE_EASING_CURVE_EDITOR_DIALOG 1
+#endif
+#if __has_include("SubtitleTranslatorDialog.h")
+  #include "SubtitleTranslatorDialog.h"
+  #define HAVE_SUBTITLE_TRANSLATOR_DIALOG 1
+#endif
+#if __has_include("LowerThirdDialog.h")
+  #include "LowerThirdDialog.h"
+  #define HAVE_LOWER_THIRD_DIALOG 1
+#endif
+#if __has_include("WatermarkDialog.h")
+  #include "WatermarkDialog.h"
+  #define HAVE_WATERMARK_DIALOG 1
+#endif
 #include <QApplication>
 #include <QMessageBox>
 #include <QMenu>
@@ -650,6 +680,13 @@ MainWindow::MainWindow(QWidget *parent)
     , m_hdrDialog(nullptr)
     , m_multiCamSyncDialog(nullptr)
     , m_batchExportDialog(nullptr)
+    , m_chromaKeyDialog(nullptr)
+    , m_audioRestoreDialog(nullptr)
+    , m_animExportDialog(nullptr)
+    , m_easingEditorDialog(nullptr)
+    , m_subtitleTranslatorDialog(nullptr)
+    , m_lowerThirdDialog(nullptr)
+    , m_watermarkDialog(nullptr)
 {
     qInfo() << "MainWindow::ctor begin";
     resize(1280, 720);
@@ -2330,6 +2367,64 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::openBatchExportDialog);
     m_menuHelpEntries.append({batchExportAction,
         QStringLiteral("複数の書き出しジョブをキューに登録し、まとめてバッチ処理します。")});
+
+    // US-INT-2: Sprint 22 — keying / restoration / animated export / easing /
+    // subtitle translation / lower-third / watermark.
+    auto *chromaKeyAction = toolsMenu->addAction(
+        QStringLiteral("クロマキー精緻化(&K)…"));
+    chromaKeyAction->setObjectName("action_chroma_key_refine");
+    connect(chromaKeyAction, &QAction::triggered,
+            this, &MainWindow::openChromaKeyDialog);
+    m_menuHelpEntries.append({chromaKeyAction,
+        QStringLiteral("スピル除去・エッジ調整などでクロマキー合成の抜きを精緻に仕上げます。")});
+
+    auto *audioRestoreAction = toolsMenu->addAction(
+        QStringLiteral("音声リストア(&R)…"));
+    audioRestoreAction->setObjectName("action_audio_restoration");
+    connect(audioRestoreAction, &QAction::triggered,
+            this, &MainWindow::openAudioRestoreDialog);
+    m_menuHelpEntries.append({audioRestoreAction,
+        QStringLiteral("ノイズ・クリック・ハムなどの劣化を取り除き、収録音声を復元します。")});
+
+    auto *animExportAction = toolsMenu->addAction(
+        QStringLiteral("アニメGIF・WebP書き出し(&G)…"));
+    animExportAction->setObjectName("action_animated_export");
+    connect(animExportAction, &QAction::triggered,
+            this, &MainWindow::openAnimExportDialog);
+    m_menuHelpEntries.append({animExportAction,
+        QStringLiteral("選択範囲をアニメーション GIF / WebP として最適化して書き出します。")});
+
+    auto *easingEditorAction = toolsMenu->addAction(
+        QStringLiteral("イージングカーブエディタ(&E)…"));
+    easingEditorAction->setObjectName("action_easing_curve_editor");
+    connect(easingEditorAction, &QAction::triggered,
+            this, &MainWindow::openEasingEditorDialog);
+    m_menuHelpEntries.append({easingEditorAction,
+        QStringLiteral("ベジェ制御点でキーフレーム間のイージングカーブを視覚的に編集します。")});
+
+    auto *subtitleTranslatorAction = toolsMenu->addAction(
+        QStringLiteral("字幕翻訳(&Z)…"));
+    subtitleTranslatorAction->setObjectName("action_subtitle_translator");
+    connect(subtitleTranslatorAction, &QAction::triggered,
+            this, &MainWindow::openSubtitleTranslatorDialog);
+    m_menuHelpEntries.append({subtitleTranslatorAction,
+        QStringLiteral("既存の字幕トラックを別言語へ翻訳し、多言語字幕を生成します。")});
+
+    auto *lowerThirdAction = toolsMenu->addAction(
+        QStringLiteral("ローワーサード(&D)…"));
+    lowerThirdAction->setObjectName("action_lower_third");
+    connect(lowerThirdAction, &QAction::triggered,
+            this, &MainWindow::openLowerThirdDialog);
+    m_menuHelpEntries.append({lowerThirdAction,
+        QStringLiteral("名前・肩書きなどを表示する下三分の一テロップ (ローワーサード) を作成します。")});
+
+    auto *watermarkAction = toolsMenu->addAction(
+        QStringLiteral("ウォーターマーク(&W)…"));
+    watermarkAction->setObjectName("action_watermark");
+    connect(watermarkAction, &QAction::triggered,
+            this, &MainWindow::openWatermarkDialog);
+    m_menuHelpEntries.append({watermarkAction,
+        QStringLiteral("ロゴ画像やテキストの透かしを映像へ重ねて、位置・不透明度を調整します。")});
 
     // US-SNS-7: LoudnessPanel dock (created here so menu action can reference it)
     m_loudnessDock = new QDockWidget("ラウドネスパネル", this);
@@ -8444,6 +8539,121 @@ void MainWindow::openBatchExportDialog()
 #else
     QMessageBox::information(this, QStringLiteral("バッチエクスポート"),
         QStringLiteral("BatchExportDialog がビルドに含まれていません。"));
+#endif
+}
+
+// --- US-INT-2: Sprint 22 — keying / restoration / animated export / easing /
+//     subtitle translation / lower-third / watermark. ---
+
+void MainWindow::openChromaKeyDialog()
+{
+#ifdef HAVE_CHROMA_KEY_REFINE_DIALOG
+    if (!m_chromaKeyDialog) {
+        m_chromaKeyDialog = new ChromaKeyRefineDialog(this);
+        m_chromaKeyDialog->setObjectName(QStringLiteral("chromaKeyDialog"));
+    }
+    m_chromaKeyDialog->show();
+    m_chromaKeyDialog->raise();
+    m_chromaKeyDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("クロマキー精緻化"),
+        QStringLiteral("ChromaKeyRefineDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openAudioRestoreDialog()
+{
+#ifdef HAVE_AUDIO_RESTORATION_DIALOG
+    if (!m_audioRestoreDialog) {
+        m_audioRestoreDialog = new AudioRestorationDialog(this);
+        m_audioRestoreDialog->setObjectName(QStringLiteral("audioRestoreDialog"));
+    }
+    m_audioRestoreDialog->show();
+    m_audioRestoreDialog->raise();
+    m_audioRestoreDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("音声リストア"),
+        QStringLiteral("AudioRestorationDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openAnimExportDialog()
+{
+#ifdef HAVE_ANIMATED_EXPORT_DIALOG
+    if (!m_animExportDialog) {
+        m_animExportDialog = new AnimatedExportDialog(this);
+        m_animExportDialog->setObjectName(QStringLiteral("animExportDialog"));
+    }
+    m_animExportDialog->show();
+    m_animExportDialog->raise();
+    m_animExportDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("アニメGIF・WebP書き出し"),
+        QStringLiteral("AnimatedExportDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openEasingEditorDialog()
+{
+#ifdef HAVE_EASING_CURVE_EDITOR_DIALOG
+    if (!m_easingEditorDialog) {
+        m_easingEditorDialog = new EasingCurveEditorDialog(this);
+        m_easingEditorDialog->setObjectName(QStringLiteral("easingEditorDialog"));
+    }
+    m_easingEditorDialog->show();
+    m_easingEditorDialog->raise();
+    m_easingEditorDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("イージングカーブエディタ"),
+        QStringLiteral("EasingCurveEditorDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openSubtitleTranslatorDialog()
+{
+#ifdef HAVE_SUBTITLE_TRANSLATOR_DIALOG
+    if (!m_subtitleTranslatorDialog) {
+        m_subtitleTranslatorDialog = new SubtitleTranslatorDialog(this);
+        m_subtitleTranslatorDialog->setObjectName(QStringLiteral("subtitleTranslatorDialog"));
+    }
+    m_subtitleTranslatorDialog->show();
+    m_subtitleTranslatorDialog->raise();
+    m_subtitleTranslatorDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("字幕翻訳"),
+        QStringLiteral("SubtitleTranslatorDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openLowerThirdDialog()
+{
+#ifdef HAVE_LOWER_THIRD_DIALOG
+    if (!m_lowerThirdDialog) {
+        m_lowerThirdDialog = new LowerThirdDialog(this);
+        m_lowerThirdDialog->setObjectName(QStringLiteral("lowerThirdDialog"));
+    }
+    m_lowerThirdDialog->show();
+    m_lowerThirdDialog->raise();
+    m_lowerThirdDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("ローワーサード"),
+        QStringLiteral("LowerThirdDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openWatermarkDialog()
+{
+#ifdef HAVE_WATERMARK_DIALOG
+    if (!m_watermarkDialog) {
+        m_watermarkDialog = new WatermarkDialog(this);
+        m_watermarkDialog->setObjectName(QStringLiteral("watermarkDialog"));
+    }
+    m_watermarkDialog->show();
+    m_watermarkDialog->raise();
+    m_watermarkDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("ウォーターマーク"),
+        QStringLiteral("WatermarkDialog がビルドに含まれていません。"));
 #endif
 }
 
