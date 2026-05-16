@@ -1,4 +1,5 @@
 #include "LayerCompositor.h"
+#include "TrackMatteBake.h"
 
 #include <QPainter>
 #include <QTransform>
@@ -101,6 +102,9 @@ QJsonObject CompositeLayer::toJson() const
     obj["inPoint"]  = inPoint;
     obj["outPoint"] = outPoint;
 
+    obj["matteType"]             = static_cast<int>(matteType);
+    obj["matteSourceLayerIndex"] = matteSourceLayerIndex;
+
     return obj;
 }
 
@@ -129,6 +133,9 @@ CompositeLayer CompositeLayer::fromJson(const QJsonObject &obj)
 
     l.inPoint  = obj["inPoint"].toDouble(0.0);
     l.outPoint = obj["outPoint"].toDouble(0.0);
+
+    l.matteType             = static_cast<TrackMatteType>(obj["matteType"].toInt(0));
+    l.matteSourceLayerIndex = obj["matteSourceLayerIndex"].toInt(-1);
 
     return l;
 }
@@ -348,9 +355,6 @@ QImage LayerCompositor::transformLayer(const QImage &source, const CompositeLaye
 QImage LayerCompositor::compositeFrame(const QVector<CompositeLayer> &layers,
                                        const QSize &canvasSize, double time)
 {
-    QImage canvas(canvasSize, QImage::Format_ARGB32);
-    canvas.fill(Qt::transparent);
-
     // Sort by zOrder (bottom to top)
     QVector<CompositeLayer> sorted = layers;
     std::sort(sorted.begin(), sorted.end(),
@@ -358,44 +362,37 @@ QImage LayerCompositor::compositeFrame(const QVector<CompositeLayer> &layers,
                   return a.zOrder < b.zOrder;
               });
 
-    for (const auto &layer : sorted) {
-        // Skip invisible layers
-        if (!layer.visible)
-            continue;
-
-        // Skip layers outside their time range
-        if (time < layer.inPoint)
-            continue;
-        if (layer.outPoint > 0.0 && time > layer.outPoint)
-            continue;
-
-        // Obtain the layer source image
+    QVector<QImage> layerImages;
+    layerImages.reserve(sorted.size());
+    auto renderLayerImage = [&](const CompositeLayer &layer) -> QImage {
         QImage layerImage;
-
         if (layer.sourceType == LayerSourceType::Solid) {
-            // Generate a solid-colour layer
             layerImage = QImage(canvasSize, QImage::Format_ARGB32);
             layerImage.fill(layer.solidColor);
         } else if (layer.sourceType == LayerSourceType::Image) {
-            // Load from disk
             layerImage = QImage(layer.sourcePath);
             if (layerImage.isNull())
-                continue;
+                return QImage();
             layerImage = layerImage.convertToFormat(QImage::Format_ARGB32);
         } else {
-            // Video / Shape / Text / Adjustment — placeholder: transparent
-            // (actual frame retrieval is handled by the pipeline caller)
+            return QImage();
+        }
+        return transformLayer(layerImage, layer, canvasSize);
+    };
+
+    for (const CompositeLayer &layer : sorted) {
+        if (time < layer.inPoint) {
+            layerImages.append(QImage());
             continue;
         }
-
-        // Apply transform (position, scale, rotation)
-        QImage transformed = transformLayer(layerImage, layer, canvasSize);
-
-        // Blend onto canvas
-        canvas = blendImages(canvas, transformed, layer.blendMode, layer.opacity);
+        if (layer.outPoint > 0.0 && time > layer.outPoint) {
+            layerImages.append(QImage());
+            continue;
+        }
+        layerImages.append(renderLayerImage(layer));
     }
 
-    return canvas;
+    return trackmatte::composite(sorted, layerImages, canvasSize);
 }
 
 // ===== Serialisation =====

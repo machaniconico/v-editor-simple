@@ -220,6 +220,7 @@
 #include "SmartReframe.h"
 #include "SmartReframeDialog.h"
 #include "LoudnessAnalyzer.h"
+#include "TrackMatteBake.h"
 #include "SubtitleTrackRenderer.h"
 #include "LoudnessPanel.h"
 #include "ParticleEffectDialog.h"
@@ -660,6 +661,33 @@ QVector<fcpx::xml::ClipEntry> buildFcpxmlExportClips(const Timeline *timeline)
     return entries;
 }
 #endif
+
+// TM-8: mirror MainWindow's m_trackMatteClipEntries onto the Timeline so
+// the SSOT renderFrameAt (src/TimelineFrameRenderer.cpp) reads matte
+// wiring from the Timeline object itself instead of walking QObject
+// parents up to this live MainWindow off the RenderQueue worker thread
+// (the old #define-private-public path — C1+C2). The QHash key is
+// MainWindow::brushClipId(track,clip) == tlrender::renderClipId, so this
+// is a straight per-entry copy into the 2-field TimelineTrackMatteEntry
+// the consumer reads. Called on every m_trackMatteClipEntries mutation
+// (configure dialog) and after a project load rebuilds it, so the GUI
+// preview keeps working — now through the Timeline carrier.
+void syncTrackMatteEntriesToTimeline(
+    Timeline *timeline,
+    const QHash<QString, TrackMatteClipEntry> &source)
+{
+    if (!timeline)
+        return;
+    QHash<QString, TimelineTrackMatteEntry> out;
+    out.reserve(source.size());
+    for (auto it = source.cbegin(); it != source.cend(); ++it) {
+        TimelineTrackMatteEntry e;
+        e.matteType = it.value().matteType;
+        e.matteSourceClipId = it.value().matteSourceClipId;
+        out.insert(it.key(), e);
+    }
+    timeline->setTrackMatteEntries(out);
+}
 
 } // namespace
 
@@ -3688,43 +3716,34 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
         return activeLayers[a].layer.zOrder < activeLayers[b].layer.zOrder;
     });
 
-    QSet<int> matteSourceIndices;
-    for (int sortedIdx : order) {
-        const CompositeLayer &layer = activeLayers[sortedIdx].layer;
-        if (layer.matteType == TrackMatteType::None)
-            continue;
-        const int matteIndex = layer.matteSourceLayerIndex;
-        if (matteIndex >= 0 && matteIndex < activeLayers.size() && matteIndex != sortedIdx)
-            matteSourceIndices.insert(matteIndex);
-    }
+    // SSOT: hand the full z-ordered layer list plus parallel pre-transformed
+    // canvas-sized images to trackmatte::composite so the GUI preview and the
+    // export path (renderFrameAt, TM-3) share one matte+blend implementation.
+    // matteSourceLayerIndex was resolved against the unsorted activeLayers
+    // index space; remap it into the sorted-array position the SSOT indexes.
+    QVector<int> sortedPosByOldIndex(activeLayers.size(), -1);
+    for (int sortedPos = 0; sortedPos < order.size(); ++sortedPos)
+        sortedPosByOldIndex[order[sortedPos]] = sortedPos;
 
-    QImage canvas(canvasSize, QImage::Format_ARGB32);
-    canvas.fill(Qt::transparent);
+    QVector<CompositeLayer> layers;
+    QVector<QImage> layerImages;
+    layers.reserve(order.size());
+    layerImages.reserve(order.size());
     for (int sortedIdx : order) {
         const ActiveLayer &active = activeLayers[sortedIdx];
-        const CompositeLayer &layer = active.layer;
-        if (!layer.visible || matteSourceIndices.contains(sortedIdx))
-            continue;
-
-        QImage transformed = renderCompositeImage(active.image, layer, canvasSize);
-        if (transformed.isNull())
-            continue;
-
-        if (layer.matteType != TrackMatteType::None
-            && layer.matteSourceLayerIndex >= 0
-            && layer.matteSourceLayerIndex < activeLayers.size()
-            && layer.matteSourceLayerIndex != sortedIdx) {
-            const QImage matteImage = renderCompositeImage(
-                activeLayers[layer.matteSourceLayerIndex].image,
-                activeLayers[layer.matteSourceLayerIndex].layer,
-                canvasSize);
-            if (!matteImage.isNull())
-                transformed = MaskSystem::applyTrackMatte(transformed, matteImage, layer.matteType);
+        CompositeLayer layer = active.layer;
+        if (layer.matteType != TrackMatteType::None) {
+            const int oldMatteIndex = layer.matteSourceLayerIndex;
+            layer.matteSourceLayerIndex =
+                (oldMatteIndex >= 0 && oldMatteIndex < sortedPosByOldIndex.size())
+                    ? sortedPosByOldIndex[oldMatteIndex]
+                    : -1;
         }
-
-        canvas = LayerCompositor::blendImages(canvas, transformed, layer.blendMode, layer.opacity);
+        layers.append(layer);
+        layerImages.append(renderCompositeImage(active.image, layer, canvasSize));
     }
-    return canvas;
+
+    return trackmatte::composite(layers, layerImages, canvasSize);
 }
 
 void MainWindow::refreshSpecialClipPreview()
@@ -3948,6 +3967,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
         if (!entry.clipId.isEmpty())
             m_trackMatteClipEntries.insert(entry.clipId, entry);
     }
+    // TM-8: push the freshly-loaded matte wiring onto the Timeline so the
+    // SSOT renderer (preview AND export) sources it from the Timeline.
+    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     // US-3D-11: motion-graphics sprint sidecars
     m_text3DClipConfigs.clear();
     for (const auto &entry : data.text3DClipEntries) {
@@ -7343,6 +7365,7 @@ void MainWindow::configureTrackMatte()
     const QString matteSourceId = sourceCombo->currentData().toString();
     if (matteType == TrackMatteType::None || matteSourceId.isEmpty()) {
         m_trackMatteClipEntries.remove(targetClipId);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         refreshSpecialClipPreview();
         statusBar()->showMessage(QStringLiteral("トラックマットを解除しました"), 3000);
         return;
@@ -7358,6 +7381,7 @@ void MainWindow::configureTrackMatte()
     entry.matteType = matteType;
     entry.matteSourceClipId = matteSourceId;
     m_trackMatteClipEntries.insert(targetClipId, entry);
+    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
 
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("%1 に %2 を設定しました")

@@ -6,6 +6,7 @@
 #include <QVector>
 #include <QDateTime>
 #include <QJsonObject>
+#include <QMutex>
 #include <QProcess>
 
 class QThread;
@@ -181,6 +182,7 @@ private:
     static Timeline *resolveTimeline(const RenderJob &job, Timeline **ownedOut);
 
     QVector<RenderJob> m_jobs;
+    QMutex m_processMutex;
     QProcess *m_process = nullptr;
     int m_nextId = 1;
     int m_currentJobIndex = -1;

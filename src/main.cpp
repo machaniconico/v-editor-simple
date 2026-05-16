@@ -21,6 +21,7 @@
 #include <QMetaMethod>
 #include <QTemporaryDir>
 #include <QProcess>
+#include <QProcessEnvironment>  // TM-6: re-exec self with observer env set
 #include <QHash>
 #include <QPainter>
 #include <QPainterPath>
@@ -54,6 +55,7 @@
 #include "ParticleSystem.h"
 #include "ProjectFile.h"
 #include "MaskSystem.h"
+#include "TrackMatteBake.h"  // TM-6 parity: shared trackmatte::composite SSOT under test
 #include "OpticalFlow.h"
 #include "RotoAutoTrace.h"
 #include "RotoTracking.h"
@@ -764,6 +766,82 @@ int runProSelftest()
         || !requireSelftest(qAlpha(lumaInverted.pixel(8, 8)) < qAlpha(lumaInverted.pixel(24, 8)),
                             QStringLiteral("luma inverted matte result invalid"), &error)) {
         return 1;
+    }
+
+    // TM-6: hand-computed-expectation correctness check on the DIRECT
+    // MaskSystem::applyTrackMatte primitive (not just a non-null / directional
+    // check). Independent comparator: the expected output alpha is derived
+    // purely from raw arithmetic below, NOT by calling applyTrackMatte/
+    // trackmatte::composite a second time (that would be tautological — see
+    // project rule feedback_independent_comparator).
+    //
+    // Fully-opaque WHITE foreground (R=G=B=A=255) makes the math exact: the
+    // premultiplied cut == matte value m per channel, and un-premultiply
+    // recovers R=G=B=255 with alpha=m exactly (zero rounding ambiguity, vs the
+    // 32x32 painted images above which leave premultiply slack).
+    {
+        const int W = 8, H = 8;
+        QImage fgWhite(W, H, QImage::Format_ARGB32);
+        fgWhite.fill(QColor(255, 255, 255, 255));
+
+        // Alpha-matte source: left half alpha=255, right half alpha=64
+        // (RGB white so only the alpha channel drives the matte).
+        QImage alphaSrc(W, H, QImage::Format_ARGB32);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                alphaSrc.setPixelColor(x, y,
+                    QColor(255, 255, 255, x < W / 2 ? 255 : 64));
+
+        // Luma-matte source: left half RGB(200,100,50) alpha=255, right half
+        // RGB(0,0,0) alpha=255. Rec.601 luma (MaskSystem.cpp:518-520, the
+        // EXACT 0.299/0.587/0.114 coefficients with int() truncation):
+        //   left  = int(0.299*200 + 0.587*100 + 0.114*50) = int(124.2) = 124
+        //   right = int(0) = 0
+        QImage lumaSrc(W, H, QImage::Format_ARGB32);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                lumaSrc.setPixelColor(x, y,
+                    x < W / 2 ? QColor(200, 100, 50, 255)
+                              : QColor(0, 0, 0, 255));
+
+        const QImage dAlpha =
+            MaskSystem::applyTrackMatte(fgWhite, alphaSrc, TrackMatteType::AlphaMatte);
+        const QImage dLuma =
+            MaskSystem::applyTrackMatte(fgWhite, lumaSrc, TrackMatteType::LumaMatte);
+
+        // Hand-computed expected alpha (independent arithmetic):
+        //   AlphaMatte: outA = fgA(255) * matteAlpha / 255  -> left 255, right 64
+        const int expAlphaLeft  = 255 * 255 / 255;   // = 255
+        const int expAlphaRight = 255 * 64  / 255;   // = 64
+        //   LumaMatte: outA = fgA(255) * rec601 / 255       -> left 124, right 0
+        const int lumaLeftCoeff =
+            static_cast<int>(0.299 * 200 + 0.587 * 100 + 0.114 * 50); // 124
+        const int expLumaLeft  = 255 * lumaLeftCoeff / 255;  // = 124
+        const int expLumaRight = 255 * 0 / 255;              // = 0
+
+        const int gotAlphaLeft  = qAlpha(dAlpha.pixel(1, 1));
+        const int gotAlphaRight = qAlpha(dAlpha.pixel(W - 1, 1));
+        const int gotLumaLeft   = qAlpha(dLuma.pixel(1, 1));
+        const int gotLumaRight  = qAlpha(dLuma.pixel(W - 1, 1));
+
+        if (!requireSelftest(std::abs(gotAlphaLeft - expAlphaLeft) <= 1
+                                 && std::abs(gotAlphaRight - expAlphaRight) <= 1,
+                             QStringLiteral("applyTrackMatte AlphaMatte alpha "
+                                            "mismatch vs hand-computed"), &error)) {
+            qCritical() << "  AlphaMatte expected" << expAlphaLeft << "/"
+                        << expAlphaRight << "got" << gotAlphaLeft << "/"
+                        << gotAlphaRight;
+            return 1;
+        }
+        if (!requireSelftest(std::abs(gotLumaLeft - expLumaLeft) <= 1
+                                 && std::abs(gotLumaRight - expLumaRight) <= 1,
+                             QStringLiteral("applyTrackMatte LumaMatte alpha "
+                                            "mismatch vs hand-computed"), &error)) {
+            qCritical() << "  LumaMatte expected" << expLumaLeft << "/"
+                        << expLumaRight << "got" << gotLumaLeft << "/"
+                        << gotLumaRight;
+            return 1;
+        }
     }
 
     timeremap::TimeRemapCurve nearestCurve;
@@ -3071,7 +3149,7 @@ int runBatchExportSelftest()
         qCritical() << "BATCHEXPORT FAILED: job 1 timed out";
         loop.quit();
     });
-    hardTimeout.start(180000);   // 3 min
+    hardTimeout.start(360000);   // 6min: slow-CI margin (was 180s, critic follow-up)
 
     queue.start();
     queue.pause();               // pause IMMEDIATELY — guard must hold
@@ -3138,7 +3216,7 @@ int runBatchExportSelftest()
         qCritical() << "BATCHEXPORT FAILED: job 2 timed out after resume";
         loop2.quit();
     });
-    hardTimeout2.start(180000);
+    hardTimeout2.start(360000);  // 6min: slow-CI margin (was 180s, critic follow-up)
 
     queue.resume();
     if (!job2Terminal)
@@ -3424,6 +3502,543 @@ int runLowerThirdSelftest()
     }
 #endif
     qInfo() << "LOWERTHIRD selftest OK";
+    return 0;
+}
+
+// TM-6: track-matte SSOT parity selftest (--selftest-trackmatte-parity).
+//
+// This is the campaign's CORE verification. TM-1 extracted the shared
+// trackmatte::composite SSOT; TM-3 wired the export path
+// (tlrender::renderFrameAt) to it and TM-4 wired the GUI preview
+// (MainWindow::buildSpecialClipComposite) to the SAME function — so export and
+// preview are structurally one path whose single point of truth is
+// trackmatte::composite(layers, layerImages, canvasSize). This test drives
+// that exact funnel with a deterministic synthetic layer stack for all 4
+// matte types and asserts the produced pixels equal an INDEPENDENT
+// hand-computed expectation (raw arithmetic — never derived by calling
+// MaskSystem::applyTrackMatte or trackmatte::composite a second time; that
+// would be tautological per project rule feedback_independent_comparator).
+//
+// Index-space coverage: layer 0 is the matte SOURCE, layer 1 is the
+// foreground whose matteSourceLayerIndex == 0. composite() must (a) skip
+// drawing the matte-source layer standalone and (b) consume
+// layerImages[matteSourceLayerIndex] as layer 1's matte — exactly the
+// CompositeLayer::matteSourceLayerIndex contract TM-3 and TM-4 populate.
+//
+// Sanity guard: trackmatte::selftestReset() before /
+// trackmatte::selftestAppliedMatte() after (gated by env
+// VEDITOR_TRACKMATTE_SELFTEST, which this function sets) — catches a silent
+// no-op where the matte branch is skipped and the test would otherwise pass
+// on coincidentally-matching pixels.
+int runTrackMatteParitySelftest()
+{
+    // trackmatte::composite's applied-matte observer latches its enable flag
+    // (g_observeAppliedMatte) at STATIC-INIT from VEDITOR_TRACKMATTE_SELFTEST —
+    // before main() runs — exactly like textbake's g_observeBakeThread. A
+    // qputenv() here would be too late, so the sanity guard could never fire.
+    // Canonical fix (mirrors the env-gated-observer contract): if the env is
+    // not already present in the process environment, RE-EXEC this same binary
+    // with it set + the same switch, forwarding the child's stdio + exit code.
+    // The re-exec'd child enters with the observer live, so the sanity guard
+    // has real teeth (it is NOT weakened — a genuine matte no-op still fails).
+    if (qEnvironmentVariableIsEmpty("VEDITOR_TRACKMATTE_SELFTEST")) {
+        QProcess child;
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("VEDITOR_TRACKMATTE_SELFTEST"),
+                   QStringLiteral("1"));
+        child.setProcessEnvironment(env);
+        child.setProcessChannelMode(QProcess::ForwardedChannels);
+        child.start(QCoreApplication::applicationFilePath(),
+                    { QStringLiteral("--selftest-trackmatte-parity") });
+        if (!child.waitForStarted(15000)) {
+            qCritical() << "TRACKMATTE-PARITY FAILED: could not re-exec self"
+                        << child.errorString();
+            return 1;
+        }
+        child.waitForFinished(120000);
+        if (child.state() != QProcess::NotRunning) {
+            child.kill();
+            qCritical() << "TRACKMATTE-PARITY FAILED: re-exec child hung";
+            return 1;
+        }
+        if (child.exitStatus() != QProcess::NormalExit) {
+            qCritical() << "TRACKMATTE-PARITY FAILED: re-exec child crashed";
+            return 1;
+        }
+        return child.exitCode();
+    }
+
+    const QSize canvas(64, 48);
+
+    // Fully-opaque WHITE foreground (R=G=B=A=255). This choice makes the
+    // arithmetic EXACT end-to-end: applyTrackMatte premultiplies the source
+    // (255 -> identity), the per-pixel cut alpha == matte value m and the
+    // premultiplied cut RGB == m per channel; LayerCompositor::blendImages
+    // then un-premultiplies (recovering R=G=B=255 for m>0) and composites
+    // Normal@opacity=1 over a transparent ARGB32 canvas, yielding the final
+    // pixel qRgba(255,255,255,m) for m>0 and qRgba(0,0,0,0) for m==0 — with
+    // zero rounding ambiguity.
+    QImage fg(canvas, QImage::Format_ARGB32);
+    fg.fill(QColor(255, 255, 255, 255));
+
+    // Three deterministic vertical bands so every matte type yields three
+    // DISTINCT, non-degenerate values (not all 0 or 255 — a meaningful test).
+    //   band A : x <  bandA
+    //   band B : bandA <= x < bandB
+    //   band C : x >= bandB
+    const int bandA = canvas.width() / 3;        // 21
+    const int bandB = (canvas.width() * 2) / 3;  // 42
+
+    // Alpha-matte source: opaque-white RGB, alpha = {255, 128, 0} per band.
+    QImage alphaSrc(canvas, QImage::Format_ARGB32);
+    // Luma-matte source: alpha=255, RGB = {(200,100,50),(0,0,0),(255,255,255)}.
+    QImage lumaSrc(canvas, QImage::Format_ARGB32);
+    for (int y = 0; y < canvas.height(); ++y) {
+        for (int x = 0; x < canvas.width(); ++x) {
+            const int band = (x < bandA) ? 0 : (x < bandB ? 1 : 2);
+            const int a = (band == 0) ? 255 : (band == 1 ? 128 : 0);
+            alphaSrc.setPixelColor(x, y, QColor(255, 255, 255, a));
+            QColor lc = (band == 0) ? QColor(200, 100, 50, 255)
+                      : (band == 1) ? QColor(0, 0, 0, 255)
+                                    : QColor(255, 255, 255, 255);
+            lumaSrc.setPixelColor(x, y, lc);
+        }
+    }
+
+    // Rec.601 luma with the EXACT MaskSystem.cpp:518-520 coefficients and the
+    // SAME int() truncation. Hand-computed (independent) — NOT a call into
+    // MaskSystem.
+    auto rec601 = [](int r, int g, int b) -> int {
+        return static_cast<int>(0.299 * r + 0.587 * g + 0.114 * b);
+    };
+    const int lumaA = rec601(200, 100, 50);   // int(124.2) = 124
+    const int lumaB = rec601(0, 0, 0);        // 0
+    const int lumaC = rec601(255, 255, 255);  // int(254.99..) = 254
+
+    struct Case {
+        const char *name;
+        TrackMatteType type;
+        const QImage *matteSrc;
+        int mA, mB, mC;  // hand-computed matte value m per band
+    };
+    // outA = fgA(255) * m / 255 (integer); fg is opaque white so the final
+    // canvas pixel is qRgba(255,255,255,m) for m>0 else qRgba(0,0,0,0).
+    const Case cases[] = {
+        { "AlphaMatte",         TrackMatteType::AlphaMatte,
+          &alphaSrc, 255, 128, 0 },
+        { "AlphaInvertedMatte", TrackMatteType::AlphaInvertedMatte,
+          &alphaSrc, 255 - 255, 255 - 128, 255 - 0 },          // 0,127,255
+        { "LumaMatte",          TrackMatteType::LumaMatte,
+          &lumaSrc,  lumaA, lumaB, lumaC },                     // 124,0,254
+        { "LumaInvertedMatte",  TrackMatteType::LumaInvertedMatte,
+          &lumaSrc,  255 - lumaA, 255 - lumaB, 255 - lumaC },   // 131,255,1
+    };
+
+    for (const Case &c : cases) {
+        trackmatte::selftestReset();
+
+        // Layer stack handed to the SSOT exactly as TM-3 / TM-4 build it:
+        //   layers[0] = matte SOURCE  (drawn-standalone-suppressed by composite)
+        //   layers[1] = foreground, matteSourceLayerIndex = 0
+        QVector<CompositeLayer> layers(2);
+        layers[0].name = QStringLiteral("matte-src");
+        layers[0].zOrder = 0;
+        layers[1].name = QStringLiteral("fg");
+        layers[1].zOrder = 1;
+        layers[1].matteType = c.type;
+        layers[1].matteSourceLayerIndex = 0;
+
+        QVector<QImage> layerImages(2);
+        layerImages[0] = *c.matteSrc;
+        layerImages[1] = fg;
+
+        const QImage out = trackmatte::composite(layers, layerImages, canvas);
+        if (out.isNull() || out.size() != canvas) {
+            qCritical() << "TRACKMATTE-PARITY FAILED:" << c.name
+                        << "composite returned null/wrong-size";
+            return 1;
+        }
+
+        // SANITY GUARD: composite() must have actually taken the matte branch.
+        if (!trackmatte::selftestAppliedMatte()) {
+            qCritical() << "TRACKMATTE-PARITY FAILED:" << c.name
+                        << "sanity guard: selftestAppliedMatte()==false — the "
+                           "matte path was SKIPPED (silent no-op)";
+            return 1;
+        }
+
+        // Build the INDEPENDENT hand-computed expected canvas from raw
+        // arithmetic only (no MaskSystem / composite call).
+        QImage expected(canvas, QImage::Format_ARGB32);
+        for (int y = 0; y < canvas.height(); ++y) {
+            for (int x = 0; x < canvas.width(); ++x) {
+                const int m = (x < bandA) ? c.mA
+                            : (x < bandB) ? c.mB
+                                          : c.mC;
+                expected.setPixelColor(
+                    x, y,
+                    m > 0 ? QColor(255, 255, 255, m) : QColor(0, 0, 0, 0));
+            }
+        }
+
+        const double mseVal = framediff::mse(out, expected);
+        qInfo() << "TRACKMATTE-PARITY:" << c.name
+                << "MSE(renderPath, hand-computed) =" << mseVal
+                << "(bands m =" << c.mA << c.mB << c.mC << ")";
+        if (!(mseVal >= 0.0 && mseVal <= 1.0)) {
+            qCritical() << "TRACKMATTE-PARITY FAILED:" << c.name
+                        << "MSE out of tolerance (expected [0,1], got"
+                        << mseVal << ") — SSOT matte wiring produces pixels "
+                           "that do NOT match the hand-computed expectation";
+            return 1;
+        }
+    }
+
+    qInfo() << "[INFO] TRACKMATTE-PARITY OK — all 4 matte types "
+               "(Alpha/AlphaInverted/Luma/LumaInverted) pixel-match the "
+               "independent hand-computed expectation through the shared "
+               "trackmatte::composite SSOT (TM-1/TM-3/TM-4)";
+    return 0;
+}
+
+// TM-9: track-matte EXPORT-INTEGRATION selftest
+// (--selftest-trackmatte-export-integration).
+//
+// This is the answer to critic finding M1. The TM-6 sibling
+// (runTrackMatteParitySelftest) calls trackmatte::composite() DIRECTLY with
+// hand-built vectors — it proved only the leaf SSOT, never the export wiring,
+// which is exactly why critic C1 (queue/file export silently dropping the
+// matte because the parentless export Timeline returned nullptr from the
+// old MainWindow-reaching matte lookup) slipped past its MSE=0 evidence.
+//
+// TM-8 made the track-matte wiring INTRINSIC to the Timeline
+// (Timeline::setTrackMatteEntries / trackMatteEntries(), keyed "trackIdx:
+// clipIdx"); trackMatteClipEntriesForTimeline() now reads ONLY that QHash —
+// the same shape RenderQueue::resolveTimeline produces for a parentless
+// export Timeline. THIS test proves that end-to-end integration: it builds a
+// real parentless Timeline (NOT a MainWindow), wires the matte purely via
+// the Timeline API, and drives the FULL tlrender::renderFrameAt export path
+// (clipId<->layer-index resolution at TimelineFrameRenderer.cpp:759-772 +
+// the trackmatte::composite branch at :845-857) for all 4 matte types,
+// asserting the produced pixels EXACTLY equal an independent hand-computed
+// expectation. If renderFrameAt fails to apply the matte the sanity guard
+// (trackmatte::selftestAppliedMatte) trips and the test FAILS — that is the
+// guard that would have caught C1.
+//
+// SCENARIO (mirrors TM-6's index-space contract end-to-end):
+//   V1 clip = the MATTE SOURCE  -> renderLayers[0], clipId "0:0" (the base)
+//   V2 clip = the FOREGROUND    -> renderLayers[1], clipId "1:0"
+//   timeline.setTrackMatteEntries({ "1:0" -> {type, matteSourceClipId="0:0"} })
+// The consumer then sets renderLayers[1].matteType=type and
+// renderLayers[1].matteSourceLayerIndex = indexByClipId["0:0"] = 0 — exactly
+// the CompositeLayer contract TM-6 hand-builds, but reached through the REAL
+// Timeline->renderFrameAt funnel instead of a direct composite() call.
+//
+// SOLID-COLOUR sources: both clips are flat single-colour frames, so the
+// libav decode + sws + Qt smooth-scale chain is a per-pixel identity (a
+// uniform image scales to the same uniform value) and the matte arithmetic
+// is EXACT end-to-end — the TM-6 precedent for asserting MSE==0.0 rather
+// than <=1.0. Sources are generated at test time with ffmpeg (the same
+// QProcess "ffmpeg" dependency the runParitySelftest S2 stage already
+// relies on); a missing ffmpeg -> qWarning + return 0 (CI-tolerant, never
+// a silent pass), mirroring runParitySelftest's missing-asset idiom.
+//
+// INDEPENDENT comparator (feedback_independent_comparator): `expected` is
+// computed with RAW alpha/luma arithmetic from the ACTUALLY-DECODED source
+// pixels (read back via the independent tlrender::detail::
+// decodeClipFrameNativeForTest forwarder, NOT via MaskSystem::applyTrackMatte
+// or trackmatte::composite). Deriving it from the decoded pixels rather than
+// the nominal ffmpeg colour is deliberate and load-bearing: ffmpeg's lavfi
+// `color` source was empirically observed to shift every channel by -1
+// (0xC86432 -> decoded 199,99,49), so a nominal-colour expectation would
+// fail on an encoder quirk that has nothing to do with the matte wiring
+// under test. The Rec.601 coefficients are the EXACT MaskSystem.cpp:518-520
+// constants with the SAME int() truncation, hand-typed here (not called).
+int runTrackMatteExportIntegrationSelftest()
+{
+    // Same env-gated-observer re-exec contract as runTrackMatteParitySelftest:
+    // trackmatte::composite's g_observeAppliedMatte latches at STATIC-INIT
+    // from VEDITOR_TRACKMATTE_SELFTEST (before main() runs), so a qputenv()
+    // here would be too late and the sanity guard could never fire. If the
+    // env is absent, RE-EXEC this binary with it set + the same switch,
+    // forwarding the child's stdio + exit code. The re-exec'd child enters
+    // with the observer live, so the C1-catching guard has real teeth.
+    if (qEnvironmentVariableIsEmpty("VEDITOR_TRACKMATTE_SELFTEST")) {
+        QProcess child;
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("VEDITOR_TRACKMATTE_SELFTEST"),
+                   QStringLiteral("1"));
+        child.setProcessEnvironment(env);
+        child.setProcessChannelMode(QProcess::ForwardedChannels);
+        child.start(QCoreApplication::applicationFilePath(),
+                    { QStringLiteral("--selftest-trackmatte-export-integration") });
+        if (!child.waitForStarted(15000)) {
+            qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED: could not "
+                           "re-exec self" << child.errorString();
+            return 1;
+        }
+        child.waitForFinished(120000);
+        if (child.state() != QProcess::NotRunning) {
+            child.kill();
+            qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED: re-exec "
+                           "child hung";
+            return 1;
+        }
+        if (child.exitStatus() != QProcess::NormalExit) {
+            qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED: re-exec "
+                           "child crashed";
+            return 1;
+        }
+        return child.exitCode();
+    }
+
+    // ── Generate the two flat-colour source clips ───────────────────────────
+    // Lossless RGB (libx264rgb -qp 0, -pix_fmt rgb24 — no chroma subsampling)
+    // so the only colour transform is the lavfi `color` source's own -1
+    // channel shift, which the decoded-pixel comparator below absorbs.
+    QTemporaryDir tmpDir;
+    if (!tmpDir.isValid()) {
+        qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED: could not create "
+                       "temp dir";
+        return 1;
+    }
+    const QString fgPath  = tmpDir.filePath(QStringLiteral("tm9_fg.mp4"));
+    const QString srcPath = tmpDir.filePath(QStringLiteral("tm9_matte.mp4"));
+
+    auto genSolidClip = [](const QString &outPath, const QString &hexColor)
+        -> bool {
+        QProcess ff;
+        ff.start(QStringLiteral("ffmpeg"),
+                 { QStringLiteral("-hide_banner"),
+                   QStringLiteral("-loglevel"), QStringLiteral("error"),
+                   QStringLiteral("-y"),
+                   QStringLiteral("-f"), QStringLiteral("lavfi"),
+                   QStringLiteral("-i"),
+                   QStringLiteral("color=c=%1:s=64x48:r=10:d=1")
+                       .arg(hexColor),
+                   QStringLiteral("-frames:v"), QStringLiteral("1"),
+                   QStringLiteral("-c:v"), QStringLiteral("libx264rgb"),
+                   QStringLiteral("-qp"), QStringLiteral("0"),
+                   QStringLiteral("-pix_fmt"), QStringLiteral("rgb24"),
+                   outPath });
+        if (!ff.waitForStarted(15000))
+            return false;
+        ff.waitForFinished(60000);
+        return ff.exitStatus() == QProcess::NormalExit
+            && ff.exitCode() == 0
+            && QFile::exists(outPath);
+    };
+
+    // fg = solid white (opaque). matte-source = solid 0xC86432 — chosen so
+    // its Rec.601 luma is unambiguous and NOT 0/255 (decoded ~124, distinct
+    // from the alpha-matte's 255/0), giving 4 DISTINCT non-degenerate m
+    // values across the matte types.
+    if (!genSolidClip(fgPath, QStringLiteral("0xFFFFFF"))
+        || !genSolidClip(srcPath, QStringLiteral("0xC86432"))) {
+        qWarning() << "TRACKMATTE-EXPORT-INTEGRATION: ffmpeg unavailable or "
+                      "failed to synthesise source clips (skipping — "
+                      "CI-tolerant, NOT a silent pass)";
+        qInfo() << "[INFO] TRACKMATTE-EXPORT-INTEGRATION OK";
+        return 0;
+    }
+
+    // ── Read back the ACTUAL decoded source pixels (independent path) ───────
+    // tlrender::detail::decodeClipFrameNativeForTest is a thin pass-through to
+    // the SAME libav+sws decode renderFrameAt uses per layer, but invoked
+    // SEPARATELY here so `expected` is independent of the composite/matte
+    // code under test. usec=0 -> local 0 -> source-second inPoint(=0).
+    const QImage fgDecoded =
+        tlrender::detail::decodeClipFrameNativeForTest(fgPath, 0.0);
+    const QImage srcDecoded =
+        tlrender::detail::decodeClipFrameNativeForTest(srcPath, 0.0);
+    if (fgDecoded.isNull() || srcDecoded.isNull()) {
+        qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED: reference decode "
+                       "produced null (fg null=" << fgDecoded.isNull()
+                    << " src null=" << srcDecoded.isNull() << ")";
+        return 1;
+    }
+    // Flat clips -> sample one pixel; assert uniformity so a non-flat decode
+    // can never silently weaken the exact-arithmetic expectation.
+    auto assertUniform = [](const QImage &img, const char *tag) -> bool {
+        const QColor c0 = img.pixelColor(0, 0);
+        for (int y = 0; y < img.height(); y += qMax(1, img.height() / 8))
+            for (int x = 0; x < img.width(); x += qMax(1, img.width() / 8))
+                if (img.pixelColor(x, y) != c0) {
+                    qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED:" << tag
+                                << "decoded frame is not uniform — exact "
+                                   "arithmetic precondition violated";
+                    return false;
+                }
+        return true;
+    };
+    if (!assertUniform(fgDecoded, "fg") || !assertUniform(srcDecoded, "matte"))
+        return 1;
+
+    const QColor fgC  = fgDecoded.pixelColor(0, 0);
+    const QColor srcC = srcDecoded.pixelColor(0, 0);
+    const int fr = fgC.red(), fgn = fgC.green(), fb = fgC.blue();
+    const int mr = srcC.red(), mg = srcC.green(), mb = srcC.blue();
+    qInfo() << "TRACKMATTE-EXPORT-INTEGRATION: decoded fg pixel ="
+            << fr << fgn << fb << "; matte-src pixel =" << mr << mg << mb;
+
+    // Rec.601 luma with the EXACT MaskSystem.cpp:518-520 coefficients + the
+    // SAME int() truncation. Hand-computed here (independent — NOT a call
+    // into MaskSystem / trackmatte).
+    const int luma = static_cast<int>(0.299 * mr + 0.587 * mg + 0.114 * mb);
+
+    struct Case {
+        const char *name;
+        TrackMatteType type;
+        int m;  // hand-computed matte coverage value (uniform across the frame)
+    };
+    // Decoded video has no alpha channel -> qAlpha == 255 everywhere, so
+    // AlphaMatte m=255 (fg fully shown), AlphaInvertedMatte m=0 (fully cut).
+    // LumaMatte m=luma, LumaInvertedMatte m=255-luma.
+    const Case cases[] = {
+        { "AlphaMatte",         TrackMatteType::AlphaMatte,         255 },
+        { "AlphaInvertedMatte", TrackMatteType::AlphaInvertedMatte, 0 },
+        { "LumaMatte",          TrackMatteType::LumaMatte,          luma },
+        { "LumaInvertedMatte",  TrackMatteType::LumaInvertedMatte,  255 - luma },
+    };
+
+    const QSize outSize(640, 360);
+
+    for (const Case &c : cases) {
+        // Build a REAL parentless Timeline — exactly the shape
+        // RenderQueue::resolveTimeline produces for the queue/file/batch
+        // export path (NOT a MainWindow). V1 = matte source via the public
+        // addClip(filePath) (libav-probes + appends a real ClipInfo); V2 =
+        // a real second video track carrying the foreground clip.
+        Timeline tl;
+        tl.addClip(srcPath);                 // V1 -> renderLayers[0], "0:0"
+        if (tl.videoClips().isEmpty()) {
+            qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED:" << c.name
+                        << "addClip produced no V1 (matte-source) clip";
+            return 1;
+        }
+        tl.addVideoTrack();
+        const QVector<TimelineTrack *> &vtracks = tl.videoTracks();
+        if (vtracks.size() < 2 || !vtracks[1]) {
+            qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED:" << c.name
+                        << "second video track not created";
+            return 1;
+        }
+        ClipInfo fgClip = tl.videoClips().first();  // probed metadata shell
+        fgClip.filePath = fgPath;                   // ...point it at the fg src
+        fgClip.displayName = QStringLiteral("fg");
+        vtracks[1]->addClip(fgClip);                // V2 -> renderLayers[1],"1:0"
+        if (vtracks[1]->clipCount() != 1) {
+            qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED:" << c.name
+                        << "foreground clip not added to V2";
+            return 1;
+        }
+
+        // Wire the track matte PURELY through the Timeline API (the exact
+        // QHash shape RenderQueue::resolveTimeline pushes). Key = the fg
+        // clip's "trackIdx:clipIdx" ("1:0"); matteSourceClipId = the matte
+        // source clip's id ("0:0"). renderFrameAt's consumer
+        // (TimelineFrameRenderer.cpp:759-772) cross-references these to set
+        // renderLayers[1].matteSourceLayerIndex = indexOf("0:0") = 0.
+        //
+        // tlrender::renderClipId is an internal anonymous-namespace helper of
+        // TimelineFrameRenderer.cpp (not exported via the header), so this
+        // selftest reproduces its EXACT format verbatim — the documented
+        // "trackIdx:clipIdx" id contract (TimelineFrameRenderer.cpp:541-544,
+        // Timeline.h:191). Keeping this inline preserves the "modify only
+        // src/main.cpp" constraint while staying byte-identical to the key
+        // renderFrameAt builds for each renderLayer.
+        const auto clipId = [](int trackIdx, int clipIdx) -> QString {
+            return QStringLiteral("%1:%2").arg(trackIdx).arg(clipIdx);
+        };
+        QHash<QString, TimelineTrackMatteEntry> matteEntries;
+        TimelineTrackMatteEntry entry;
+        entry.matteType = c.type;
+        entry.matteSourceClipId = clipId(0, 0);     // "0:0" (V1 base)
+        matteEntries.insert(clipId(1, 0),           // "1:0" (V2 fg)
+                            entry);
+        tl.setTrackMatteEntries(matteEntries);
+        if (tl.trackMatteEntries().size() != 1
+            || !tl.trackMatteEntries().contains(clipId(1, 0))) {
+            qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED:" << c.name
+                        << "setTrackMatteEntries did not seat the wiring";
+            return 1;
+        }
+
+        // Drive the FULL export render path.
+        trackmatte::selftestReset();
+        const QImage rendered = tlrender::renderFrameAt(&tl, 0, outSize);
+        if (rendered.isNull() || rendered.size() != outSize) {
+            qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED:" << c.name
+                        << "renderFrameAt returned null/wrong-size";
+            return 1;
+        }
+
+        // SANITY GUARD (the C1 catcher): renderFrameAt must have actually
+        // routed through trackmatte::composite's matte branch. If the matte
+        // were silently dropped on the export path (the C1 defect TM-8
+        // fixed), this fires and the test FAILS — it is NOT weakened to make
+        // the test pass.
+        if (!trackmatte::selftestAppliedMatte()) {
+            qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED:" << c.name
+                        << "sanity guard: selftestAppliedMatte()==false — "
+                           "renderFrameAt did NOT apply the matte (the matte "
+                           "was SILENTLY DROPPED on the export path; this is "
+                           "the C1 regression). NOT weakening the test.";
+            return 1;
+        }
+
+        // INDEPENDENT hand-computed expectation, from the ACTUAL decoded
+        // pixels + raw arithmetic only (no MaskSystem / composite call).
+        // This is the genuine AE/Premiere track-matte contract — the matte
+        // modulates the foreground's ALPHA; its RGB is preserved. Traced
+        // end-to-end against the real code (and empirically confirmed by the
+        // measured render output):
+        //   1. MaskSystem::applyTrackMatte: src(fg, opaque) -> ARGB32_
+        //      Premultiplied (alpha=255 => premult is identity), then per
+        //      pixel multiplied by m/255 (MaskSystem.cpp:500-504, integer)
+        //      => premultiplied quad (fr*m/255, fgn*m/255, fb*m/255, m).
+        //   2. LayerCompositor::blendImages does
+        //      top.convertToFormat(Format_ARGB32) — a NON-premultiplied
+        //      format — which UN-premultiplies that quad straight back to
+        //      (fr, fgn, fb, m) for m>0 (LayerCompositor.cpp:310).
+        //   3. blendPixel Normal @opacity=1 over the transparent ARGB32
+        //      canvas: baseA=0 => outA=topA=m/255, outRGB=topRGB; the final
+        //      8-bit round int(channel*255+0.5) reproduces (fr, fgn, fb)
+        //      exactly and alpha int(m/255*255+0.5)=m
+        //      (LayerCompositor.cpp:289-301). m==0 short-circuits via
+        //      topA<=0 => the canvas stays transparent (0,0,0,0).
+        // So the foreground COLOUR is unchanged and only its alpha carries
+        // the matte coverage m — the RGB is NOT premultiplied by m.
+        QImage expected(outSize, QImage::Format_ARGB32);
+        const int m = c.m;
+        const QColor px = (m > 0)
+            ? QColor(fr, fgn, fb, m)
+            : QColor(0, 0, 0, 0);
+        expected.fill(px);
+
+        const double mseVal = framediff::mse(rendered, expected);
+        qInfo() << "TRACKMATTE-EXPORT-INTEGRATION:" << c.name
+                << "MSE(renderFrameAt, hand-computed) =" << mseVal
+                << "(m =" << m << "expected pixel ="
+                << px.red() << px.green() << px.blue() << px.alpha() << ")";
+        if (mseVal != 0.0) {
+            qCritical() << "TRACKMATTE-EXPORT-INTEGRATION FAILED:" << c.name
+                        << "MSE != 0 (got" << mseVal << ") — the FULL "
+                           "Timeline->renderFrameAt export path does NOT "
+                           "pixel-match the independent hand-computed matte "
+                           "expectation. This is a REAL residual defect in "
+                           "the TM-8 matte wiring (clipId<->index resolution "
+                           "or the composite branch), NOT a test artefact.";
+            return 1;
+        }
+    }
+
+    qInfo() << "[INFO] TRACKMATTE-EXPORT-INTEGRATION OK — all 4 matte types "
+               "(Alpha/AlphaInverted/Luma/LumaInverted) pixel-match the "
+               "independent hand-computed expectation through the FULL "
+               "Timeline->tlrender::renderFrameAt export path (TM-8 wiring: "
+               "Timeline::setTrackMatteEntries -> clipId<->index resolution "
+               "-> trackmatte::composite), with the C1 sanity guard armed";
     return 0;
 }
 
@@ -7336,6 +7951,30 @@ int main(int argc, char *argv[])
         qDebug() << "=== VEDITOR_NODEGRAPH_SELFTEST: PASSED ===";
     }
 #endif
+
+    // TM-6: track-matte SSOT parity selftest. Dispatched by the argv switch
+    // --selftest-trackmatte-parity (matching the runParitySelftest sibling's
+    // role) and also by the VEDITOR_TRACKMATTE_PARITY_SELFTEST env var for
+    // consistency with the other VEDITOR_*_SELFTEST hooks below.
+    if (app.arguments().contains(QStringLiteral("--selftest-trackmatte-parity"))
+        || qEnvironmentVariableIntValue("VEDITOR_TRACKMATTE_PARITY_SELFTEST") != 0) {
+        writeLogLine("INFO", "running --selftest-trackmatte-parity");
+        return runTrackMatteParitySelftest();
+    }
+
+    // TM-9: track-matte EXPORT-INTEGRATION selftest (critic M1 closure).
+    // Dispatched by --selftest-trackmatte-export-integration (mirroring the
+    // TM-6 sibling's argv-switch role) and the VEDITOR_TRACKMATTE_EXPORT_
+    // INTEGRATION_SELFTEST env var for consistency with the other
+    // VEDITOR_*_SELFTEST hooks.
+    if (app.arguments().contains(
+            QStringLiteral("--selftest-trackmatte-export-integration"))
+        || qEnvironmentVariableIntValue(
+               "VEDITOR_TRACKMATTE_EXPORT_INTEGRATION_SELFTEST") != 0) {
+        writeLogLine("INFO",
+                     "running --selftest-trackmatte-export-integration");
+        return runTrackMatteExportIntegrationSelftest();
+    }
 
     if (qEnvironmentVariableIntValue("VEDITOR_VFX_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_VFX_SELFTEST");

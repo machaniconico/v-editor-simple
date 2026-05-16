@@ -62,6 +62,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/TimelineFrameRenderer.cpp
     src/TextOverlayBake.h
     src/TextOverlayBake.cpp
+    src/TrackMatteBake.h
+    src/TrackMatteBake.cpp
     src/CodecDetector.cpp
     src/UndoManager.cpp
     src/Overlay.cpp

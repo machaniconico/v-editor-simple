@@ -9,6 +9,7 @@
 #include <QPainter>
 #include <QFileInfo>
 #include <QVector>
+#include <QHash>
 #include <QMenu>
 #include <QElapsedTimer>
 #include "VideoEffect.h"
@@ -176,6 +177,18 @@ enum class DragMode {
     MoveClip,
     TransitionLeadInResize,
     TransitionTrailOutResize
+};
+
+// TM-8: intrinsic track-matte wiring carried BY the Timeline so the SSOT
+// renderFrameAt (src/TimelineFrameRenderer.cpp) no longer reaches into a
+// live MainWindow off the worker thread for matte data. This mirrors the
+// 2 fields the consumer actually reads (matteType + matteSourceClipId);
+// it is deliberately NOT ProjectFile.h's TrackMatteClipEntry because
+// ProjectFile.h #includes Timeline.h (a cycle would form). TrackMatteType
+// is already visible here via the existing MaskSystem.h include above.
+struct TimelineTrackMatteEntry {
+    TrackMatteType matteType = TrackMatteType::None;
+    QString matteSourceClipId;   // "trackIdx:clipIdx" of the matte source clip
 };
 
 class TimelineTrack : public QWidget
@@ -572,6 +585,20 @@ public:
                             const QVector<QVector<ClipInfo>> &audioTracks,
                             double playhead, double markIn, double markOut, int zoom);
 
+    // TM-8: track-matte wiring SSOT. Producers (MainWindow on every
+    // m_trackMatteClipEntries mutation; RenderQueue::resolveTimeline after
+    // rebuilding a parentless Timeline from a loaded project) push the
+    // QHash here keyed by "trackIdx:clipIdx" (== MainWindow::brushClipId ==
+    // tlrender::renderClipId). renderFrameAt reads ONLY this — never a live
+    // MainWindow off the worker thread (kills the C2 data race + C1
+    // edit≠export divergence on the queue/file export path).
+    void setTrackMatteEntries(const QHash<QString, TimelineTrackMatteEntry> &entries) {
+        m_trackMatteEntries = entries;
+    }
+    const QHash<QString, TimelineTrackMatteEntry> &trackMatteEntries() const {
+        return m_trackMatteEntries;
+    }
+
 signals:
     void clipSelected(int index);
     // V3 sprint — track-aware overload. emitted alongside the int-only
@@ -653,6 +680,9 @@ private:
     QVector<TimelineTrack*> m_audioTracks;
     TimelineTrack *m_videoTrack = nullptr; // alias for m_videoTracks[0]
     TimelineTrack *m_audioTrack = nullptr; // alias for m_audioTracks[0]
+    // TM-8: track-matte wiring carried by the Timeline (see
+    // setTrackMatteEntries). Keyed by "trackIdx:clipIdx".
+    QHash<QString, TimelineTrackMatteEntry> m_trackMatteEntries;
     QScrollArea *m_scrollArea;
     QWidget *m_tracksWidget;
     QVBoxLayout *m_tracksLayout;

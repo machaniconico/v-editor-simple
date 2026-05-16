@@ -11,6 +11,7 @@
 #include <QThread>
 #include <QImage>
 #include <QPainter>
+#include <QMutexLocker>
 #include <QStandardPaths>
 #include <QtGlobal>
 #include <cmath>  // S11: std::round for HDR10 master-display luminance
@@ -29,19 +30,28 @@ RenderQueue::RenderQueue(QObject *parent)
 RenderQueue::~RenderQueue()
 {
     m_cancelRequested = true;
-    if (m_process) {
-        m_process->kill();
-        m_process->waitForFinished(3000);
+    QProcess *process = nullptr;
+    {
+        QMutexLocker locker(&m_processMutex);
+        process = m_process;
+        if (process)
+            process->kill();
+    }
+    if (process) {
+        process->waitForFinished(3000);
     }
     if (m_renderThread) {
         m_renderThread->wait(10000);
         delete m_renderThread;
         m_renderThread = nullptr;
     }
-    if (m_process) {
-        delete m_process;
+    {
+        QMutexLocker locker(&m_processMutex);
+        process = m_process;
         m_process = nullptr;
     }
+    if (process)
+        delete process;
 }
 
 int RenderQueue::addJob(const QString &name, const QString &projectFilePath,
@@ -215,9 +225,15 @@ void RenderQueue::cancelCurrent()
     // VideoStabilizer::m_cancelled.
     m_cancelRequested = true;
 
-    if (m_process) {
-        m_process->kill();
-        m_process->waitForFinished(3000);
+    QProcess *process = nullptr;
+    {
+        QMutexLocker locker(&m_processMutex);
+        process = m_process;
+        if (process)
+            process->kill();
+    }
+    if (process) {
+        process->waitForFinished(3000);
     }
 
     RenderJob &j = m_jobs[m_currentJobIndex];
@@ -478,10 +494,14 @@ void RenderQueue::startRenderPipe(int jobIndex)
 {
     const RenderJob jobCopy = m_jobs[jobIndex];
 
-    if (m_process) {
-        delete m_process;
+    QProcess *process = nullptr;
+    {
+        QMutexLocker locker(&m_processMutex);
+        process = m_process;
         m_process = nullptr;
     }
+    if (process)
+        delete process;
     if (m_renderThread) {
         m_renderThread->wait(5000);
         delete m_renderThread;
@@ -583,12 +603,20 @@ void RenderQueue::startRenderPipe(int jobIndex)
         const bool ok = [&]() -> bool {
             QProcess *proc = new QProcess();
             proc->setProcessChannelMode(QProcess::SeparateChannels);
-            m_process = proc;
+            {
+                QMutexLocker locker(&m_processMutex);
+                m_process = proc;
+            }
+            auto clearProcess = [&]() {
+                QMutexLocker locker(&m_processMutex);
+                if (m_process == proc)
+                    m_process = nullptr;
+            };
             proc->start(ffmpegBin, args);
             if (!proc->waitForStarted(15000)) {
                 failMsg = QStringLiteral("failed to start ffmpeg: ")
                     + proc->errorString();
-                m_process = nullptr;
+                clearProcess();
                 proc->deleteLater();
                 return false;
             }
@@ -599,7 +627,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
                 if (m_cancelRequested) {
                     proc->kill();
                     proc->waitForFinished(3000);
-                    m_process = nullptr;
+                    clearProcess();
                     proc->deleteLater();
                     failMsg = QStringLiteral("cancelled");
                     return false;
@@ -611,7 +639,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
                 if (frame.isNull()) {
                     proc->kill();
                     proc->waitForFinished(3000);
-                    m_process = nullptr;
+                    clearProcess();
                     proc->deleteLater();
                     failMsg = QStringLiteral(
                         "renderFrameAt returned a null image at frame ")
@@ -657,7 +685,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
                         if (wrote < 0) {
                             proc->kill();
                             proc->waitForFinished(3000);
-                            m_process = nullptr;
+                            clearProcess();
                             proc->deleteLater();
                             failMsg =
                                 QStringLiteral("ffmpeg stdin write failed");
@@ -668,7 +696,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
                         if (rem > 0 && !proc->waitForBytesWritten(15000)) {
                             proc->kill();
                             proc->waitForFinished(3000);
-                            m_process = nullptr;
+                            clearProcess();
                             proc->deleteLater();
                             failMsg = QStringLiteral("ffmpeg stdin stalled");
                             return false;
@@ -693,7 +721,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
             if (!encOk)
                 failMsg = QStringLiteral("ffmpeg exited with code ")
                     + QString::number(proc->exitCode());
-            m_process = nullptr;
+            clearProcess();
             proc->deleteLater();
             return encOk;
         }();
@@ -1086,6 +1114,29 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
     tl->restoreFromProject(data.videoTracks, data.audioTracks,
                            data.playheadPos, data.markIn, data.markOut,
                            data.zoomLevel);
+
+    // TM-8: this parentless heap Timeline is the queue / file / batch
+    // export path. The SSOT renderFrameAt no longer walks QObject parents
+    // to a live MainWindow for track-matte wiring (it has none here — that
+    // was the C1 silent-drop: matte rendered in preview, vanished on this
+    // export path). Populate the Timeline's own intrinsic matte carrier
+    // straight from the persisted ProjectData so this export path applies
+    // the EXACT same track matte the GUI preview shows. ProjectData's
+    // QVector<TrackMatteClipEntry> is keyed by entry.clipId ==
+    // MainWindow::brushClipId("track:clip") == tlrender::renderClipId —
+    // the exact key trackMatteClipEntriesForTimeline's consumer expects.
+    QHash<QString, TimelineTrackMatteEntry> matteEntries;
+    matteEntries.reserve(data.trackMatteClipEntries.size());
+    for (const TrackMatteClipEntry &entry : data.trackMatteClipEntries) {
+        if (entry.clipId.isEmpty())
+            continue;
+        TimelineTrackMatteEntry e;
+        e.matteType = entry.matteType;
+        e.matteSourceClipId = entry.matteSourceClipId;
+        matteEntries.insert(entry.clipId, e);
+    }
+    tl->setTrackMatteEntries(matteEntries);
+
     if (ownedOut)
         *ownedOut = tl;
     return tl;

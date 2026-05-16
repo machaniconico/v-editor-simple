@@ -8,8 +8,14 @@
 #include "TextManager.h"        // EnhancedTextOverlay (S6 — per-clip overlay list)
 #include "MaskSystem.h"         // S7 — genuine MaskSystem::generateMaskImage/applyMask
 #include "MotionTracker.h"      // S7 — genuine TrackingResult::positionAtTime
+#include "TrackMatteBake.h"     // TM-3 — shared SSOT track-matte compositor
+                                // TM-8 — track-matte wiring is now read from
+                                // Timeline::trackMatteEntries() (no MainWindow
+                                // include, no #define private public, no
+                                // worker-thread QWidget deref — C1+C2 fixed).
 
 #include <QtGlobal>
+#include <QHash>
 #include <QPainter>
 #include <QRectF>
 #include <QVector>
@@ -532,6 +538,53 @@ int activeClipOnTrack(const QVector<ClipInfo> &clips, double targetSec,
     return -1;
 }
 
+QString renderClipId(int trackIdx, int clipIdx)
+{
+    return QStringLiteral("%1:%2").arg(trackIdx).arg(clipIdx);
+}
+
+// TM-8: the track-matte wiring is now intrinsic to the Timeline. Both
+// producers populate it: MainWindow on every m_trackMatteClipEntries
+// mutation (GUI preview path), and RenderQueue::resolveTimeline after
+// rebuilding a parentless Timeline from a loaded project (queue / file /
+// batch export path). This runs on the RenderQueue WORKER thread and
+// touches NOTHING but the Timeline's own QHash — no MainWindow, no
+// QObject::parent() walk, no QWidget deref off the worker thread. That
+// kills the C2 data race AND the C1 edit≠export divergence (the parentless
+// export Timeline previously returned nullptr here → matte silently
+// dropped). The QHash is keyed by "trackIdx:clipIdx" (== renderClipId).
+const QHash<QString, TimelineTrackMatteEntry> *trackMatteClipEntriesForTimeline(const Timeline *timeline)
+{
+    if (!timeline)
+        return nullptr;
+    return &timeline->trackMatteEntries();
+}
+
+QImage renderOverlayLayerImage(const QImage &rgb, double videoScale,
+                               double videoDx, double videoDy,
+                               const QSize &canvasSize)
+{
+    if (rgb.isNull() || canvasSize.isEmpty())
+        return QImage();
+
+    QImage layerImage(canvasSize, QImage::Format_ARGB32_Premultiplied);
+    layerImage.fill(Qt::transparent);
+
+    QPainter p(&layerImage);
+    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+
+    const double w  = canvasSize.width()  * videoScale;
+    const double h  = canvasSize.height() * videoScale;
+    const double cx = canvasSize.width()  * 0.5 + videoDx * canvasSize.width();
+    const double cy = canvasSize.height() * 0.5 + videoDy * canvasSize.height();
+    const QRectF dst(cx - w * 0.5, cy - h * 0.5, w, h);
+    p.drawImage(dst, rgb);
+    p.end();
+
+    return layerImage;
+}
+
 } // namespace
 
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
@@ -612,7 +665,12 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
     const QImage base = v1Native.scaled(outSize, Qt::IgnoreAspectRatio,
                                         Qt::SmoothTransformation);
 
-    // ── Collect overlay layers from tracks V2.. (ascending = bottom-to-top) ──
+    // ── Collect render layers from tracks V1.. (ascending = bottom-to-top) ──
+    struct RenderLayer {
+        CompositeLayer layer;
+        QString clipId;
+        QImage image;      // already transformed to outSize
+    };
     struct OverlayLayer {
         QImage rgb;        // already scaled to outSize (the shared canvas grid)
         double opacity = 1.0;
@@ -620,7 +678,21 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         double videoDx = 0.0;
         double videoDy = 0.0;
     };
+    QVector<RenderLayer> renderLayers;
     QVector<OverlayLayer> overlays;
+    {
+        RenderLayer baseLayer;
+        baseLayer.clipId = renderClipId(0, v1Idx);
+        baseLayer.image = base;
+        baseLayer.layer.name = v1Clip.displayName;
+        baseLayer.layer.opacity = 1.0;
+        baseLayer.layer.blendMode = BlendMode::Normal;
+        baseLayer.layer.zOrder = 0;
+        baseLayer.layer.inPoint = v1Start;
+        baseLayer.layer.outPoint = v1Start + v1Clip.effectiveDuration();
+        renderLayers.append(baseLayer);
+    }
+
     for (int t = 1; t < tracks.size(); ++t) {
         TimelineTrack *trk = tracks[t];
         if (!trk || trk->isHidden())
@@ -654,20 +726,64 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         // for un-masked overlays, so S3's multi-track MSE stays ~0.
         const QImage native = applyClipMask(
             applyClipFxPack(gradeClipNativeFrame(nativeRaw, c), c), c, srcSec);
-        OverlayLayer L;
+        RenderLayer renderLayer;
+        renderLayer.clipId = renderClipId(t, idx);
         // Scale the overlay source to the shared canvas grid first; the
         // compositor's videoScale then sizes the dst rect relative to the
         // canvas exactly as composeMultiTrackFrame does for L.rgb.
-        L.rgb = native.scaled(outSize, Qt::IgnoreAspectRatio,
-                              Qt::SmoothTransformation);
+        const QImage rgb = native.scaled(outSize, Qt::IgnoreAspectRatio,
+                                         Qt::SmoothTransformation);
         // Straight ClipInfo -> layer copy, identical to the preview harvest
         // (src/VideoPlayer.cpp:4848-4850 finalizeOverlayFromDecoder and the
         // layer fill at VideoPlayer.cpp:3656/3734).
-        L.opacity = c.opacity;
-        L.videoScale = c.videoScale;
-        L.videoDx = c.videoDx;
-        L.videoDy = c.videoDy;
-        overlays.append(L);
+        OverlayLayer overlay;
+        overlay.rgb = rgb;
+        overlay.opacity = c.opacity;
+        overlay.videoScale = c.videoScale;
+        overlay.videoDx = c.videoDx;
+        overlay.videoDy = c.videoDy;
+        overlays.append(overlay);
+
+        renderLayer.layer.name = c.displayName;
+        renderLayer.layer.visible = c.opacity > 0.001;
+        renderLayer.layer.opacity = qBound(0.0, c.opacity, 1.0);
+        renderLayer.layer.blendMode = BlendMode::Normal;
+        renderLayer.layer.zOrder = t;
+        renderLayer.layer.inPoint = start;
+        renderLayer.layer.outPoint = start + c.effectiveDuration();
+        renderLayer.image = renderOverlayLayerImage(
+            rgb, c.videoScale, c.videoDx, c.videoDy, outSize);
+        renderLayers.append(renderLayer);
+    }
+
+    if (const auto *trackMatteEntries = trackMatteClipEntriesForTimeline(timeline);
+        trackMatteEntries && !trackMatteEntries->isEmpty()) {
+        QHash<QString, int> indexByClipId;
+        for (int i = 0; i < renderLayers.size(); ++i)
+            indexByClipId.insert(renderLayers[i].clipId, i);
+
+        for (int i = 0; i < renderLayers.size(); ++i) {
+            const auto it = trackMatteEntries->constFind(renderLayers[i].clipId);
+            if (it == trackMatteEntries->cend())
+                continue;
+            renderLayers[i].layer.matteType = it.value().matteType;
+            renderLayers[i].layer.matteSourceLayerIndex =
+                indexByClipId.value(it.value().matteSourceClipId, -1);
+        }
+    }
+
+    const bool hasOverlayLayers = renderLayers.size() > 1;
+    bool hasTrackMatteLayer = false;
+    for (int i = 0; i < renderLayers.size(); ++i) {
+        const CompositeLayer &layer = renderLayers[i].layer;
+        const int sourceIndex = layer.matteSourceLayerIndex;
+        if (layer.matteType != TrackMatteType::None
+            && sourceIndex >= 0
+            && sourceIndex < renderLayers.size()
+            && sourceIndex != i) {
+            hasTrackMatteLayer = true;
+            break;
+        }
     }
 
     // No overlays -> the multi-track stack reduces to the V1 base. S6 still
@@ -676,19 +792,19 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
     // text, so a lone V1 clip with a default transform stays byte-identical
     // to S2/S3/S4/S5 — applyAdjustmentLayers/applyTextOverlays return the
     // input UNTOUCHED in that case, no QPainter, no convert).
-    if (overlays.isEmpty()) {
+    if (!hasOverlayLayers && !hasTrackMatteLayer) {
         const QImage adj = applyAdjustmentLayers(base, timeline, usec);
         return applyTextOverlays(adj, timeline, usec, &v1Clip);
     }
 
-    // ── Composite: replicate VideoPlayer::composeMultiTrackFrame ────────────
-    // (src/VideoPlayer.cpp:4542-4582). Replicated here rather than calling the
-    // member directly because composeMultiTrackFrame is a non-static const
-    // METHOD of VideoPlayer; this SSOT must run without owning a VideoPlayer
-    // (the export path has none). The method body reads ONLY its arguments
-    // plus a local QPainter (zero member-state access, verified at
-    // VideoPlayer.cpp:4542-4582), so a faithful line-for-line port is
-    // pixel-equivalent. Each formula is annotated with the exact source line:
+    // ── Composite ──────────────────────────────────────────────────────────
+    // Matte-free timelines keep the existing byte-identical
+    // VideoPlayer::composeMultiTrackFrame replication (src/VideoPlayer.cpp:
+    // 4542-4582). When a valid track matte is active, the same decoded layer
+    // stack is handed to the shared trackmatte::composite SSOT instead of
+    // re-implementing matte application here.
+    //
+    // The matte-free formulas are annotated with the exact source line:
     //   - canvas := ARGB32_Premultiplied copy of v1 base   (VideoPlayer.cpp:4558)
     //   - SmoothPixmapTransform = false                      (VideoPlayer.cpp:4565)
     //   - CompositionMode_SourceOver                         (VideoPlayer.cpp:4566)
@@ -704,30 +820,44 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
     // rotation2DDegrees is intentionally NOT consulted in the authoritative
     // multi-track compositor — see VideoPlayer.cpp:4569-4579). To pixel-match
     // the authoritative comparator this SSOT also omits rotation here.
-    QImage composed = base.convertToFormat(QImage::Format_ARGB32_Premultiplied);
-    QPainter p(&composed);
-    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
-    p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    QImage stacked;
+    if (!hasTrackMatteLayer) {
+        QImage composed = base.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        QPainter p(&composed);
+        p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+        p.setCompositionMode(QPainter::CompositionMode_SourceOver);
 
-    const QSize canvas(composed.width(), composed.height());
-    for (const OverlayLayer &L : overlays) {
-        if (L.rgb.isNull() || L.opacity <= 0.001)
-            continue;
-        const double w  = canvas.width()  * L.videoScale;
-        const double h  = canvas.height() * L.videoScale;
-        const double cx = canvas.width()  * 0.5 + L.videoDx * canvas.width();
-        const double cy = canvas.height() * 0.5 + L.videoDy * canvas.height();
-        const QRectF dst(cx - w * 0.5, cy - h * 0.5, w, h);
-        p.setOpacity(qBound(0.0, L.opacity, 1.0));
-        p.drawImage(dst, L.rgb);
+        const QSize canvas(composed.width(), composed.height());
+        for (const OverlayLayer &L : overlays) {
+            if (L.rgb.isNull() || L.opacity <= 0.001)
+                continue;
+            const double w  = canvas.width()  * L.videoScale;
+            const double h  = canvas.height() * L.videoScale;
+            const double cx = canvas.width()  * 0.5 + L.videoDx * canvas.width();
+            const double cy = canvas.height() * 0.5 + L.videoDy * canvas.height();
+            const QRectF dst(cx - w * 0.5, cy - h * 0.5, w, h);
+            p.setOpacity(qBound(0.0, L.opacity, 1.0));
+            p.drawImage(dst, L.rgb);
+        }
+        p.end();
+
+        stacked = composed.convertToFormat(QImage::Format_RGBA8888);
+    } else {
+        QVector<CompositeLayer> layers;
+        QVector<QImage> layerImages;
+        layers.reserve(renderLayers.size());
+        layerImages.reserve(renderLayers.size());
+        for (const RenderLayer &renderLayer : renderLayers) {
+            layers.append(renderLayer.layer);
+            layerImages.append(renderLayer.image);
+        }
+
+        const QImage composed = trackmatte::composite(layers, layerImages, outSize);
+        stacked = composed.convertToFormat(QImage::Format_RGBA8888);
     }
-    p.end();
 
     // Public contract: Format_RGBA8888 at outSize (Timeline.h header / S2).
-    // The composite ran on an ARGB32_Premultiplied canvas for blend-correct
-    // SourceOver (matching VideoPlayer.cpp:4558); convert back so callers and
-    // framediff::mse see the documented format.
-    const QImage stacked = composed.convertToFormat(QImage::Format_RGBA8888);
+    // Keep callers and framediff::mse on the documented format.
 
     // S6 — over the fully-composited multi-track frame, apply the
     // adjustment-layer grade THEN bake text overlays, in the preview's order
