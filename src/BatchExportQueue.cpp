@@ -8,6 +8,8 @@ Queue::Queue(QObject *parent)
     m_timer = new QTimer(this);
     m_timer->setInterval(200);
     connect(m_timer, &QTimer::timeout, this, [this]() {
+        if (m_paused)
+            return;
         if (m_currentId.isEmpty())
             return;
 

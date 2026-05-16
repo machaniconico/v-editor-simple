@@ -202,11 +202,12 @@ void UploadClient::doAppend(const XUploadConfig &cfg, const QString &mediaId,
     multiPart->append(mediaPart);
 
     QNetworkReply *reply = m_nam->post(req, multiPart);
-    multiPart->setParent(reply);   // reply takes ownership
     if (!reply) {
+        multiPart->deleteLater();
         emit uploadFailed(QStringLiteral("failed to dispatch APPEND request"));
         return;
     }
+    multiPart->setParent(reply);   // reply takes ownership
 
     const qint64 nextOffset   = offset + static_cast<qint64>(chunk.size());
     const int    nextSegment  = segmentIndex + 1;

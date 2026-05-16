@@ -172,13 +172,14 @@ void Publisher::startPollLoop(const QString &creationId, const IgConfig &config,
                 return;
             }
 
-            if (statusCode == QStringLiteral("FINISHED")) {
+            if (statusCode == QStringLiteral("FINISHED")
+                || statusCode == QStringLiteral("PUBLISHED")) {
                 // Phase 3: publish the container
                 doMediaPublish(creationId, config);
                 return;
             }
 
-            // Still IN_PROGRESS or PUBLISHED — keep polling
+            // Still IN_PROGRESS — keep polling
             startPollLoop(creationId, config, pollCount + 1);
         });
     });

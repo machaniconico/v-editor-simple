@@ -186,6 +186,13 @@ QVector<float> processAll(const QVector<float> &in, int sampleRate, const Restor
 {
     QVector<float> out = in; // copy; never mutate caller's buffer
 
+    // Sanitize non-finite input: a single NaN/Inf would otherwise propagate
+    // through the deHum biquad feedback and corrupt every subsequent sample.
+    for (float &s : out) {
+        if (!std::isfinite(s))
+            s = 0.0f;
+    }
+
     if (cfg.doDeclick)
         deClick(out, sampleRate, cfg.declickThreshold);
 

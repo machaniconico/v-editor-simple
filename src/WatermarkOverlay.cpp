@@ -80,11 +80,12 @@ QImage applyWatermark(const QImage &frame, const WmConfig &cfg)
 
     if (cfg.position == Position::Tiled) {
         // Tiled: repeat the stamp across the whole frame in a grid
-        const int spacingX = sw + qMax(sw / 2, cfg.marginPx);
-        const int spacingY = sh + qMax(sh / 2, cfg.marginPx);
+        const int margin   = qMax(0, cfg.marginPx);
+        const int spacingX = qMax(1, sw + qMax(sw / 2, margin));
+        const int spacingY = qMax(1, sh + qMax(sh / 2, margin));
 
-        for (int y = cfg.marginPx; y < fh; y += spacingY) {
-            for (int x = cfg.marginPx; x < fw; x += spacingX) {
+        for (int y = margin; y < fh; y += spacingY) {
+            for (int x = margin; x < fw; x += spacingX) {
                 if (cfg.rotationDeg != 0.0) {
                     painter.save();
                     painter.translate(x + sw / 2.0, y + sh / 2.0);

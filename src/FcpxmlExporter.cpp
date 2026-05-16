@@ -18,6 +18,11 @@ static QString fmtTime(double secs, int fps)
     return QString::number(qRound(secs * fps)) + "/" + QString::number(fps) + "s";
 }
 
+static QString xmlEsc(QString s)
+{
+    return s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+}
+
 // ---------------------------------------------------------------------------
 // buildXml
 // ---------------------------------------------------------------------------
@@ -78,9 +83,9 @@ QString buildXml(const QVector<ClipEntry> &clips, const ExporterConfig &config)
         const QString srcUrl = QUrl::fromLocalFile(c->filePath).toString();
 
         s << "    <asset"
-          << " id=\"r"      << assetIdx << "\""
-          << " name=\""     << clipName << "\""
-          << " src=\""      << srcUrl   << "\""
+          << " id=\"r"      << assetIdx          << "\""
+          << " name=\""     << xmlEsc(clipName)  << "\""
+          << " src=\""      << xmlEsc(srcUrl)    << "\""
           << " start=\"0s\""
           << " duration=\"" << fmtTime(c->duration, fps) << "\""
           << " hasVideo=\"1\""
@@ -92,8 +97,8 @@ QString buildXml(const QVector<ClipEntry> &clips, const ExporterConfig &config)
 
     // --- library / event / project / sequence / spine ---
     s << "  <library>\n";
-    s << "    <event name=\"" << config.projectName << " Event\">\n";
-    s << "      <project name=\"" << config.projectName << "\">\n";
+    s << "    <event name=\"" << xmlEsc(config.projectName) << " Event\">\n";
+    s << "      <project name=\"" << xmlEsc(config.projectName) << "\">\n";
     s << "        <sequence"
       << " format=\"r0\""
       << " duration=\""  << fmtTime(totalDuration, fps) << "\""
@@ -113,7 +118,7 @@ QString buildXml(const QVector<ClipEntry> &clips, const ExporterConfig &config)
           << " offset=\""   << fmtTime(c.offset, fps)        << "\""
           << " duration=\"" << fmtTime(c.duration, fps)      << "\""
           << " start=\""    << fmtTime(c.startInSource, fps) << "\""
-          << " name=\""     << clipName                      << "\""
+          << " name=\""     << xmlEsc(clipName)               << "\""
           << "/>\n";
     }
 

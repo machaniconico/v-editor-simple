@@ -177,15 +177,15 @@ double measureIntegratedLufs(const QString &audioPath)
         }
         qWarning("loudness::measureIntegratedLufs: failed to read raw PCM '%s'",
                  qUtf8Printable(audioPath));
-        return -23.0;
+        return std::numeric_limits<double>::quiet_NaN();
     }
 
     // Compressed/container decoding is not wired here; a later integration
     // story routes this through the project's decoder facilities.
     qWarning("loudness::measureIntegratedLufs: audio decoding not wired for "
-             "'%s'; returning broadcast fallback (-23.0 LUFS)",
+             "'%s'; unsupported container — returning NaN",
              qUtf8Printable(audioPath));
-    return -23.0;
+    return std::numeric_limits<double>::quiet_NaN();
 }
 
 } // namespace loudness

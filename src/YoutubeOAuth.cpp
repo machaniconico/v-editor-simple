@@ -284,14 +284,17 @@ void AuthClient::onTokenReplyFinished() {
         emit authError(QStringLiteral("Token reply has no sender"));
         return;
     }
+    m_pendingReply.clear();
+    const QNetworkReply::NetworkError err = reply->error();
+    const QString errStr = reply->errorString();
+    const QByteArray body = reply->readAll();
     reply->deleteLater();
-    if (reply->error() != QNetworkReply::NoError) {
-        const QByteArray body = reply->readAll();
+    if (err != QNetworkReply::NoError) {
         emit authError(QStringLiteral("Token endpoint error: %1 (%2)")
-                       .arg(reply->errorString(), QString::fromUtf8(body)));
+                       .arg(errStr, QString::fromUtf8(body)));
         return;
     }
-    parseTokenJson(reply->readAll(), m_pendingIsRefresh);
+    parseTokenJson(body, m_pendingIsRefresh);
 }
 
 void AuthClient::parseTokenJson(const QByteArray& json, bool isRefresh) {
