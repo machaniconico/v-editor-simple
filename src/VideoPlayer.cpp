@@ -3,6 +3,19 @@
 #include "GLPreview.h"
 #include "ProxyManager.h"
 #include "TextOverlayBake.h"   // textbake::bakeOverlays (shared text baker SSOT)
+#include "ClipGeometry.h"      // clipgeom::renderLayer (shared clip-placement SSOT)
+#include <algorithm>           // std::stable_sort
+
+// Free comparator for the production layer sort. Extracted from the inline
+// lambda in handlePlaybackTick so the S3-STACK predicate sub-assertion in
+// main.cpp can exercise the EXACT same comparator and catch a re-inversion.
+// Returns true when `a` should paint BEFORE `b` (i.e. is deeper in the stack):
+// V1 (sourceTrack 0) is the base; higher tracks paint on top — ascending order.
+bool layerPaintOrderLess(const VideoPlayer::DecodedLayer &a,
+                         const VideoPlayer::DecodedLayer &b)
+{
+    return a.sourceTrack < b.sourceTrack;
+}
 
 #if defined(_WIN32)
 // Phase 1e — d3d11.h pulls in WinSDK 10.0.26100 headers that fight Qt's
@@ -3515,8 +3528,13 @@ void VideoPlayer::handlePlaybackTick()
             for (int idx : activeIdxs) {
                 if (idx < 0 || idx >= m_sequence.size())
                     continue;
-                if (v1FullyCoversCanvas && idx != m_activeEntry)
-                    continue; // V1 hides V2+ entirely — skip overlay decode
+                // v1FullyCoversCanvas occlusion-cull removed: export always
+                // composites V2+ over V1 regardless of V1 opacity/scale, so
+                // skipping overlay decode here created a preview≠export
+                // divergence on opaque V1 + PiP/title overlay scenes.
+                // (nonV1Count==0 means only V1 is active; idx!=m_activeEntry
+                // is then always false so the old skip never fired then
+                // anyway — no perf regression from removing it here.)
                 const auto &e = m_sequence[idx];
                 if (idx == m_activeEntry) {
                     if (m_lastV1RawFrame.isNull())
@@ -3528,6 +3546,7 @@ void VideoPlayer::handlePlaybackTick()
                     layer.videoScale = e.videoScale;
                     layer.videoDx = e.videoDx;
                     layer.videoDy = e.videoDy;
+                    layer.rotation2DDegrees = e.rotation2DDegrees;
                     layer.sourceTrack = e.sourceTrack;
                     layer.sequenceIdx = idx;
                     layers.append(layer);
@@ -3589,8 +3608,10 @@ void VideoPlayer::handlePlaybackTick()
             for (int idx : activeIdxs) {
                 if (idx < 0 || idx >= m_sequence.size())
                     continue;
-                if (v1FullyCoversCanvas && idx != m_activeEntry)
-                    continue; // V1 hides V2+ entirely — skip overlay decode
+                // v1FullyCoversCanvas occlusion-cull removed (same reasoning
+                // as parallel path above): export always composites V2+, so
+                // this skip was a preview≠export divergence on opaque V1 +
+                // overlay scenes.
                 const auto &e = m_sequence[idx];
                 DecodedLayer layer;
                 if (idx == m_activeEntry) {
@@ -3606,6 +3627,7 @@ void VideoPlayer::handlePlaybackTick()
                 layer.videoScale = e.videoScale;
                 layer.videoDx = e.videoDx;
                 layer.videoDy = e.videoDy;
+                layer.rotation2DDegrees = e.rotation2DDegrees;
                 layer.sourceTrack = e.sourceTrack;
                 layer.sequenceIdx = idx;
                 layers.append(layer);
@@ -3613,15 +3635,19 @@ void VideoPlayer::handlePlaybackTick()
                     overlayPresent = true;
             }
         }
-        // V1-wins paint order: higher sourceTrack = back, V1 (sourceTrack 0)
-        // = front. Sort DESCENDING by sourceTrack so V_max paints first into
-        // the canvas and V1 paints last on top — V1 covers V2 wherever V1
-        // has opaque pixels, V2 fills V1's gaps and shows through V1's
-        // per-clip opacity.
-        std::sort(layers.begin(), layers.end(),
-                  [](const DecodedLayer &a, const DecodedLayer &b) {
-                      return a.sourceTrack > b.sourceTrack;
-                  });
+        // Export-matching paint order: V1 (sourceTrack 0) is the base,
+        // higher tracks (V2, V3, …) paint OVER it — ascending by sourceTrack.
+        // This mirrors renderFrameAt (TimelineFrameRenderer.cpp:681/719/869),
+        // trackmatte::composite (TrackMatteBake.cpp:82 ascending array order),
+        // and MainWindow::buildSpecialClipComposite (zOrder ascending), so
+        // an opaque V2 overlay occludes V1 in preview exactly as in export.
+        // stable_sort: deterministic tie-break for same-sourceTrack clips
+        // (preserves input order for equal keys); behaviour-identical to sort
+        // for the common distinct-track case.
+        // layerPaintOrderLess is a named free function (declared in
+        // VideoPlayer.h) so the S3-STACK predicate sub-assertion in main.cpp
+        // exercises the SAME comparator — a re-inversion breaks the selftest.
+        std::stable_sort(layers.begin(), layers.end(), layerPaintOrderLess);
         if (overlayPresent) {
             // Reuse a canvas-sized scratch buffer so we don't allocate
             // ~8MB (1080p ARGB) every tick. Re-allocates only when the
@@ -4429,25 +4455,28 @@ QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
     // 100% opaque base layer paints over the canvas just like GL does.
     QImage composed = v1Frame.convertToFormat(QImage::Format_ARGB32_Premultiplied);
     QPainter p(&composed);
-    // Nearest-neighbor sampling. Software bilinear (the prior default) is
-    // ~5-10x more expensive at 1080p+ and was the dominant contributor to
-    // the multi-track "video heavy" regression. The user-visible aliasing
-    // for live preview is acceptable; the export path can re-enable smooth
-    // sampling if higher quality is needed there.
-    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
     p.setCompositionMode(QPainter::CompositionMode_SourceOver);
 
+    // Per-layer placement now goes through the clipgeom SSOT so live preview
+    // geometry (translate -> rotate -> scale, normalized dx/dy, canvas-center
+    // anchor) is byte-identical to every export path — and rotation is no
+    // longer dropped. Nearest-neighbor sampling (smooth=false) is retained
+    // for live perf: software bilinear is ~5-10x more expensive at 1080p+ and
+    // was the dominant contributor to the multi-track "video heavy"
+    // regression. The sampling-only difference vs. the smooth export is
+    // absorbed by the PARITY S3 MSE tolerance; the geometry is exact.
+    const bool kSmooth = false;
     const QSize canvas(composed.width(), composed.height());
     for (const DecodedLayer &L : overlayLayers) {
         if (L.rgb.isNull() || L.opacity <= 0.001)
             continue;
-        const double w  = canvas.width()  * L.videoScale;
-        const double h  = canvas.height() * L.videoScale;
-        const double cx = canvas.width()  * 0.5 + L.videoDx * canvas.width();
-        const double cy = canvas.height() * 0.5 + L.videoDy * canvas.height();
-        const QRectF dst(cx - w * 0.5, cy - h * 0.5, w, h);
+        const QImage placed = clipgeom::renderLayer(
+            L.rgb,
+            clipgeom::ClipTransform{L.videoScale, L.videoDx, L.videoDy,
+                                    L.rotation2DDegrees},
+            canvas, kSmooth);
         p.setOpacity(qBound(0.0, L.opacity, 1.0));
-        p.drawImage(dst, L.rgb);
+        p.drawImage(0, 0, placed);
     }
     p.end();
     return composed;
@@ -4500,20 +4529,24 @@ void VideoPlayer::composeMultiTrackFrameInto(QImage &canvas,
     if (canvas.format() != QImage::Format_ARGB32_Premultiplied)
         return;
     QPainter p(&canvas);
-    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
     p.setCompositionMode(QPainter::CompositionMode_SourceOver);
 
+    // Same clipgeom SSOT placement as composeMultiTrackFrame (geometry exact,
+    // rotation included); smooth=false preserved from the legacy live-preview
+    // setting for perf — the sampling-only delta vs. export is inside S3's
+    // MSE tolerance.
+    const bool kSmooth = false;
     const QSize cs(canvas.width(), canvas.height());
     for (const DecodedLayer &L : overlayLayers) {
         if (L.rgb.isNull() || L.opacity <= 0.001)
             continue;
-        const double w  = cs.width()  * L.videoScale;
-        const double h  = cs.height() * L.videoScale;
-        const double cx = cs.width()  * 0.5 + L.videoDx * cs.width();
-        const double cy = cs.height() * 0.5 + L.videoDy * cs.height();
-        const QRectF dst(cx - w * 0.5, cy - h * 0.5, w, h);
+        const QImage placed = clipgeom::renderLayer(
+            L.rgb,
+            clipgeom::ClipTransform{L.videoScale, L.videoDx, L.videoDy,
+                                    L.rotation2DDegrees},
+            cs, kSmooth);
         p.setOpacity(qBound(0.0, L.opacity, 1.0));
-        p.drawImage(dst, L.rgb);
+        p.drawImage(0, 0, placed);
     }
     p.end();
 }
@@ -4743,12 +4776,13 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
             return false;
     }
 
-    out->opacity     = e.opacity;
-    out->videoScale  = e.videoScale;
-    out->videoDx     = e.videoDx;
-    out->videoDy     = e.videoDy;
-    out->sourceTrack = e.sourceTrack;
-    out->sequenceIdx = seqIdx;
+    out->opacity            = e.opacity;
+    out->videoScale         = e.videoScale;
+    out->videoDx            = e.videoDx;
+    out->videoDy            = e.videoDy;
+    out->rotation2DDegrees  = e.rotation2DDegrees;
+    out->sourceTrack        = e.sourceTrack;
+    out->sequenceIdx        = seqIdx;
     return true;
 }
 

@@ -9,6 +9,7 @@
 #include "MaskSystem.h"         // S7 — genuine MaskSystem::generateMaskImage/applyMask
 #include "MotionTracker.h"      // S7 — genuine TrackingResult::positionAtTime
 #include "TrackMatteBake.h"     // TM-3 — shared SSOT track-matte compositor
+#include "ClipGeometry.h"       // G3 — canonical clip-placement SSOT (clipgeom)
 #include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
                                 // TM-8 — track-matte wiring is now read from
                                 // Timeline::trackMatteEntries() (no MainWindow
@@ -569,29 +570,22 @@ QHash<QString, TimelineTrackMatteEntry> trackMatteClipEntriesForTimeline(const T
     return timeline->trackMatteEntries();
 }
 
+// G3: per-layer placement now delegates to the canonical clipgeom SSOT
+// (src/ClipGeometry.h). videoDx/videoDy stay NORMALIZED fractions of the
+// canvas, the anchor stays the canvas centre, and — unlike the prior inline
+// math — rotationDeg (== ClipInfo::rotation2DDegrees) IS now applied, so a
+// rotated clip exports with its rotation. clipgeom::renderLayer returns a
+// canvas-sized ARGB32_Premultiplied image with `rgb` placed; the SourceOver
+// stacking below is unchanged.
 QImage renderOverlayLayerImage(const QImage &rgb, double videoScale,
                                double videoDx, double videoDy,
-                               const QSize &canvasSize)
+                               double rotationDeg, const QSize &canvasSize)
 {
     if (rgb.isNull() || canvasSize.isEmpty())
         return QImage();
 
-    QImage layerImage(canvasSize, QImage::Format_ARGB32_Premultiplied);
-    layerImage.fill(Qt::transparent);
-
-    QPainter p(&layerImage);
-    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
-    p.setCompositionMode(QPainter::CompositionMode_SourceOver);
-
-    const double w  = canvasSize.width()  * videoScale;
-    const double h  = canvasSize.height() * videoScale;
-    const double cx = canvasSize.width()  * 0.5 + videoDx * canvasSize.width();
-    const double cy = canvasSize.height() * 0.5 + videoDy * canvasSize.height();
-    const QRectF dst(cx - w * 0.5, cy - h * 0.5, w, h);
-    p.drawImage(dst, rgb);
-    p.end();
-
-    return layerImage;
+    const clipgeom::ClipTransform t{videoScale, videoDx, videoDy, rotationDeg};
+    return clipgeom::renderLayer(rgb, t, canvasSize, /*smooth=*/true);
 }
 
 } // namespace
@@ -670,9 +664,28 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
     // so a lone V1 clip stays byte-identical to S2/S3/S4/S5/S6.
     const QImage v1Native = applyClipMask(v1Fx, v1Clip, v1SourceSec);
 
-    // Base canvas == S2 output exactly: scaled to outSize, RGBA8888.
-    const QImage base = v1Native.scaled(outSize, Qt::IgnoreAspectRatio,
-                                        Qt::SmoothTransformation);
+    // Base canvas placement — V1 clip transform applied via clipgeom SSOT.
+    // Fast path (byte-identical to S2, MSE=0 preserved): when the V1 clip
+    // carries the exact-default transform (videoScale==1.0, videoDx==0.0,
+    // videoDy==0.0, rotation2DDegrees==0.0) skip clipgeom entirely and use
+    // the direct scaled() path so untransformed single-track projects stay
+    // byte-identical to the S2 reference.
+    // Transformed path: any deviation from exact-default (Ken-Burns, pan,
+    // rotate, motion-track) routes through clipgeom::renderLayer so export
+    // matches the GLPreview transform — closing the edit≠export gap for V1.
+    const bool v1TransformIsDefault =
+        v1Clip.videoScale       == 1.0 &&
+        v1Clip.videoDx          == 0.0 &&
+        v1Clip.videoDy          == 0.0 &&
+        v1Clip.rotation2DDegrees == 0.0;
+    const QImage base = v1TransformIsDefault
+        ? v1Native.scaled(outSize, Qt::IgnoreAspectRatio,
+                          Qt::SmoothTransformation)
+        : clipgeom::renderLayer(
+              v1Native,
+              clipgeom::ClipTransform{v1Clip.videoScale, v1Clip.videoDx,
+                                      v1Clip.videoDy, v1Clip.rotation2DDegrees},
+              outSize, /*smooth=*/true);
 
     // ── Collect render layers from tracks V1.. (ascending = bottom-to-top) ──
     struct RenderLayer {
@@ -686,6 +699,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         double videoScale = 1.0;
         double videoDx = 0.0;
         double videoDy = 0.0;
+        double rotationDeg = 0.0;   // G3: == ClipInfo::rotation2DDegrees
     };
     QVector<RenderLayer> renderLayers;
     QVector<OverlayLayer> overlays;
@@ -751,6 +765,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         overlay.videoScale = c.videoScale;
         overlay.videoDx = c.videoDx;
         overlay.videoDy = c.videoDy;
+        overlay.rotationDeg = c.rotation2DDegrees;   // G3: carry clip rotation
         overlays.append(overlay);
 
         renderLayer.layer.name = c.displayName;
@@ -760,8 +775,13 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         renderLayer.layer.zOrder = t;
         renderLayer.layer.inPoint = start;
         renderLayer.layer.outPoint = start + c.effectiveDuration();
+        // G3: the matte path's per-layer image is placed via the same
+        // clipgeom SSOT (renderOverlayLayerImage now delegates to it),
+        // including rotation, so trackmatte::composite receives correctly
+        // placed layers. The matte/blend math in composite() is untouched.
         renderLayer.image = renderOverlayLayerImage(
-            rgb, c.videoScale, c.videoDx, c.videoDy, outSize);
+            rgb, c.videoScale, c.videoDx, c.videoDy,
+            c.rotation2DDegrees, outSize);
         renderLayers.append(renderLayer);
     }
 
@@ -819,28 +839,25 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
     }
 
     // ── Composite ──────────────────────────────────────────────────────────
-    // Matte-free timelines keep the existing byte-identical
-    // VideoPlayer::composeMultiTrackFrame replication (src/VideoPlayer.cpp:
-    // 4542-4582). When a valid track matte is active, the same decoded layer
-    // stack is handed to the shared trackmatte::composite SSOT instead of
-    // re-implementing matte application here.
+    // Matte-free timelines keep the VideoPlayer::composeMultiTrackFrame
+    // compositing semantics (src/VideoPlayer.cpp:4542-4582): ARGB32_Premul
+    // canvas, SourceOver, per-clip opacity. When a valid track matte is
+    // active, the same decoded layer stack is handed to the shared
+    // trackmatte::composite SSOT instead of re-implementing matte here.
     //
-    // The matte-free formulas are annotated with the exact source line:
+    // The retained compositing rules (exact source line):
     //   - canvas := ARGB32_Premultiplied copy of v1 base   (VideoPlayer.cpp:4558)
     //   - SmoothPixmapTransform = false                      (VideoPlayer.cpp:4565)
     //   - CompositionMode_SourceOver                         (VideoPlayer.cpp:4566)
     //   - skip layer when rgb null or opacity <= 0.001       (VideoPlayer.cpp:4570)
-    //   - w  = canvas.width()  * L.videoScale                (VideoPlayer.cpp:4572)
-    //   - h  = canvas.height() * L.videoScale                (VideoPlayer.cpp:4573)
-    //   - cx = canvas.width()  * 0.5 + L.videoDx * width     (VideoPlayer.cpp:4574)
-    //   - cy = canvas.height() * 0.5 + L.videoDy * height    (VideoPlayer.cpp:4575)
-    //   - dst = QRectF(cx-w*0.5, cy-h*0.5, w, h)             (VideoPlayer.cpp:4576)
     //   - opacity = qBound(0.0, L.opacity, 1.0)               (VideoPlayer.cpp:4577)
-    //   - p.drawImage(dst, L.rgb)                             (VideoPlayer.cpp:4578)
-    // NOTE: composeMultiTrackFrame applies NO 2D rotation (ClipInfo
-    // rotation2DDegrees is intentionally NOT consulted in the authoritative
-    // multi-track compositor — see VideoPlayer.cpp:4569-4579). To pixel-match
-    // the authoritative comparator this SSOT also omits rotation here.
+    //   - SourceOver-composite the placed layer over the canvas
+    // G3: the per-layer GEOMETRIC PLACEMENT (scale + normalized centre offset
+    // + rotation) is now produced by the canonical clipgeom SSOT
+    // (clipgeom::renderLayer) instead of inline dst-rect math, so a rotated
+    // clip (rotation2DDegrees != 0) now exports ROTATED. clipgeom::renderLayer
+    // returns a canvas-sized layer with `rgb` placed; that placed layer is
+    // then SourceOver-composited at the clip's opacity exactly as before.
     QImage stacked;
     if (!hasTrackMatteLayer) {
         QImage composed = base.convertToFormat(QImage::Format_ARGB32_Premultiplied);
@@ -852,13 +869,12 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         for (const OverlayLayer &L : overlays) {
             if (L.rgb.isNull() || L.opacity <= 0.001)
                 continue;
-            const double w  = canvas.width()  * L.videoScale;
-            const double h  = canvas.height() * L.videoScale;
-            const double cx = canvas.width()  * 0.5 + L.videoDx * canvas.width();
-            const double cy = canvas.height() * 0.5 + L.videoDy * canvas.height();
-            const QRectF dst(cx - w * 0.5, cy - h * 0.5, w, h);
+            const clipgeom::ClipTransform t{L.videoScale, L.videoDx,
+                                            L.videoDy, L.rotationDeg};
+            const QImage placed =
+                clipgeom::renderLayer(L.rgb, t, canvas, /*smooth=*/true);
             p.setOpacity(qBound(0.0, L.opacity, 1.0));
-            p.drawImage(dst, L.rgb);
+            p.drawImage(0, 0, placed);
         }
         p.end();
 

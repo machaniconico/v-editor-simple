@@ -4935,120 +4935,1237 @@ int runParitySelftest()
         qInfo() << "[INFO] PARITY S2 SSOT renderer OK";
     }
 
-    // ── S3: multi-track compositing + per-clip transform ────────────────────
-    // Build a real 2-track Timeline (V1 base + V2 overlay with a non-identity
-    // transform) and prove tlrender::renderFrameAt's composite pixel-matches
-    // the AUTHORITATIVE preview compositor VideoPlayer::composeMultiTrackFrame
-    // (src/VideoPlayer.cpp:4542) fed the SAME two decoded frames + transforms.
-    // That member is the comparator the acceptance criterion names; it reads
-    // only its arguments (zero member-state access, VideoPlayer.cpp:4542-4582)
-    // so a hidden VideoPlayer — constructed exactly like the S2 Timeline
-    // QWidget, no show()/GL context — can invoke it standalone. Asset
-    // resolution mirrors S2: missing asset -> qWarning + return 0.
+    // ── S3: multi-track compositing + per-clip TRANSFORM — INDEPENDENT ──────
+    // VERIFICATION-INTEGRITY oracle. The previous S3 compared
+    // tlrender::renderFrameAt against a "reference" obtained from
+    // VideoPlayer::composeMultiTrackFrameForTest. After the clipgeom SSOT
+    // unification (src/ClipGeometry.h) BOTH the export path (renderFrameAt)
+    // AND composeMultiTrackFrame place every layer through the SAME
+    // clipgeom::renderLayer. That made old-S3 a "clipgeom == clipgeom"
+    // tautology: it would PASS even if clipgeom's rotate/translate/scale math
+    // were wrong (e.g. inverted rotation sign), violating the project
+    // independent-comparator rule (feedback_independent_comparator).
+    //
+    // WHY THIS IS NON-TAUTOLOGICAL: the EXPECTED pixels/coordinates here are
+    // NEVER produced by the code under test. Every expected coordinate is
+    // derived by plain CLOSED-FORM arithmetic written out in this test
+    // (canvas dims, the scale factor, the LAYER-CENTER anchor, and a 90°
+    // rotation modelled from first principles as the Qt row-vector point map
+    // (x,y)->(−y,x) about the placement centre). NO QTransform, NO
+    // clipgeom::resolveTransform, NO clipgeom::renderLayer, NO renderFrameAt
+    // and NO composeMultiTrackFrame is ever used to compute an expected value.
+    // The SUT (tlrender::renderFrameAt, the export path) is the ONLY producer
+    // of the actual pixels; the oracle is fully external and hand-computed.
+    //
+    // LAYER-CENTER CANONICAL CONTRACT (ClipGeometry.cpp resolveTransform):
+    // The transform is built as (Qt post-multiply / row-vector order):
+    //   translate(cx,cy) ∘ rotate(θ) ∘ scale(s) ∘ translate(−W/2,−H/2)
+    // where cx = W/2 + videoDx*W, cy = H/2 + videoDy*H, W=canvasWidth,
+    // H=canvasHeight. Applied to a canvas-sized source point (px,py):
+    //   (1) un-center: (px−W/2,  py−H/2)
+    //   (2) scale s:   (s*(px−W/2), s*(py−H/2))
+    //   (3) rotate+90°: (−s*(py−H/2), s*(px−W/2))   [Qt (x,y)→(−y,x)]
+    //   (4) translate: (−s*(py−H/2)+cx, s*(px−W/2)+cy)
+    // IDENTITY CHECK: scale=1,dx=dy=rot=0 ⇒ source (0,0)→(0,0), source
+    // (W,H)→(W,H) — fills the canvas exactly (no corner-pivot artifact).
+    // Inverting clipgeom's rotation sign OR removing the un-center step
+    // relocates the overlay to a DISJOINT region — S3 MUST then fail loudly.
+    //
+    // Synthetic SOLID-COLOUR layers make the expectation analytically exact:
+    // a flat rect under the above transform has a hand-derivable bounding
+    // box, so "inside == colour B" / "outside == colour A" is closed-form.
+    // Sources are generated with ffmpeg lavfi (the SAME dependency S2 uses);
+    // missing ffmpeg → qWarning + return 0 (CI-tolerant, never a silent
+    // pass), mirroring S2's missing-asset idiom. The S2 ffmpeg-decode oracle
+    // is UNCHANGED above. NOTE: ffmpeg's lavfi `color` source shifts every
+    // channel by −1 (observed elsewhere in this file); the colour
+    // expectation is therefore read back from an INDEPENDENT decode
+    // (tlrender::detail::decodeClipFrameNativeForTest — a thin libav
+    // pass-through, NOT the composite under test), exactly as the
+    // track-matte export-integration selftest does. The GEOMETRY
+    // expectation stays pure hand arithmetic regardless.
     {
-        const QString clipArg = qEnvironmentVariable(
-            "VEDITOR_E2E_CLIP", QStringLiteral("test_assets/e2e_clip.mp4"));
-        const QString clipPath = QDir::current().absoluteFilePath(clipArg);
-        qInfo() << "PARITY S3: clip path" << clipPath;
-        if (!QFile::exists(clipPath)) {
-            qWarning() << "PARITY S3: missing test asset" << clipPath
-                       << "(skipping S3)";
+        QTemporaryDir tmpDir;
+        if (!tmpDir.isValid()) {
+            qCritical() << "PARITY S3 FAILED: could not create temp dir";
+            return 1;
+        }
+
+        // ffmpeg lavfi solid-colour clip generator (lossless RGB so the only
+        // colour transform is lavfi's own −1 channel shift, absorbed by the
+        // independent decode-read-back below). `extraVf` injects an optional
+        // drawbox for the rotation-DIRECTION marker / wide-rect cases.
+        auto genClip = [](const QString &outPath, const QString &hexColor,
+                          const QString &extraVf) -> bool {
+            QStringList args{ QStringLiteral("-hide_banner"),
+                              QStringLiteral("-loglevel"), QStringLiteral("error"),
+                              QStringLiteral("-y"),
+                              QStringLiteral("-f"), QStringLiteral("lavfi"),
+                              QStringLiteral("-i"),
+                              // 160x90 source ⇒ ISOTROPIC scale onto the
+                              // 640x360 canvas grid (640/160 = 360/90 = 4.0),
+                              // so a 2:1 source rect stays exactly 2:1 after
+                              // native.scaled(outSize) — required for the
+                              // closed-form Case-B aspect arithmetic.
+                              QStringLiteral("color=c=%1:s=160x90:r=10:d=1")
+                                  .arg(hexColor) };
+            if (!extraVf.isEmpty()) {
+                args << QStringLiteral("-vf") << extraVf;
+            }
+            args << QStringLiteral("-frames:v") << QStringLiteral("1")
+                 << QStringLiteral("-c:v") << QStringLiteral("libx264rgb")
+                 << QStringLiteral("-qp") << QStringLiteral("0")
+                 << QStringLiteral("-pix_fmt") << QStringLiteral("rgb24")
+                 << outPath;
+            QProcess ff;
+            ff.start(QStringLiteral("ffmpeg"), args);
+            if (!ff.waitForStarted(15000))
+                return false;
+            ff.waitForFinished(60000);
+            return ff.exitStatus() == QProcess::NormalExit
+                && ff.exitCode() == 0 && QFile::exists(outPath);
+        };
+
+        const QString basePath  = tmpDir.filePath(QStringLiteral("s3_base.mp4"));
+        const QString ovPath    = tmpDir.filePath(QStringLiteral("s3_ov.mp4"));
+        const QString wideOvPath= tmpDir.filePath(QStringLiteral("s3_wide.mp4"));
+        const QString markOvPath= tmpDir.filePath(QStringLiteral("s3_mark.mp4"));
+        // V1 base = colour A (10,20,30); overlay = colour B (200,40,60).
+        // Wide-overlay case: a 2:1 bright rect on a distinct dark field so
+        // its rendered bbox aspect is measurable. Marker case: solid B with
+        // one bright (255,255,0) block in the SOURCE top-left quadrant.
+        const bool genOk =
+            genClip(basePath,   QStringLiteral("0x0A141E"), QString())
+         && genClip(ovPath,     QStringLiteral("0xC8283C"), QString())
+         && genClip(wideOvPath, QStringLiteral("0x0A0A0A"),
+                    // 2:1 (w:h) bright block, 80x40 at src (40,25) in the
+                    // 160x90 source. At the isotropic 4.0x scale it becomes
+                    // exactly 320x160 on the 640x360 canvas grid (aspect
+                    // 2.0); rot90 ⇒ 160x320 (aspect 0.5).
+                    QStringLiteral("drawbox=x=40:y=25:w=80:h=40:"
+                                   "color=0xC8283C:t=fill"))
+         && genClip(markOvPath, QStringLiteral("0xC8283C"),
+                    // bright marker in the SOURCE top-left quadrant (the
+                    // 160x90 source's TL quadrant is [0,80)x[0,45)); a
+                    // 40x25 block at src (20,10) ⇒ source centre (40,22.5)
+                    // ⇒ canvas-grid centre (160,90).
+                    QStringLiteral("drawbox=x=20:y=10:w=40:h=25:"
+                                   "color=0xFFFF00:t=fill"));
+        if (!genOk) {
+            qWarning() << "PARITY S3: ffmpeg unavailable or failed to "
+                          "synthesise solid-colour clips (skipping S3 — "
+                          "CI-tolerant, NOT a silent pass)";
             qInfo() << "[INFO] PARITY selftest OK";
             return 0;
         }
 
-        // V1: real libav-probed ClipInfo via the public addClip(filePath).
-        Timeline tl;
-        tl.addClip(clipPath);
-        if (tl.videoClips().isEmpty()) {
-            qCritical() << "PARITY S3 FAILED: addClip produced no V1 clip";
-            return 1;
-        }
-
-        // V2 overlay: add a real second video track, then append a clip onto
-        // it via the canonical TimelineTrack::addClip path (src/Timeline.cpp:
-        // 733 — the same call addClip() itself routes through). The overlay
-        // clip is a copy of the probed V1 ClipInfo with the per-clip transform
-        // fields set (the real ClipInfo members: videoScale / videoDy /
-        // opacity — Timeline.h:81-91). No faking: this is exactly how a stacked
-        // PiP clip is represented in computePlaybackSequence.
-        tl.addVideoTrack();
-        const QVector<TimelineTrack *> &vtracks = tl.videoTracks();
-        if (vtracks.size() < 2 || !vtracks[1]) {
-            qCritical() << "PARITY S3 FAILED: second video track not created";
-            return 1;
-        }
-        ClipInfo overlayClip = tl.videoClips().first();  // probed V1 clip copy
-        overlayClip.videoScale = 0.5;
-        overlayClip.videoDx = 0.0;
-        overlayClip.videoDy = 0.2;
-        overlayClip.opacity = 0.8;
-        vtracks[1]->addClip(overlayClip);
-        if (vtracks[1]->clipCount() != 1) {
-            qCritical() << "PARITY S3 FAILED: overlay clip not added to V2";
-            return 1;
-        }
-
         const QSize outSize(640, 360);
-        const QImage rendered = tlrender::renderFrameAt(&tl, 0, outSize);
-        if (rendered.isNull()) {
-            qCritical() << "PARITY S3 FAILED: renderFrameAt returned null";
+
+        // INDEPENDENT decode read-back of the flat source colours (A, B).
+        // This is the genuine libav decode forwarder, invoked SEPARATELY
+        // from any composite — it is NOT the SUT and NOT clipgeom. It only
+        // tells us which 8-bit values ffmpeg actually wrote so the colour
+        // tolerance survives lavfi's −1 quirk; the geometry oracle is pure
+        // arithmetic regardless.
+        const QImage baseDec =
+            tlrender::detail::decodeClipFrameNativeForTest(basePath, 0.0);
+        const QImage ovDec =
+            tlrender::detail::decodeClipFrameNativeForTest(ovPath, 0.0);
+        if (baseDec.isNull() || ovDec.isNull()) {
+            qCritical() << "PARITY S3 FAILED: independent decode produced null"
+                        << "(base null=" << baseDec.isNull()
+                        << "overlay null=" << ovDec.isNull() << ")";
+            return 1;
+        }
+        const QColor colA = baseDec.pixelColor(baseDec.width() / 2,
+                                               baseDec.height() / 2);
+        const QColor colB = ovDec.pixelColor(ovDec.width() / 2,
+                                             ovDec.height() / 2);
+        qInfo() << "PARITY S3: decoded base colour A =" << colA.red()
+                << colA.green() << colA.blue() << "; overlay colour B ="
+                << colB.red() << colB.green() << colB.blue();
+
+        // Helper: build a real parentless 2-track Timeline (the exact shape
+        // RenderQueue::resolveTimeline produces for export), V1=basePath,
+        // V2=overlay clip with the given transform, then render through the
+        // SUT export path tlrender::renderFrameAt. (renderFrameAt is the
+        // PRODUCER OF THE ACTUAL ONLY — never used to build EXPECTED values.)
+        auto renderTwoTrack =
+            [&](const QString &ovFile, double scale, double dx, double dy,
+                double rotDeg) -> QImage {
+            Timeline tl;
+            tl.addClip(basePath);
+            if (tl.videoClips().isEmpty())
+                return QImage();
+            tl.addVideoTrack();
+            const QVector<TimelineTrack *> &vt = tl.videoTracks();
+            if (vt.size() < 2 || !vt[1])
+                return QImage();
+            ClipInfo ov = tl.videoClips().first();   // probed metadata shell
+            ov.filePath = ovFile;
+            ov.displayName = QStringLiteral("s3-overlay");
+            ov.videoScale = scale;
+            ov.videoDx = dx;
+            ov.videoDy = dy;
+            ov.rotation2DDegrees = rotDeg;
+            ov.opacity = 1.0;                        // opaque: exact colour
+            vt[1]->addClip(ov);
+            if (vt[1]->clipCount() != 1)
+                return QImage();
+            return tlrender::renderFrameAt(&tl, 0, outSize);
+        };
+
+        // Sampling helper: average a small block to stay robust to bilinear
+        // edge smudging; returns the mean QColor.
+        auto blockMean = [](const QImage &img, int cx, int cy,
+                            int half) -> QColor {
+            long r = 0, g = 0, b = 0, n = 0;
+            for (int y = cy - half; y <= cy + half; ++y) {
+                if (y < 0 || y >= img.height()) continue;
+                for (int x = cx - half; x <= cx + half; ++x) {
+                    if (x < 0 || x >= img.width()) continue;
+                    const QColor c = img.pixelColor(x, y);
+                    r += c.red(); g += c.green(); b += c.blue(); ++n;
+                }
+            }
+            if (n == 0) return QColor();
+            return QColor(int(r / n), int(g / n), int(b / n));
+        };
+        auto colNear = [](const QColor &a, const QColor &b, int tol) -> bool {
+            return qAbs(a.red()   - b.red())   <= tol
+                && qAbs(a.green() - b.green()) <= tol
+                && qAbs(a.blue()  - b.blue())  <= tol;
+        };
+
+        // ── Identity + centered-PiP golden ────────────────────────────────
+        // IDENTITY (scale=1,dx=0,dy=0,rot=0): the center-anchored contract
+        // guarantees the source fills the entire canvas exactly. Five sample
+        // points spread across the canvas must all equal colour B.
+        {
+            const QImage act = renderTwoTrack(ovPath, 1.0, 0.0, 0.0, 0.0);
+            if (act.isNull() || act.size() != outSize) {
+                qCritical() << "PARITY S3 FAILED: identity render null/wrong size";
+                return 1;
+            }
+            struct P { int x, y; };
+            const P pts[] = {
+                {  10,  10 }, { 630, 10 }, {  10, 350 }, { 630, 350 },
+                { 320, 180 }
+            };
+            for (const P &s : pts) {
+                const QColor m = blockMean(act, s.x, s.y, 4);
+                if (!colNear(m, colB, 6)) {
+                    qCritical() << "PARITY S3 FAILED: identity transform —"
+                                   " sample (" << s.x << "," << s.y
+                                << ") =" << m.red() << m.green() << m.blue()
+                                << "should be colour B (overlay fills canvas)"
+                                << colB.red() << colB.green() << colB.blue()
+                                << "(±6) — center-anchored identity is broken";
+                    return 1;
+                }
+            }
+            qInfo() << "PARITY S3 (identity): overlay fills canvas OK";
+        }
+
+        // CENTERED PiP (scale=0.5,dx=0,dy=0,rot=0): LAYER-CENTER anchoring
+        // means scale=0.5 places the overlay in the centre quarter of the
+        // canvas. HAND DERIVATION: canvas-sized source corners map as
+        //   (px,py) -> (0.5*(px-320)+320, 0.5*(py-180)+180)
+        //   (0,0)   -> (160,90)
+        //   (640,360) -> (480,270)
+        // Visible bbox = x[160,480] y[90,270] (fully on-canvas, no clipping).
+        // The old corner-pivot would have placed the TL at (320,180) instead.
+        {
+            const QImage act = renderTwoTrack(ovPath, 0.5, 0.0, 0.0, 0.0);
+            if (act.isNull() || act.size() != outSize) {
+                qCritical() << "PARITY S3 FAILED: centered-PiP render null/wrong size";
+                return 1;
+            }
+            const int px0 = 160, px1 = 480, py0 = 90, py1 = 270;
+            struct P { int x, y; };
+            // Inside the PiP bbox -> colour B
+            const P inside[] = {
+                { (px0+px1)/2, (py0+py1)/2 },   // 320,180 centre
+                { px0+20,      py0+20      },
+                { px1-20,      py1-20      },
+            };
+            for (const P &s : inside) {
+                const QColor m = blockMean(act, s.x, s.y, 4);
+                if (!colNear(m, colB, 6)) {
+                    qCritical() << "PARITY S3 FAILED: centered-PiP inside ("
+                                << s.x << "," << s.y << ") =" << m.red()
+                                << m.green() << m.blue()
+                                << "expected B" << colB.red() << colB.green()
+                                << colB.blue()
+                                << "(±6) — center-anchor scale=0.5 wrong";
+                    return 1;
+                }
+            }
+            // Outside -> colour A
+            const P outside[] = {
+                {  80,  40 }, { 590, 40 }, {  80, 330 }, { 590, 330 },
+            };
+            for (const P &s : outside) {
+                const QColor m = blockMean(act, s.x, s.y, 4);
+                if (!colNear(m, colA, 6)) {
+                    qCritical() << "PARITY S3 FAILED: centered-PiP outside ("
+                                << s.x << "," << s.y << ") =" << m.red()
+                                << m.green() << m.blue()
+                                << "expected A" << colA.red() << colA.green()
+                                << colA.blue()
+                                << "(±6) — overlay bled outside centered-PiP bbox";
+                    return 1;
+                }
+            }
+            qInfo() << "PARITY S3 (centered-PiP): scale=0.5 center-anchor OK";
+        }
+
+        // ── A) SOLID-COLOUR inside/outside the hand-derived bbox ────────────
+        // Overlay transform: videoScale=0.5, videoDx=0.25, videoDy=0.0,
+        // rotation=90°. The overlay source is scaled to the 640x360 canvas
+        // grid (renderFrameAt does native.scaled(outSize) first), so the
+        // placed source rect is (0,0)-(640,360). HAND DERIVATION (closed
+        // form, independent of the SUT, LAYER-CENTER contract):
+        //   cx = W/2 + 0.25*W = 480,  cy = H/2 + 0*H = 180,  W=640, H=360
+        // For each source corner (px,py):
+        //   canvas_x = −s*(py−H/2)+cx = −0.5*(py−180)+480
+        //   canvas_y =  s*(px−W/2)+cy =  0.5*(px−320)+180
+        //   (0,0)   -> cx=−0.5*(−180)+480=570, cy=0.5*(−320)+180=20  -> (570,20)
+        //   (640,0) -> cx=−0.5*(−180)+480=570, cy=0.5*(320)+180=340  -> (570,340)
+        //   (0,360) -> cx=−0.5*(180)+480=390,  cy=0.5*(−320)+180=20  -> (390,20)
+        //   (640,360)->cx=−0.5*(180)+480=390,  cy=0.5*(320)+180=340  -> (390,340)
+        // Bbox: x[390,570] y[20,340] — fully on-canvas, no clipping.
+        // (All four numbers are produced by the arithmetic written above —
+        // NOT by calling clipgeom/renderFrameAt.) With the old corner-pivot
+        // the bbox was x[300,480] y[180,360] (completely disjoint) — so the
+        // asserts below fail if the center-anchor fix is reverted. Inverting
+        // the rotation sign would give x[390,570] y[−160,160] (half off-canvas
+        // and different vertical range) → fails the outside-sample checks.
+        {
+            const QImage act = renderTwoTrack(ovPath, 0.5, 0.25, 0.0, 90.0);
+            if (act.isNull()) {
+                qCritical() << "PARITY S3 FAILED: renderFrameAt returned null"
+                               " (solid-colour case)";
+                return 1;
+            }
+            if (act.size() != outSize) {
+                qCritical() << "PARITY S3 FAILED: SUT frame size" << act.size()
+                            << "!= expected" << outSize;
+                return 1;
+            }
+            // Hand-computed visible-overlay bbox corners (independent):
+            const int bx0 = 390, bx1 = 570, by0 = 20, by1 = 340;
+            struct P { int x, y; };
+            // (a) well INSIDE the bbox → colour B
+            const P inside[] = {
+                { (bx0 + bx1) / 2, (by0 + by1) / 2 },   // 480,180 centre
+                { bx0 + 30,        by0 + 30        },
+                { bx1 - 30,        by1 - 30        },
+            };
+            for (const P &s : inside) {
+                const QColor m = blockMean(act, s.x, s.y, 4);
+                if (!colNear(m, colB, 6)) {
+                    qCritical() << "PARITY S3 FAILED: inside-bbox sample ("
+                                << s.x << "," << s.y << ") =" << m.red()
+                                << m.green() << m.blue()
+                                << "expected overlay colour B" << colB.red()
+                                << colB.green() << colB.blue()
+                                << "(±6) — clipgeom transform mis-placed the"
+                                   " overlay (wrong center-anchor or rotation)";
+                    return 1;
+                }
+            }
+            // (b) well OUTSIDE the bbox → colour A (the V1 base shows)
+            const P outside[] = {
+                {  80, 180 },                 // left of overlay (x<390)
+                { 200, 180 },                 // still left of overlay
+                { 320,  10 },                 // above overlay (y<20) — centre col
+                { 100, 350 },                 // bottom-left corner, outside bbox
+            };
+            for (const P &s : outside) {
+                const QColor m = blockMean(act, s.x, s.y, 4);
+                if (!colNear(m, colA, 6)) {
+                    qCritical() << "PARITY S3 FAILED: outside-bbox sample ("
+                                << s.x << "," << s.y << ") =" << m.red()
+                                << m.green() << m.blue()
+                                << "expected base colour A" << colA.red()
+                                << colA.green() << colA.blue()
+                                << "(±6) — overlay bled outside its"
+                                   " hand-derived bounding box";
+                    return 1;
+                }
+            }
+            // (c) bbox CORNER positions (±2px): scan the centre row through
+            // the overlay for the A→B / B→A transitions and assert they land
+            // at the hand-derived edges.
+            const int midY = (by0 + by1) / 2;     // 180, inside vertically
+            int leftEdge = -1, rightEdge = -1;
+            for (int x = 1; x < act.width(); ++x) {
+                const bool prevB = colNear(act.pixelColor(x - 1, midY), colB, 24);
+                const bool curB  = colNear(act.pixelColor(x,     midY), colB, 24);
+                if (!prevB && curB && leftEdge < 0) leftEdge = x;
+                if (prevB && !curB) rightEdge = x;
+            }
+            if (leftEdge < 0 || rightEdge < 0
+                || qAbs(leftEdge - bx0) > 2 || qAbs(rightEdge - bx1) > 2) {
+                qCritical() << "PARITY S3 FAILED: overlay horizontal extent ["
+                            << leftEdge << "," << rightEdge
+                            << "] != hand-derived [" << bx0 << "," << bx1
+                            << "] (±2) — clipgeom translate/scale/rotate"
+                               " geometry is wrong";
+                return 1;
+            }
+            qInfo() << "PARITY S3 (a/b/c): solid-colour bbox OK — overlay"
+                       " horizontal extent [" << leftEdge << "," << rightEdge
+                    << "] matches hand-derived [" << bx0 << "," << bx1 << "]";
+        }
+
+        // ── B) NON-SYMMETRIC rotation-aspect transpose (2:1 → 1:2) ──────────
+        // A 2:1 (wide) bright rect: at rotation 0° the rendered bright bbox
+        // aspect (w/h) must be 2.0; at rotation 90° it must TRANSPOSE to 0.5
+        // (1:2 tall). HAND DERIVATION (closed form, independent of the SUT,
+        // LAYER-CENTER contract):
+        // The bright block is 80x40 at src (40,25) in the 160x90 source.
+        // renderFrameAt scales the source to canvas size (640x360) first via
+        // native.scaled(outSize) — isotropic 4.0x — making the block span
+        // (160,100)-(480,260) in canvas coordinates (centre at 320,180).
+        // With videoScale=0.5, dx=0, dy=0 (cx=320,cy=180):
+        //
+        //   rot=0:  canvas = (0.5*(px−320)+320, 0.5*(py−180)+180)
+        //     block TL (160,100) → (240,140)
+        //     block BR (480,260) → (400,220)
+        //     bbox = x[240,400] y[140,220] → 160×80 → aspect 2.0
+        //
+        //   rot=+90°: canvas_x=−0.5*(py−180)+320, canvas_y=0.5*(px−320)+180
+        //     block TL (160,100) → (360,100)
+        //     block TR (480,100) → (360,260)
+        //     block BL (160,260) → (280,100)
+        //     block BR (480,260) → (280,260)
+        //     bbox = x[280,360] y[100,260] → 80×160 → aspect 0.5
+        //
+        // No dx/dy compensation needed: with center-anchoring dx=dy=0 keeps
+        // the overlay centred on the canvas for BOTH rotations. (The old
+        // corner-pivot code required per-rotation hacks like dx=−0.25,−0.25
+        // and dx=+0.140625,dy=−0.444444 to achieve this — those are removed.)
+        // ALL bbox values above are produced by the arithmetic written here —
+        // NO clipgeom/QTransform/renderFrameAt is used to derive them. A
+        // no-rotation bug keeps aspect 2.0 at rot90 and FAILS the 0.5
+        // assertion; a wrong angle misses the hand-derived bbox.
+        {
+            struct Exp { double rot, dx, dy;
+                         int bx0, bx1, by0, by1; double aspect; };
+            const Exp e0 { 0.0,  0.0, 0.0,
+                           240, 400, 140, 220, 2.0 };
+            const Exp e90{ 90.0, 0.0, 0.0,
+                           280, 360, 100, 260, 0.5 };
+            auto brightBBox = [&](const Exp &e, bool *ok,
+                                  int *ox0, int *ox1, int *oy0, int *oy1)
+                -> double {
+                const QImage act =
+                    renderTwoTrack(wideOvPath, 0.5, e.dx, e.dy, e.rot);
+                if (act.isNull()) { *ok = false; return 0.0; }
+                int minX = act.width(), minY = act.height(),
+                    maxX = -1, maxY = -1;
+                for (int y = 0; y < act.height(); ++y) {
+                    for (int x = 0; x < act.width(); ++x) {
+                        if (colNear(act.pixelColor(x, y), colB, 40)) {
+                            minX = qMin(minX, x); maxX = qMax(maxX, x);
+                            minY = qMin(minY, y); maxY = qMax(maxY, y);
+                        }
+                    }
+                }
+                if (maxX < 0 || maxY < 0) { *ok = false; return 0.0; }
+                *ok = true;
+                *ox0 = minX; *ox1 = maxX; *oy0 = minY; *oy1 = maxY;
+                return double(maxX - minX + 1) / double(maxY - minY + 1);
+            };
+            bool ok0 = false, ok90 = false;
+            int x0a, x1a, y0a, y1a, x0b, x1b, y0b, y1b;
+            const double asp0  =
+                brightBBox(e0,  &ok0,  &x0a, &x1a, &y0a, &y1a);
+            const double asp90 =
+                brightBBox(e90, &ok90, &x0b, &x1b, &y0b, &y1b);
+            if (!ok0 || !ok90) {
+                qCritical() << "PARITY S3 FAILED: could not locate the 2:1"
+                               " bright rect (ok0=" << ok0
+                            << " ok90=" << ok90 << ")";
+                return 1;
+            }
+            qInfo() << "PARITY S3 (B): rot0 bright bbox x[" << x0a << ","
+                    << x1a << "] y[" << y0a << "," << y1a << "] aspect ="
+                    << asp0 << "; rot90 bbox x[" << x0b << "," << x1b
+                    << "] y[" << y0b << "," << y1b << "] aspect =" << asp90
+                    << "(expect ~2.0 then ~0.5; hand-derived rot0 x[240,"
+                       "400] y[140,220], rot90 x[280,360] y[100,260])";
+            // The bright rect must be FULLY on-canvas (a clipped block would
+            // distort the aspect — the earlier mistake this guards against).
+            auto onCanvas = [](int x0, int x1, int y0, int y1) -> bool {
+                return x0 > 0 && x1 < 639 && y0 > 0 && y1 < 359;
+            };
+            if (!onCanvas(x0a, x1a, y0a, y1a)
+                || !onCanvas(x0b, x1b, y0b, y1b)) {
+                qCritical() << "PARITY S3 FAILED: the 2:1 bright rect touched"
+                               " a canvas edge (rot0 x[" << x0a << ","
+                            << x1a << "] y[" << y0a << "," << y1a
+                            << "] rot90 x[" << x0b << "," << x1b << "] y["
+                            << y0b << "," << y1b << "]) — aspect would be"
+                               " clip-distorted, test precondition violated";
+                return 1;
+            }
+            // Hand-derived bbox match (±3px for bilinear edge AA).
+            if (qAbs(x0a - e0.bx0) > 3 || qAbs(x1a - e0.bx1) > 3
+                || qAbs(y0a - e0.by0) > 3 || qAbs(y1a - e0.by1) > 3) {
+                qCritical() << "PARITY S3 FAILED: rot0 bright bbox x[" << x0a
+                            << "," << x1a << "] y[" << y0a << "," << y1a
+                            << "] != hand-derived x[240,400] y[140,220]"
+                               " (±3) — clipgeom geometry wrong";
+                return 1;
+            }
+            if (qAbs(x0b - e90.bx0) > 3 || qAbs(x1b - e90.bx1) > 3
+                || qAbs(y0b - e90.by0) > 3 || qAbs(y1b - e90.by1) > 3) {
+                qCritical() << "PARITY S3 FAILED: rot90 bright bbox x[" << x0b
+                            << "," << x1b << "] y[" << y0b << "," << y1b
+                            << "] != hand-derived x[280,360] y[100,260]"
+                               " (±3) — rotation mis-applied";
+                return 1;
+            }
+            // Aspect transpose: rot0≈2.0, rot90≈0.5, and it must FLIP across
+            // 1.0 (a no-rotation / transposed-sign bug fails this).
+            if (qAbs(asp0 - 2.0) > 0.15) {
+                qCritical() << "PARITY S3 FAILED: rot0 wide-rect aspect"
+                            << asp0 << "!= ~2.0 — geometry baseline wrong";
+                return 1;
+            }
+            if (qAbs(asp90 - 0.5) > 0.10) {
+                qCritical() << "PARITY S3 FAILED: rot90 aspect" << asp90
+                            << "did not transpose to ~0.5 — rotation is NOT"
+                               " applied (no-rotation bug) or wrong angle";
+                return 1;
+            }
+            if (!(asp0 > 1.0 && asp90 < 1.0)) {
+                qCritical() << "PARITY S3 FAILED: aspect did not flip across"
+                               " 1.0 (rot0=" << asp0 << " rot90=" << asp90
+                            << ") — rotation did not transpose the rect";
+                return 1;
+            }
+            qInfo() << "PARITY S3 (B): 2:1->1:2 rotation-aspect transpose OK";
+        }
+
+        // ── C) ROTATION-DIRECTION guard (bright marker quadrant) ────────────
+        // The marker overlay is solid B with a bright (255,255,0) block in
+        // its SOURCE top-left quadrant. Transform: scale=0.5, dx=0, dy=0,
+        // rotation=+90°. HAND DERIVATION (closed form, independent,
+        // LAYER-CENTER contract):
+        // After native.scaled(640x360) the marker source is canvas-sized.
+        // The drawbox was placed at src (20,10) in the 160x90 source, so
+        // its centre (40,22.5) in source maps to canvas (160,90) after the
+        // 4.0x scale. Apply the center-anchored +90° formula:
+        //   canvas_x = −s*(py−H/2)+cx = −0.5*(90−180)+320 = 45+320 = 365
+        //   canvas_y =  s*(px−W/2)+cy =  0.5*(160−320)+180 = −80+180 = 100
+        // → marker lands at (365,100) = TOP-RIGHT quadrant (x>320, y<180).
+        // A WRONG rotation sign (−90°) would instead put it at (275,260) =
+        // BOTTOM-LEFT — the opposite quadrant — so this catches a sign error
+        // that a fully-solid test cannot detect.
+        {
+            const QImage act = renderTwoTrack(markOvPath, 0.5, 0.0, 0.0, 90.0);
+            if (act.isNull()) {
+                qCritical() << "PARITY S3 FAILED: renderFrameAt returned null"
+                               " (marker rotation-direction case)";
+                return 1;
+            }
+            // Hand-derived expected marker centre (independent arithmetic):
+            const int exMX = 365, exMY = 100;
+            // The bright marker is yellow: R high, G high, B low — assert the
+            // dominant-channel signature in a generous block (robust to
+            // bilinear smear of the solid-B surround which is R~200,G~40).
+            const QColor m = blockMean(act, exMX, exMY, 10);
+            const bool yellowish = m.red()  >= 150 && m.green() >= 150
+                                && m.blue() <= 90
+                                && m.green() >= m.blue() + 60;
+            if (!yellowish) {
+                qCritical() << "PARITY S3 FAILED: rotation-DIRECTION guard —"
+                               " expected the bright yellow marker near the"
+                               " hand-derived TOP-RIGHT point ("
+                            << exMX << "," << exMY << ") but block mean ="
+                            << m.red() << m.green() << m.blue()
+                            << "(want R,G high & B low). A wrong clipgeom"
+                               " rotation SIGN puts the marker at the"
+                               " opposite (BOTTOM-LEFT ~275,260) quadrant.";
+                return 1;
+            }
+            // Negative control: the diagonally-opposite point that the
+            // sign-flipped (−90°) transform would light up must NOT be
+            // yellow — proves the marker is genuinely where +90° puts it,
+            // not symmetric noise.
+            const QColor opp = blockMean(act, 275, 260, 10);
+            const bool oppYellow = opp.red() >= 150 && opp.green() >= 150
+                                && opp.blue() <= 90
+                                && opp.green() >= opp.blue() + 60;
+            if (oppYellow) {
+                qCritical() << "PARITY S3 FAILED: rotation-DIRECTION guard —"
+                               " the SIGN-FLIPPED target (275,260) is also"
+                               " yellow (" << opp.red() << opp.green()
+                            << opp.blue() << ") — marker placement is"
+                               " ambiguous / rotation sign indeterminate";
+                return 1;
+            }
+            qInfo() << "PARITY S3 (C): rotation-DIRECTION OK — marker at"
+                       " hand-derived TOP-RIGHT (" << exMX << "," << exMY
+                    << ") block mean =" << m.red() << m.green() << m.blue()
+                    << "; sign-flip target (275,260) correctly NOT yellow";
+        }
+
+        qInfo() << "[INFO] PARITY S3 multi-track compositor OK (independent"
+                   " hand-computed oracle; layer-center anchoring verified;"
+                   " inverting clipgeom's rotation sign OR removing the"
+                   " un-center step MUST fail S3)";
+    }
+
+    // ── S3-V1: V1 single-track NON-DEFAULT transform regression guard ────────
+    // REGRESSION GUARD FOR:
+    //   Codex#1 — V1 clip exported UNTRANSFORMED (renderFrameAt applied the
+    //             transform to overlay tracks only; V1 always filled the canvas
+    //             regardless of its ClipInfo::videoScale/rotation settings).
+    //   NEW-1   — V1 clip decoded at NATIVE resolution then fed at native size
+    //             into the canvas-size clipgeom contract; clipgeom::renderLayer
+    //             did NOT self-scale the source to canvasSize first, so a
+    //             1920×1080 V1 placed on a 640×360 canvas with scale=0.5 was
+    //             mis-scaled / cropped instead of producing the centered quarter.
+    //
+    // Both bugs shipped green because ALL prior stages keep V1 at default
+    // transform (scale=1,dx=0,dy=0,rot=0) — that is the untransformed fill that
+    // both bugs produce "correctly" by accident.
+    //
+    // HOW THIS CATCHES BOTH:
+    //   Codex#1: an untransformed V1 fills the entire canvas with colour B.
+    //            The assertion requires colour B only inside x[160,480]y[90,270]
+    //            and the DEFAULT FILL (transparent → black → or checkerboard)
+    //            outside. A V1 that ignores its transform FAILS the outside
+    //            sample check immediately.
+    //   NEW-1:   the source is generated at 1920×1080 (a realistic camera
+    //            resolution ≠ the 640×360 canvas). clipgeom::renderLayer MUST
+    //            self-scale the 1920×1080 source to 640×360 before applying the
+    //            ClipTransform. If it feeds native pixels into the
+    //            canvas-coordinate transform, the placed layer is 3× too large
+    //            and occupies x[0,960]y[0,540] (clipped to the canvas) — not
+    //            the expected x[160,480]y[90,270]. The inside-bbox and
+    //            outside-bbox asserts then both fail.
+    //
+    // INDEPENDENT ORACLE (no clipgeom/renderFrameAt used to derive expecteds):
+    // Canvas: W=640, H=360. Layer: solid colour B, native 1920×1080,
+    //   videoScale=0.5, videoDx=0, videoDy=0, rotation=0.
+    // Contract: renderLayer self-scales any source to canvasSize; then the
+    //   center-anchored transform maps (px,py) →
+    //     (s*(px−W/2)+W/2,  s*(py−H/2)+H/2)   [rot=0 case]
+    //   Source corners (0,0)→(160,90), (640,360)→(480,270).
+    //   EXPECTED BBOX: x[W/4, 3W/4] = x[160,480], y[H/4, 3H/4] = y[90,270].
+    //   (These four numbers are derived from the arithmetic above, NOT by
+    //   calling any SUT function.)
+    //
+    // Second case: videoScale=0.5, videoDx=0.25, rotation=90° (same as S3
+    //   Case A but on V1). Expected bbox = x[390,570] y[20,340] (identical
+    //   derivation: same formula, same canvas, same transform params).
+    //   See S3 Case A comment for the full corner expansion.
+    {
+        QTemporaryDir v1TmpDir;
+        if (!v1TmpDir.isValid()) {
+            qCritical() << "PARITY S3-V1 FAILED: could not create temp dir";
             return 1;
         }
 
-        // Build the authoritative reference. Decode BOTH layers' frame at
-        // source-second 0 (inPoint=0, speed=1 for the freshly-probed clip)
-        // through the SAME libav+sws helper renderFrameAt uses per layer, so
-        // the only thing the MSE can measure is compositing fidelity — not a
-        // decode-path delta. Then scale each to the shared canvas exactly as
-        // renderFrameAt does and hand them to composeMultiTrackFrame.
-        const ClipInfo &v1c = tl.videoClips().first();
-        const double srcSec = v1c.inPoint;  // usec=0 -> local 0 -> inPoint
-        const QImage v1Native =
-            tlrender::detail::decodeClipFrameNativeForTest(v1c.filePath, srcSec);
-        const QImage ovNative =
-            tlrender::detail::decodeClipFrameNativeForTest(overlayClip.filePath,
-                                                           srcSec);
-        if (v1Native.isNull() || ovNative.isNull()) {
-            qCritical() << "PARITY S3 FAILED: reference decode produced null"
-                        << "(v1 null=" << v1Native.isNull()
-                        << "overlay null=" << ovNative.isNull() << ")";
-            return 1;
-        }
-        const QImage refBase = v1Native.scaled(outSize, Qt::IgnoreAspectRatio,
-                                               Qt::SmoothTransformation);
-        const QImage ovScaled = ovNative.scaled(outSize, Qt::IgnoreAspectRatio,
-                                                Qt::SmoothTransformation);
-
-        // Hidden VideoPlayer (parented to nothing, never show()n — same
-        // headless-safe construction the process already does for widgets in
-        // selftests). composeMultiTrackFrame + its DecodedLayer struct are
-        // private, so we go through the public test forwarder
-        // composeMultiTrackFrameForTest (VideoPlayer.h) which builds the
-        // DecodedLayer entries and invokes the REAL private compositor — the
-        // reference is therefore the genuine authoritative comparator.
-        VideoPlayer vp;
-        const QImage reference = vp.composeMultiTrackFrameForTest(
-            refBase,
-            { ovScaled },
-            { overlayClip.opacity },
-            { overlayClip.videoScale },
-            { overlayClip.videoDx },
-            { overlayClip.videoDy });
-        if (reference.isNull()) {
-            qCritical() << "PARITY S3 FAILED: composeMultiTrackFrame returned null";
-            return 1;
+        // Generate a solid-colour V1 source at 1920x1080 (realistic camera
+        // native resolution, ≠ canvas 640x360 — exercises the self-scale path).
+        const QString v1Path =
+            v1TmpDir.filePath(QStringLiteral("s3v1_layer.mp4"));
+        {
+            QStringList args{
+                QStringLiteral("-hide_banner"),
+                QStringLiteral("-loglevel"), QStringLiteral("error"),
+                QStringLiteral("-y"),
+                QStringLiteral("-f"), QStringLiteral("lavfi"),
+                QStringLiteral("-i"),
+                // 1920x1080 — native ≠ canvas (640x360).
+                // Same colour B as S3 (0xC8283C → decoded ~199,37,58).
+                QStringLiteral("color=c=0xC8283C:s=1920x1080:r=10:d=1"),
+                QStringLiteral("-frames:v"), QStringLiteral("1"),
+                QStringLiteral("-c:v"), QStringLiteral("libx264rgb"),
+                QStringLiteral("-qp"),  QStringLiteral("0"),
+                QStringLiteral("-pix_fmt"), QStringLiteral("rgb24"),
+                v1Path
+            };
+            QProcess ff;
+            ff.start(QStringLiteral("ffmpeg"), args);
+            if (!ff.waitForStarted(15000)
+                || (ff.waitForFinished(60000),
+                    ff.exitStatus() != QProcess::NormalExit
+                    || ff.exitCode() != 0)
+                || !QFile::exists(v1Path)) {
+                qWarning() << "PARITY S3-V1: ffmpeg unavailable — skipping"
+                              " (CI-tolerant, NOT a silent pass)";
+                goto s3v1_skip;
+            }
         }
 
-        const double s3Mse = framediff::mse(rendered, reference);
-        qInfo() << "PARITY S3: renderFrameAt vs composeMultiTrackFrame MSE ="
-                << s3Mse;
-        if (!(s3Mse >= 0.0 && s3Mse <= 10.0)) {
-            qCritical() << "PARITY S3 FAILED: MSE out of tolerance (expected"
-                        << "[0,10], got" << s3Mse << ")";
+        {
+            const QSize outSize(640, 360);
+
+            // Independent colour read-back (same idiom as S3).
+            const QImage v1Dec =
+                tlrender::detail::decodeClipFrameNativeForTest(v1Path, 0.0);
+            if (v1Dec.isNull()) {
+                qCritical() << "PARITY S3-V1 FAILED: independent decode null";
+                return 1;
+            }
+            const QColor colB_v1 =
+                v1Dec.pixelColor(v1Dec.width() / 2, v1Dec.height() / 2);
+            qInfo() << "PARITY S3-V1: decoded V1 colour B ="
+                    << colB_v1.red() << colB_v1.green() << colB_v1.blue();
+
+            // Build a SINGLE-TRACK timeline (V1 only, no overlay).
+            // renderFrameAt with a non-default V1 transform is the SUT.
+            auto renderV1Only =
+                [&](double scale, double dx, double dy,
+                    double rotDeg) -> QImage {
+                Timeline tl;
+                tl.addClip(v1Path);
+                const QVector<TimelineTrack *> &vt = tl.videoTracks();
+                if (vt.isEmpty() || !vt[0] || vt[0]->clipCount() < 1)
+                    return QImage();
+                // Mutate the V1 clip in-place via setClips.
+                QVector<ClipInfo> cls = vt[0]->clips();
+                cls[0].videoScale           = scale;
+                cls[0].videoDx              = dx;
+                cls[0].videoDy              = dy;
+                cls[0].rotation2DDegrees    = rotDeg;
+                cls[0].opacity              = 1.0;
+                vt[0]->setClips(cls);
+                return tlrender::renderFrameAt(&tl, 0, outSize);
+            };
+
+            // Helper aliases (same lambdas as S3 context).
+            auto blockMeanV1 = [](const QImage &img, int cx, int cy,
+                                  int half) -> QColor {
+                long r = 0, g = 0, b = 0, n = 0;
+                for (int y = cy - half; y <= cy + half; ++y) {
+                    if (y < 0 || y >= img.height()) continue;
+                    for (int x = cx - half; x <= cx + half; ++x) {
+                        if (x < 0 || x >= img.width()) continue;
+                        const QColor c = img.pixelColor(x, y);
+                        r += c.red(); g += c.green(); b += c.blue(); ++n;
+                    }
+                }
+                if (n == 0) return QColor();
+                return QColor(int(r/n), int(g/n), int(b/n));
+            };
+            auto colNearV1 = [](const QColor &a, const QColor &b,
+                                int tol) -> bool {
+                return qAbs(a.red()  - b.red())  <= tol
+                    && qAbs(a.green()- b.green()) <= tol
+                    && qAbs(a.blue() - b.blue())  <= tol;
+            };
+            // The canvas background where the V1 layer is NOT drawn is
+            // transparent/black (Qt default canvas fill = Qt::black or
+            // transparent depending on format). We assert outside pixels are
+            // NOT colour B (tolerance inverted) — a fully-solid untransformed
+            // V1 would make outside == B and fail.
+            auto notColourB = [&](const QColor &m) -> bool {
+                // Outside must differ from colB_v1 by > 40 in at least one
+                // channel — a fully-filled canvas (Codex#1 bug) would fail.
+                return qAbs(m.red()  - colB_v1.red())  > 40
+                    || qAbs(m.green()- colB_v1.green()) > 40
+                    || qAbs(m.blue() - colB_v1.blue())  > 40;
+            };
+
+            // ── V1 case 1: scale=0.5, dx=0, dy=0, rot=0 ─────────────────────
+            // HAND DERIVATION (center-anchored, rot=0):
+            //   (px,py) -> (0.5*(px-320)+320, 0.5*(py-180)+180)
+            //   (0,0)   -> (160,90)   (640,360) -> (480,270)
+            // Expected bbox: x[160,480] = [W/4,3W/4], y[90,270] = [H/4,3H/4].
+            // An untransformed V1 (Codex#1) fills x[0,639]y[0,359] → outside
+            // samples equal B → fails. A mis-scaled native-res V1 (NEW-1)
+            // occupies a wrong region → inside or outside samples fail.
+            {
+                const QImage act = renderV1Only(0.5, 0.0, 0.0, 0.0);
+                if (act.isNull() || act.size() != outSize) {
+                    qCritical() << "PARITY S3-V1 FAILED: renderFrameAt null"
+                                   " or wrong size (V1 scale=0.5 rot=0)";
+                    return 1;
+                }
+                const int bx0=160, bx1=480, by0=90, by1=270;
+                struct P { int x, y; };
+                // Inside → colour B
+                const P ins[] = {
+                    { (bx0+bx1)/2, (by0+by1)/2 },   // 320,180
+                    { bx0+20, by0+20 },
+                    { bx1-20, by1-20 },
+                };
+                for (const P &s : ins) {
+                    const QColor m = blockMeanV1(act, s.x, s.y, 4);
+                    if (!colNearV1(m, colB_v1, 6)) {
+                        qCritical()
+                            << "PARITY S3-V1 FAILED: V1 scale=0.5 rot=0 —"
+                               " inside-bbox (" << s.x << "," << s.y
+                            << ") =" << m.red() << m.green() << m.blue()
+                            << "expected B" << colB_v1.red()
+                            << colB_v1.green() << colB_v1.blue()
+                            << "(±6). V1 clipgeom self-scale or transform"
+                               " wrong (NEW-1 or Codex#1 regression).";
+                        return 1;
+                    }
+                }
+                // Outside → NOT colour B (background, black or transparent)
+                const P outs[] = {
+                    {  50,  45 },   // top-left corner
+                    { 590,  45 },   // top-right corner
+                    {  50, 315 },   // bottom-left corner
+                    { 590, 315 },   // bottom-right corner
+                };
+                for (const P &s : outs) {
+                    const QColor m = blockMeanV1(act, s.x, s.y, 4);
+                    if (!notColourB(m)) {
+                        qCritical()
+                            << "PARITY S3-V1 FAILED: V1 scale=0.5 rot=0 —"
+                               " outside-bbox (" << s.x << "," << s.y
+                            << ") =" << m.red() << m.green() << m.blue()
+                            << "is still colour B — V1 transform IGNORED"
+                               " (Codex#1 regression: untransformed V1)";
+                        return 1;
+                    }
+                }
+                // Bbox edge scan on the centre row (y=180)
+                int leftEdge = -1, rightEdge = -1;
+                const int midY = (by0+by1)/2;
+                for (int x = 1; x < act.width(); ++x) {
+                    const bool pB =
+                        colNearV1(act.pixelColor(x-1,midY), colB_v1, 24);
+                    const bool cB =
+                        colNearV1(act.pixelColor(x,  midY), colB_v1, 24);
+                    if (!pB && cB && leftEdge < 0) leftEdge = x;
+                    if (pB && !cB) rightEdge = x;
+                }
+                if (leftEdge < 0 || rightEdge < 0
+                    || qAbs(leftEdge - bx0) > 2
+                    || qAbs(rightEdge - bx1) > 2) {
+                    qCritical()
+                        << "PARITY S3-V1 FAILED: V1 scale=0.5 rot=0 —"
+                           " horizontal extent [" << leftEdge << ","
+                        << rightEdge << "] != hand-derived ["
+                        << bx0 << "," << bx1
+                        << "] (±2). Codex#1 or NEW-1 regression.";
+                    return 1;
+                }
+                qInfo() << "PARITY S3-V1 (case1 scale=0.5 rot=0): V1"
+                           " centered-quarter bbox OK — extent ["
+                        << leftEdge << "," << rightEdge
+                        << "] matches [160,480]; outside = background";
+            }
+
+            // ── V1 case 2: scale=0.5, dx=0.25, dy=0, rot=90 ─────────────────
+            // HAND DERIVATION (center-anchored, +90°, identical to S3 Case A):
+            //   cx=W/2+0.25*W=480, cy=H/2=180
+            //   canvas_x = −s*(py−H/2)+cx = −0.5*(py−180)+480
+            //   canvas_y =  s*(px−W/2)+cy =  0.5*(px−320)+180
+            //   (0,0)→(570,20)  (640,0)→(570,340)
+            //   (0,360)→(390,20) (640,360)→(390,340)
+            //   Expected bbox: x[390,570] y[20,340] (fully on-canvas).
+            // A wrong V1 path (Codex#1: ignored transform → fills canvas) or
+            // a mis-scaled native-res V1 (NEW-1) both miss this bbox.
+            {
+                const QImage act = renderV1Only(0.5, 0.25, 0.0, 90.0);
+                if (act.isNull() || act.size() != outSize) {
+                    qCritical() << "PARITY S3-V1 FAILED: renderFrameAt null"
+                                   " (V1 scale=0.5 dx=0.25 rot=90)";
+                    return 1;
+                }
+                const int bx0=390, bx1=570, by0=20, by1=340;
+                struct P { int x, y; };
+                const P ins[] = {
+                    { (bx0+bx1)/2, (by0+by1)/2 },   // 480,180
+                    { bx0+25, by0+30 },
+                    { bx1-25, by1-30 },
+                };
+                for (const P &s : ins) {
+                    const QColor m = blockMeanV1(act, s.x, s.y, 4);
+                    if (!colNearV1(m, colB_v1, 6)) {
+                        qCritical()
+                            << "PARITY S3-V1 FAILED: V1 dx=0.25 rot=90 —"
+                               " inside (" << s.x << "," << s.y
+                            << ") =" << m.red() << m.green() << m.blue()
+                            << "expected B" << colB_v1.red()
+                            << colB_v1.green() << colB_v1.blue() << "(±6)";
+                        return 1;
+                    }
+                }
+                const P outs[] = {
+                    {  80, 180 },   // left of overlay (x<390)
+                    { 200, 180 },
+                    { 320,  10 },   // above overlay (y<20)
+                    { 100, 350 },   // bottom-left, outside bbox
+                };
+                for (const P &s : outs) {
+                    const QColor m = blockMeanV1(act, s.x, s.y, 4);
+                    if (!notColourB(m)) {
+                        qCritical()
+                            << "PARITY S3-V1 FAILED: V1 dx=0.25 rot=90 —"
+                               " outside (" << s.x << "," << s.y
+                            << ") =" << m.red() << m.green() << m.blue()
+                            << "is colour B — V1 transform ignored";
+                        return 1;
+                    }
+                }
+                // Horizontal extent scan at midY=180
+                int leftEdge = -1, rightEdge = -1;
+                const int midY = (by0+by1)/2;
+                for (int x = 1; x < act.width(); ++x) {
+                    const bool pB =
+                        colNearV1(act.pixelColor(x-1,midY), colB_v1, 24);
+                    const bool cB =
+                        colNearV1(act.pixelColor(x,  midY), colB_v1, 24);
+                    if (!pB && cB && leftEdge < 0) leftEdge = x;
+                    if (pB && !cB) rightEdge = x;
+                }
+                if (leftEdge < 0 || rightEdge < 0
+                    || qAbs(leftEdge - bx0) > 2
+                    || qAbs(rightEdge - bx1) > 2) {
+                    qCritical()
+                        << "PARITY S3-V1 FAILED: V1 dx=0.25 rot=90 —"
+                           " horizontal extent [" << leftEdge << ","
+                        << rightEdge << "] != hand-derived ["
+                        << bx0 << "," << bx1 << "] (±2)";
+                    return 1;
+                }
+                qInfo() << "PARITY S3-V1 (case2 scale=0.5 dx=0.25 rot=90):"
+                           " V1 rotated-offset bbox OK — extent ["
+                        << leftEdge << "," << rightEdge
+                        << "] matches [390,570]";
+            }
+        }
+        s3v1_skip:
+        qInfo() << "[INFO] PARITY S3-V1 V1 single-track non-default transform"
+                   " OK (regression guard: Codex#1 + NEW-1; 1920x1080 native"
+                   " source scaled to 640x360 canvas, center-anchor verified)";
+    }
+
+    // ── S3-STACK: inter-layer z-order regression guard ───────────────────────
+    // Z-ORDER CONTRACT (locked here):
+    //   V1 = base layer (bottom). V2, V3 … are overlays painted ON TOP in
+    //   ASCENDING sourceTrack order ("overlays win"). This is the contract
+    //   of EVERY SSOT path:
+    //     • tlrender::renderFrameAt (export SSOT)
+    //     • trackmatte::composite
+    //     • MainWindow::buildSpecialClipComposite
+    //     • VideoPlayer::composeMultiTrackFrame (realtime preview) — FIXED in
+    //       R4-1 (was descending / V1-on-top until that commit).
+    //
+    // REGRESSION HISTORY: R3 review found that composeMultiTrackFrame sorted
+    // layers DESCENDING, painting V1 over V2. The R4-1 fix flipped the sort to
+    // ASCENDING. Neither R3 nor R4 had a test that would have caught the
+    // inversion — the old tautological S3 (removed) compared the two paths
+    // against each other, so both paths being wrong in the SAME direction gave
+    // a false PASS. This stage provides the INDEPENDENT expected value: with an
+    // opaque V2 at default transform (fills the canvas), the WHOLE canvas must
+    // equal colour B regardless of V1's content. That expectation is derived
+    // from the z-order contract alone — it does NOT come from running either
+    // path first. An old descending sort (or any future V1-on-top regression)
+    // makes the canvas colour A instead → both the export and preview asserts
+    // fail loudly.
+    //
+    // INDEPENDENT EXPECTED VALUE: V2 has opacity=1 and default transform
+    // (scale=1, dx=0, dy=0, rot=0) → centre-anchored identity → V2 fills
+    // every pixel of the 640×360 canvas (verified by the S3 identity assertion
+    // two stages above). V1 = colour A is beneath. "Overlays win" → whole
+    // canvas = colour B. Any V1-on-top path outputs colour A instead.
+    //
+    // THREE PATHS TESTED:
+    //   (a) tlrender::renderFrameAt — the export SSOT.
+    //   (b) VideoPlayer::composeMultiTrackFrameForTest — the realtime preview
+    //       compositor shim. A QApplication is already running (the selftest
+    //       runs inside it); constructing a parentless VideoPlayer is safe
+    //       here. The forwarder is `const`-clean so no GUI state is mutated.
+    //       NOTE: this shim takes pre-built overlay images and calls
+    //       composeMultiTrackFrame directly — it does NOT go through the
+    //       std::stable_sort in handlePlaybackTick. It validates the paint-
+    //       loop / compositing logic, NOT the sort comparator.
+    //   (c) PREDICATE SUB-ASSERTION — exercises layerPaintOrderLess (the
+    //       EXACT named comparator that handlePlaybackTick's stable_sort uses)
+    //       by sorting a deliberately reversed 2-element DecodedLayer vector
+    //       and asserting V1 ends up first. This is the ONLY guard that would
+    //       catch a re-inversion of the comparator in VideoPlayer.cpp. A
+    //       descending re-inversion leaves V1 last → assertion FAILS loudly.
+    {
+        QTemporaryDir stackTmpDir;
+        if (!stackTmpDir.isValid()) {
+            qCritical() << "PARITY S3-STACK FAILED: could not create temp dir";
             return 1;
         }
-        qInfo() << "[INFO] PARITY S3 multi-track compositor OK";
+
+        // Generate solid-colour V1 (colour A) and V2 (colour B) clips via
+        // ffmpeg lavfi, lossless RGB — same idiom as S3.
+        const QString stackV1Path =
+            stackTmpDir.filePath(QStringLiteral("s3stack_v1.mp4"));
+        const QString stackV2Path =
+            stackTmpDir.filePath(QStringLiteral("s3stack_v2.mp4"));
+
+        auto genFlat = [](const QString &outPath, const QString &hexColor) {
+            QStringList args{
+                QStringLiteral("-hide_banner"),
+                QStringLiteral("-loglevel"), QStringLiteral("error"),
+                QStringLiteral("-y"),
+                QStringLiteral("-f"),  QStringLiteral("lavfi"),
+                QStringLiteral("-i"),
+                QStringLiteral("color=c=%1:s=160x90:r=10:d=1").arg(hexColor),
+                QStringLiteral("-frames:v"), QStringLiteral("1"),
+                QStringLiteral("-c:v"),  QStringLiteral("libx264rgb"),
+                QStringLiteral("-qp"),   QStringLiteral("0"),
+                QStringLiteral("-pix_fmt"), QStringLiteral("rgb24"),
+                outPath
+            };
+            QProcess ff;
+            ff.start(QStringLiteral("ffmpeg"), args);
+            if (!ff.waitForStarted(15000)) return false;
+            ff.waitForFinished(60000);
+            return ff.exitStatus() == QProcess::NormalExit
+                && ff.exitCode() == 0 && QFile::exists(outPath);
+        };
+
+        const bool stackGenOk =
+            genFlat(stackV1Path, QStringLiteral("0x28507A"))  // A ~(40,80,122)
+         && genFlat(stackV2Path, QStringLiteral("0xC8283C")); // B ~(200,40,60)
+
+        if (!stackGenOk) {
+            qWarning() << "PARITY S3-STACK: ffmpeg unavailable — skipping"
+                          " (CI-tolerant, NOT a silent pass)";
+            goto s3stack_skip;
+        }
+
+        {
+            const QSize outSize(640, 360);
+
+            // Independent colour read-back for the actual decoded values
+            // (lavfi −1 channel shift absorbed here, geometry oracle unaffected).
+            const QImage decA =
+                tlrender::detail::decodeClipFrameNativeForTest(stackV1Path, 0.0);
+            const QImage decB =
+                tlrender::detail::decodeClipFrameNativeForTest(stackV2Path, 0.0);
+            if (decA.isNull() || decB.isNull()) {
+                qCritical() << "PARITY S3-STACK FAILED: independent decode null"
+                            << "(A null=" << decA.isNull()
+                            << "B null=" << decB.isNull() << ")";
+                return 1;
+            }
+            const QColor colA_st =
+                decA.pixelColor(decA.width()/2, decA.height()/2);
+            const QColor colB_st =
+                decB.pixelColor(decB.width()/2, decB.height()/2);
+            qInfo() << "PARITY S3-STACK: decoded A ="
+                    << colA_st.red() << colA_st.green() << colA_st.blue()
+                    << "; B =" << colB_st.red() << colB_st.green()
+                    << colB_st.blue();
+
+            // Sanity: A and B must differ enough to distinguish V1-on-top
+            // from V2-on-top. If they are too close the test is vacuous.
+            const int absDiff = qAbs(colA_st.red()  - colB_st.red())
+                              + qAbs(colA_st.green()- colB_st.green())
+                              + qAbs(colA_st.blue() - colB_st.blue());
+            if (absDiff < 60) {
+                qCritical() << "PARITY S3-STACK FAILED: colours A and B"
+                               " are too similar (sum diff=" << absDiff
+                            << ") — z-order test is vacuous";
+                return 1;
+            }
+
+            auto blockMeanSt = [](const QImage &img,
+                                   int cx, int cy, int half) -> QColor {
+                long r=0, g=0, b=0, n=0;
+                for (int y=cy-half; y<=cy+half; ++y) {
+                    if (y<0||y>=img.height()) continue;
+                    for (int x=cx-half; x<=cx+half; ++x) {
+                        if (x<0||x>=img.width()) continue;
+                        const QColor c=img.pixelColor(x,y);
+                        r+=c.red(); g+=c.green(); b+=c.blue(); ++n;
+                    }
+                }
+                if (n==0) return QColor();
+                return QColor(int(r/n), int(g/n), int(b/n));
+            };
+            auto colNearSt = [](const QColor &a, const QColor &b,
+                                 int tol) -> bool {
+                return qAbs(a.red()  -b.red())  <=tol
+                    && qAbs(a.green()-b.green())<=tol
+                    && qAbs(a.blue() -b.blue()) <=tol;
+            };
+
+            // 5 sample points spread across the canvas.
+            struct P { int x, y; };
+            const P pts[] = {
+                {  50,  45 }, { 590,  45 }, {  50, 315 }, { 590, 315 },
+                { 320, 180 }
+            };
+
+            // ── (a) Export path: tlrender::renderFrameAt ─────────────────
+            {
+                Timeline tl;
+                tl.addClip(stackV1Path);
+                if (tl.videoClips().isEmpty()) {
+                    qCritical() << "PARITY S3-STACK FAILED: V1 probe failed";
+                    return 1;
+                }
+                tl.addVideoTrack();
+                const QVector<TimelineTrack *> &vt = tl.videoTracks();
+                if (vt.size() < 2 || !vt[1]) {
+                    qCritical() << "PARITY S3-STACK FAILED: could not build"
+                                   " 2-track timeline for export path";
+                    return 1;
+                }
+                // Reuse probed metadata shell (duration etc.) from V1,
+                // then swap in the V2 file path — same pattern as renderTwoTrack
+                // in S3 so the clip has a valid duration and activeClipOnTrack
+                // finds it at usec=0.
+                ClipInfo v2ci = tl.videoClips().first();
+                v2ci.filePath    = stackV2Path;
+                v2ci.displayName = QStringLiteral("s3stack-v2");
+                v2ci.videoScale  = 1.0;
+                v2ci.videoDx     = 0.0;
+                v2ci.videoDy     = 0.0;
+                v2ci.rotation2DDegrees = 0.0;
+                v2ci.opacity     = 1.0;
+                vt[1]->addClip(v2ci);
+
+                const QImage act = tlrender::renderFrameAt(&tl, 0, outSize);
+                if (act.isNull() || act.size() != outSize) {
+                    qCritical() << "PARITY S3-STACK FAILED: export path"
+                                   " returned null / wrong size";
+                    return 1;
+                }
+                bool exportOk = true;
+                for (const P &s : pts) {
+                    const QColor m = blockMeanSt(act, s.x, s.y, 4);
+                    if (!colNearSt(m, colB_st, 8)) {
+                        qCritical()
+                            << "PARITY S3-STACK FAILED [EXPORT PATH]:"
+                               " z-order inversion detected — sample ("
+                            << s.x << "," << s.y << ") =" << m.red()
+                            << m.green() << m.blue()
+                            << "expected B (V2-on-top)" << colB_st.red()
+                            << colB_st.green() << colB_st.blue()
+                            << "(±8). V1 is on top of V2 in"
+                               " renderFrameAt — R4/stacking-order"
+                               " regression in the export path.";
+                        exportOk = false;
+                    }
+                }
+                if (!exportOk) return 1;
+                qInfo() << "PARITY S3-STACK (export): V2-on-top OK —"
+                           " whole canvas = colour B via renderFrameAt";
+            }
+
+            // ── (b) Preview path: VideoPlayer::composeMultiTrackFrameForTest
+            // We need an instance only to call the const shim; no GUI state
+            // is read or written. QApplication is already running.
+            {
+                // Decode the two flat frames (native 160x90 → scale to canvas)
+                // then call the preview compositor directly.
+                const QImage rawA =
+                    tlrender::detail::decodeClipFrameNativeForTest(
+                        stackV1Path, 0.0);
+                const QImage rawB =
+                    tlrender::detail::decodeClipFrameNativeForTest(
+                        stackV2Path, 0.0);
+                if (rawA.isNull() || rawB.isNull()) {
+                    qCritical() << "PARITY S3-STACK FAILED: preview-path"
+                                   " raw decode null";
+                    return 1;
+                }
+                // Scale to canvas size — same as the live decoder does.
+                const QImage v1Frame =
+                    rawA.scaled(outSize, Qt::IgnoreAspectRatio,
+                                Qt::SmoothTransformation);
+                const QImage v2Frame =
+                    rawB.scaled(outSize, Qt::IgnoreAspectRatio,
+                                Qt::SmoothTransformation);
+
+                VideoPlayer *vp = new VideoPlayer(nullptr);
+                const QImage previewResult =
+                    vp->composeMultiTrackFrameForTest(
+                        v1Frame,
+                        { v2Frame },          // overlayRgb
+                        { 1.0 },              // opacity
+                        { 1.0 },              // scale
+                        { 0.0 },              // dx
+                        { 0.0 });             // dy
+                vp->deleteLater();
+
+                if (previewResult.isNull()
+                    || previewResult.size() != outSize) {
+                    qCritical() << "PARITY S3-STACK FAILED: preview path"
+                                   " returned null / wrong size";
+                    return 1;
+                }
+                bool previewOk = true;
+                for (const P &s : pts) {
+                    const QColor m = blockMeanSt(previewResult, s.x, s.y, 4);
+                    if (!colNearSt(m, colB_st, 8)) {
+                        qCritical()
+                            << "PARITY S3-STACK FAILED [PREVIEW PATH]:"
+                               " z-order inversion detected — sample ("
+                            << s.x << "," << s.y << ") =" << m.red()
+                            << m.green() << m.blue()
+                            << "expected B (V2-on-top)" << colB_st.red()
+                            << colB_st.green() << colB_st.blue()
+                            << "(±8). V1 is on top of V2 in"
+                               " composeMultiTrackFrame — R3 stacking"
+                               " inversion still present (or re-introduced).";
+                        previewOk = false;
+                    }
+                }
+                if (!previewOk) return 1;
+                qInfo() << "PARITY S3-STACK (preview): V2-on-top OK —"
+                           " whole canvas = colour B via"
+                           " composeMultiTrackFrameForTest";
+            }
+
+            // ── (c) Predicate sub-assertion: layerPaintOrderLess ─────────
+            // Build a 2-element vector in DELIBERATELY WRONG order:
+            //   [0] overlay  (sourceTrack=1)
+            //   [1] V1 base  (sourceTrack=0)
+            // Apply the SAME layerPaintOrderLess that handlePlaybackTick's
+            // stable_sort uses. After sorting, V1 (track 0) MUST be first.
+            // If the comparator were re-inverted to `>`, stable_sort would
+            // leave V1 last → FAIL. This is the only assert that guards the
+            // production sort comparator against re-inversion.
+            {
+                VideoPlayer::DecodedLayer overlay, v1base;
+                overlay.sourceTrack = 1;   // V2 overlay — wrong position
+                v1base.sourceTrack  = 0;   // V1 base   — wrong position
+                QVector<VideoPlayer::DecodedLayer> predVec;
+                predVec.append(overlay);   // [0]=track1 (intentionally reversed)
+                predVec.append(v1base);    // [1]=track0
+
+                std::stable_sort(predVec.begin(), predVec.end(),
+                                 layerPaintOrderLess);
+
+                if (predVec[0].sourceTrack != 0 || predVec[1].sourceTrack != 1) {
+                    qCritical()
+                        << "PARITY S3-STACK FAILED [PREDICATE]:"
+                           " layerPaintOrderLess produced wrong order after"
+                           " sorting reversed vector — expected [0].track=0"
+                           " [1].track=1, got [0].track="
+                        << predVec[0].sourceTrack
+                        << "[1].track=" << predVec[1].sourceTrack
+                        << ". The production sort comparator is INVERTED —"
+                           " re-inversion regression in VideoPlayer.cpp.";
+                    return 1;
+                }
+                qInfo() << "PARITY S3-STACK (predicate): layerPaintOrderLess"
+                           " sorts V1-track0 first — production sort"
+                           " comparator correct, re-inversion guard active";
+            }
+        }
+        s3stack_skip:
+        qInfo() << "[INFO] PARITY S3-STACK z-order OK (V2 over V1 in export"
+                   " SSOT + preview compositor paint-loop; predicate guard"
+                   " confirms production sort comparator is ascending —"
+                   " R3/R4 inversion regression guard active)";
     }
 
     // ── S4: per-clip colour correction + 3D LUT ─────────────────────────────

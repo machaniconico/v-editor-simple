@@ -604,7 +604,6 @@ public:
     QHash<QString, TimelineTrackMatteEntry> trackMatteEntries() const {
         return m_trackMatteEntries;
     }
-
 signals:
     void clipSelected(int index);
     // V3 sprint — track-aware overload. emitted alongside the int-only

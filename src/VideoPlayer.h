@@ -381,22 +381,31 @@ private:
     TrackDecoder *acquireDecoderForClip(const PlaybackEntry &entry);
     void releaseDecoderForClip(const TrackKey &key);
 
+public:
     // ---- Phase 1d software compositor ---------------------------------------
     // One overlay layer harvested from a V2+ TrackDecoder for the current
     // tick. composeMultiTrackFrame paints these on top of the V1 frame in
     // m_sequence order (V1 base + V2/V3/... above), with isFresh=false
     // entries falling back to the previous decoded frame from the eviction
     // grace pool when a re-seek hasn't caught up yet.
+    //
+    // Public so that layerPaintOrderLess (the sort comparator extracted for
+    // testability) can be declared as a free function below and used in
+    // the S3-STACK predicate sub-assertion in src/main.cpp without exposing
+    // the full private compositor surface.
     struct DecodedLayer {
         QImage rgb;
         double opacity = 1.0;
         double videoScale = 1.0;
         double videoDx = 0.0;
         double videoDy = 0.0;
+        double rotation2DDegrees = 0.0;
         int sourceTrack = 0;
         int sequenceIdx = -1;
         bool isFresh = true;
     };
+
+private:
 
     QImage composeMultiTrackFrame(const QImage &v1Frame,
                                   const QVector<DecodedLayer> &overlayLayers) const;
@@ -637,3 +646,13 @@ private:
     int m_tickTraceCount = 0;
     void recordTickTrace(qint64 workNs);
 };
+
+// Free comparator used by the production sort (std::stable_sort in
+// handlePlaybackTick) AND directly exercised by the S3-STACK predicate
+// sub-assertion in src/main.cpp. Extracted from the inline lambda so a
+// re-inversion of the comparator breaks the selftest loudly.
+// Contract: V1 (sourceTrack==0) sorts BEFORE higher tracks, so the
+// compositor paints V1 first (base) and overlays on top — ascending order
+// matches renderFrameAt / trackmatte::composite / buildSpecialClipComposite.
+bool layerPaintOrderLess(const VideoPlayer::DecodedLayer &a,
+                         const VideoPlayer::DecodedLayer &b);

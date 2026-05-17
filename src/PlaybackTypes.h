@@ -39,6 +39,10 @@ struct PlaybackEntry {
     double videoScale = 1.0;
     double videoDx = 0.0;
     double videoDy = 0.0;
+    double rotation2DDegrees = 0.0; // == ClipInfo::rotation2DDegrees, carried so
+                                    // the compositor can place layers via the
+                                    // clipgeom SSOT (rotate step) identically
+                                    // to the export path.
     double opacity = 1.0;        // PiP alpha, propagated from ClipInfo::opacity
     double volume = 1.0;         // Per-clip audio gain (0.0-2.0), propagated from ClipInfo::volume
     int sourceClipIndex = -1;    // Index into TimelineTrack::m_clips

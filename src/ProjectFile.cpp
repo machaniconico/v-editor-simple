@@ -72,7 +72,49 @@ QImage imageFromPngBase64(const QString &encoded)
     return image.isNull() ? QImage() : image.convertToFormat(QImage::Format_Grayscale8);
 }
 
-static const int PROJECT_FORMAT_VERSION = 1;
+static const int PROJECT_FORMAT_VERSION = 2;
+
+// --- v1 -> v2 migration: clip pan offsets unit convention ---
+//
+// In format v1 the per-clip videoDx/videoDy were persisted in *pixels*
+// (written by the old motion path, magnitude up to ~10000). From v2 they
+// are a NORMALIZED fraction of canvas (canonical range +-5). When loading a
+// project whose stored version is < 2 we must convert the stale pixel values
+// back to the normalized convention so old projects render identically.
+//
+// Heuristic: the canonical normalized range is bounded +-5, so any persisted
+// |videoDx|>5 (or |videoDy|>5) is unambiguously a stale pixel value and is
+// divided by the canvas width (height). Values within +-5 are already
+// normalized and left untouched. The single accepted imperfection: a genuine
+// sub-5px pixel offset is kept as-is (treated as a ~0 normalized value). That
+// is visually negligible, and it already rendered that way before the unit
+// fix, so this migration neither improves nor worsens that rare case.
+//
+// rotation2DDegrees is unit-stable across v1/v2 and is deliberately NOT
+// touched here.
+static void migrateClipOffsetsToNormalized(ProjectData &data, int storedVersion)
+{
+    if (storedVersion >= 2)
+        return; // v2+ projects already store normalized values verbatim
+
+    const double w = static_cast<double>(data.config.width);
+    const double h = static_cast<double>(data.config.height);
+    if (w <= 0.0 || h <= 0.0)
+        return; // defensive: cannot normalize against a degenerate canvas
+
+    auto migrateTracks = [&](QVector<QVector<ClipInfo>> &tracks) {
+        for (auto &track : tracks) {
+            for (auto &clip : track) {
+                if (std::abs(clip.videoDx) > 5.0)
+                    clip.videoDx /= w;
+                if (std::abs(clip.videoDy) > 5.0)
+                    clip.videoDy /= h;
+            }
+        }
+    };
+    migrateTracks(data.videoTracks);
+    migrateTracks(data.audioTracks);
+}
 
 bool ProjectFile::save(const QString &filePath, const ProjectData &data)
 {
@@ -350,6 +392,11 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.config = configFromJson(root["config"].toObject());
     data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
     data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
+
+    // v1 -> v2: convert stale pixel-convention clip pan offsets. Runs after
+    // config (canvas resolution) and tracks are loaded; no-op for version>=2.
+    migrateClipOffsetsToNormalized(data, root["version"].toInt(1));
+
     data.playheadPos = root["playheadPos"].toDouble();
     data.markIn = root["markIn"].toDouble(-1.0);
     data.markOut = root["markOut"].toDouble(-1.0);
@@ -840,6 +887,11 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.config = configFromJson(root["config"].toObject());
     data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
     data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
+
+    // v1 -> v2: convert stale pixel-convention clip pan offsets. Runs after
+    // config (canvas resolution) and tracks are loaded; no-op for version>=2.
+    migrateClipOffsetsToNormalized(data, root["version"].toInt(1));
+
     data.playheadPos = root["playheadPos"].toDouble();
     data.markIn = root["markIn"].toDouble(-1.0);
     data.markOut = root["markOut"].toDouble(-1.0);

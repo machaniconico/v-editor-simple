@@ -44,6 +44,7 @@
 #include "CaptionEditorDialog.h"
 #include "SocialPreset.h"
 #include "AspectReframer.h"
+#include "ClipGeometry.h"
 
 // US-INT-1: Sprint 16 — モバイルエクスポート + 取り込みハブ (optional includes)
 #if __has_include("MobileExportDialog.h")
@@ -549,22 +550,18 @@ QImage renderCompositeImage(const QImage &source, const CompositeLayer &layer, c
         image = image.scaled(canvasSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
     }
 
-    QImage canvas(canvasSize, QImage::Format_ARGB32);
-    canvas.fill(Qt::transparent);
-
-    QPainter painter(&canvas);
-    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
-
-    QTransform transform;
-    transform.translate(layer.position.x(), layer.position.y());
-    transform.translate(layer.anchorPoint.x(), layer.anchorPoint.y());
-    transform.rotate(layer.rotation);
-    transform.scale(layer.scale.x(), layer.scale.y());
-    transform.translate(-layer.anchorPoint.x(), -layer.anchorPoint.y());
-    painter.setTransform(transform);
-    painter.drawImage(0, 0, image);
-    painter.end();
-    return canvas;
+    // SSOT: place the layer through the canonical clipgeom contract so the
+    // special-clip preview uses the SAME normalized-dx/dy + canvas-center
+    // anchor + rotate->scale math as GLPreview and the export path. The
+    // CompositeLayer carries the raw ClipInfo transform values: position holds
+    // the NORMALIZED videoDx/videoDy fractions (not pixels), scale.x() the
+    // uniform videoScale, rotation the rotation2DDegrees.
+    clipgeom::ClipTransform xf;
+    xf.videoScale  = layer.scale.x();
+    xf.videoDx     = layer.position.x();
+    xf.videoDy     = layer.position.y();
+    xf.rotationDeg = layer.rotation;
+    return clipgeom::renderLayer(image, xf, canvasSize, /*smooth=*/true);
 }
 
 #ifdef HAVE_DAVINCI_XML
@@ -3672,8 +3669,14 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             if (auto wigIt = m_clipWiggleParams.constFind(clipId);
                 wigIt != m_clipWiggleParams.cend() && wigIt.value().enabled) {
                 const wiggle::WiggleOffset off = wiggle::evaluate(wigIt.value(), localSeconds);
-                posX += off.positionOffset.x();
-                posY += off.positionOffset.y();
+                // wiggle::positionOffset is in PIXELS; posX/posY are NORMALIZED
+                // canvas fractions (canonical clipgeom contract). Convert the
+                // pixel offset to the same normalized space before summing so
+                // wiggle keeps its visual magnitude under clipgeom placement.
+                if (canvasSize.width() > 0)
+                    posX += off.positionOffset.x() / canvasSize.width();
+                if (canvasSize.height() > 0)
+                    posY += off.positionOffset.y() / canvasSize.height();
                 layerRotation += off.rotationOffsetDeg;
                 layerScale *= off.scaleMultiplier;
             }
@@ -3684,10 +3687,18 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             active.layer.name = clip.displayName;
             active.layer.opacity = layerOpacity;
             active.layer.blendMode = BlendMode::Normal;
+            // Carry the RAW canonical transform fields (NOT a pixel offset):
+            // position = NORMALIZED videoDx/videoDy fractions of the canvas,
+            // scale.x() = uniform videoScale, rotation = rotation2DDegrees.
+            // renderCompositeImage feeds these straight into clipgeom, which
+            // owns the canvas-center anchor + translate->rotate->scale math —
+            // so the special-clip preview matches GLPreview/export exactly.
+            // (posX/posY already incorporate normalized expression + wiggle
+            // offsets layered on clip.videoDx/clip.videoDy above.)
             active.layer.position = QPointF(posX, posY);
             active.layer.scale = QPointF(layerScale, layerScale);
             active.layer.rotation = layerRotation;
-            active.layer.anchorPoint = QPointF(canvasSize.width() / 2.0, canvasSize.height() / 2.0);
+            active.layer.anchorPoint = QPointF(0.0, 0.0);
             active.layer.zOrder = trackIdx;
             active.layer.inPoint = clipStart;
             active.layer.outPoint = clipEnd;

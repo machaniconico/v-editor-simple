@@ -3104,8 +3104,11 @@ void Timeline::setClipMotion(int trackIdx, int clipIdx,
 
     ClipInfo &clip = clips[clipIdx];
     clip.videoScale = qBound(0.0, motion.scale, 10.0);
-    clip.videoDx = qBound(-10000.0, motion.dx, 10000.0);
-    clip.videoDy = qBound(-10000.0, motion.dy, 10000.0);
+    // videoDx/videoDy are stored as NORMALIZED fractions of canvas W/H
+    // (same ±5.0 convention as setClipVideoTransform and all renderers).
+    // All callers pass already-normalized values — clamp only.
+    clip.videoDx = qBound(-5.0, motion.dx, 5.0);
+    clip.videoDy = qBound(-5.0, motion.dy, 5.0);
     clip.rotation2DDegrees = qBound(-360.0, motion.rotation2DDeg, 360.0);
     clip.opacity = qBound(0.0, motion.opacity, 1.0);
     clip.is3DLayer = motion.is3DLayer;
@@ -4933,6 +4936,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double videoScale = 1.0;
         double videoDx = 0.0;
         double videoDy = 0.0;
+        double rotation2DDegrees = 0.0;
         double opacity = 1.0;
         double volume = 1.0;
         QVector<AudioGainPoint> volumeEnvelope;
@@ -4973,6 +4977,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.videoScale = c.videoScale;
                 iv.videoDx = c.videoDx;
                 iv.videoDy = c.videoDy;
+                iv.rotation2DDegrees = c.rotation2DDegrees;
                 iv.opacity = c.opacity;
                 iv.volume = c.volume;
                 iv.volumeEnvelope = c.volumeEnvelope;
@@ -5104,6 +5109,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.videoScale = iv.videoScale;
         e.videoDx = iv.videoDx;
         e.videoDy = iv.videoDy;
+        e.rotation2DDegrees = iv.rotation2DDegrees;
         e.opacity = iv.opacity;
         e.volume = iv.volume;
         e.volumeEnvelope = iv.volumeEnvelope;
