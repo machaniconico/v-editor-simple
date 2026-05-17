@@ -9,6 +9,7 @@
 #include "MaskSystem.h"         // S7 — genuine MaskSystem::generateMaskImage/applyMask
 #include "MotionTracker.h"      // S7 — genuine TrackingResult::positionAtTime
 #include "TrackMatteBake.h"     // TM-3 — shared SSOT track-matte compositor
+#include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
                                 // TM-8 — track-matte wiring is now read from
                                 // Timeline::trackMatteEntries() (no MainWindow
                                 // include, no #define private public, no
@@ -540,7 +541,9 @@ int activeClipOnTrack(const QVector<ClipInfo> &clips, double targetSec,
 
 QString renderClipId(int trackIdx, int clipIdx)
 {
-    return QStringLiteral("%1:%2").arg(trackIdx).arg(clipIdx);
+    // RM-1.1: same shared formula as MainWindow::brushClipId and
+    // RenderQueue's carrier loop (src/TrackMatteKey.h) — cannot drift.
+    return trackMatteClipKey(trackIdx, clipIdx);
 }
 
 // TM-8: the track-matte wiring is now intrinsic to the Timeline. Both
@@ -553,11 +556,17 @@ QString renderClipId(int trackIdx, int clipIdx)
 // kills the C2 data race AND the C1 edit≠export divergence (the parentless
 // export Timeline previously returned nullptr here → matte silently
 // dropped). The QHash is keyed by "trackIdx:clipIdx" (== renderClipId).
-const QHash<QString, TimelineTrackMatteEntry> *trackMatteClipEntriesForTimeline(const Timeline *timeline)
+//
+// RM-3: returns the QHash BY VALUE (a cheap Qt COW snapshot). The old
+// signature returned a pointer into the live Timeline member; with
+// Timeline::trackMatteEntries() now returning by value that would dangle,
+// and more importantly a worker-thread reader must not alias a hash the
+// GUI thread may be reassigning. The caller binds the snapshot to a local.
+QHash<QString, TimelineTrackMatteEntry> trackMatteClipEntriesForTimeline(const Timeline *timeline)
 {
     if (!timeline)
-        return nullptr;
-    return &timeline->trackMatteEntries();
+        return {};
+    return timeline->trackMatteEntries();
 }
 
 QImage renderOverlayLayerImage(const QImage &rgb, double videoScale,
@@ -756,19 +765,31 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         renderLayers.append(renderLayer);
     }
 
-    if (const auto *trackMatteEntries = trackMatteClipEntriesForTimeline(timeline);
-        trackMatteEntries && !trackMatteEntries->isEmpty()) {
+    // RM-3: bind the carrier snapshot to a LOCAL value (Timeline::
+    // trackMatteEntries() now returns by value) so this worker thread
+    // never aliases a hash the GUI thread may be reassigning.
+    if (const QHash<QString, TimelineTrackMatteEntry> trackMatteEntries =
+            trackMatteClipEntriesForTimeline(timeline);
+        !trackMatteEntries.isEmpty()) {
         QHash<QString, int> indexByClipId;
         for (int i = 0; i < renderLayers.size(); ++i)
             indexByClipId.insert(renderLayers[i].clipId, i);
 
         for (int i = 0; i < renderLayers.size(); ++i) {
-            const auto it = trackMatteEntries->constFind(renderLayers[i].clipId);
-            if (it == trackMatteEntries->cend())
+            const auto it = trackMatteEntries.constFind(renderLayers[i].clipId);
+            if (it == trackMatteEntries.cend())
+                continue;
+            const int srcIdx =
+                indexByClipId.value(it.value().matteSourceClipId, -1);
+            // RM-3: renderLayers[0] is the V1 base. A malformed / hand-
+            // edited matteSourceClipId that resolves to the base (or to
+            // this same layer, or to nothing) must be IGNORED — leave the
+            // layer matte-free so it composites normally rather than
+            // matte'ing against the base and blanking the frame.
+            if (srcIdx <= 0 || srcIdx == i)
                 continue;
             renderLayers[i].layer.matteType = it.value().matteType;
-            renderLayers[i].layer.matteSourceLayerIndex =
-                indexByClipId.value(it.value().matteSourceClipId, -1);
+            renderLayers[i].layer.matteSourceLayerIndex = srcIdx;
         }
     }
 

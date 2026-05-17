@@ -221,6 +221,7 @@
 #include "SmartReframeDialog.h"
 #include "LoudnessAnalyzer.h"
 #include "TrackMatteBake.h"
+#include "TrackMatteKey.h"
 #include "SubtitleTrackRenderer.h"
 #include "LoudnessPanel.h"
 #include "ParticleEffectDialog.h"
@@ -689,6 +690,10 @@ void syncTrackMatteEntriesToTimeline(
     timeline->setTrackMatteEntries(out);
 }
 
+// RM-1.2 / RM-4: snapshotTrackClips and remapTrackMatteEntriesAfterMutation
+// are defined in TrackMatteKey.cpp (hoisted for testability). The types
+// ClipKeyId and TrackClipSnapshot are declared in TrackMatteKey.h.
+
 } // namespace
 
 MainWindow::MainWindow(QWidget *parent)
@@ -872,7 +877,9 @@ double MainWindow::currentPlayheadSeconds() const
 
 QString MainWindow::brushClipId(int trackIdx, int clipIdx)
 {
-    return QStringLiteral("%1:%2").arg(trackIdx).arg(clipIdx);
+    // RM-1.1: single shared formula (src/TrackMatteKey.h) so the GUI map
+    // key can never drift from renderClipId / RenderQueue's carrier key.
+    return trackMatteClipKey(trackIdx, clipIdx);
 }
 
 void MainWindow::setBrushAnimationEntries(const QVector<BrushAnimationEntry> &entries)
@@ -4316,6 +4323,13 @@ void MainWindow::exportVideo()
     connect(progress, &QProgressDialog::canceled, m_renderQueue,
             &RenderQueue::stop);
 
+    // RM-1.3: this is a job.timeline != nullptr path — RenderQueue's
+    // resolveTimeline early-returns before its persisted-project matte
+    // population, so the live Timeline's matte carrier MUST be current
+    // here or the export silently drops every track matte. Re-sync the
+    // GUI map onto m_timeline immediately before submission so an edit
+    // made after the last configure-matte/load is reflected.
+    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Exporting: " + exportCfg.outputPath);
     m_renderQueue->addJob(job);
     m_renderQueue->start();
@@ -4323,7 +4337,12 @@ void MainWindow::exportVideo()
 
 void MainWindow::splitClip()
 {
+    // RM-1.2: remap positional matte keys across the clip-index shift.
+    TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
     m_timeline->splitAtPlayhead();
+    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries,
+                                        snap);
+    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Split clip at playhead");
     updateEditActions();
 }
@@ -4331,7 +4350,12 @@ void MainWindow::splitClip()
 void MainWindow::deleteClip()
 {
     if (!m_timeline->hasSelection()) return;
+    // RM-1.2: drop matte entries for the removed clip + reindex survivors.
+    TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
     m_timeline->deleteSelectedClip();
+    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries,
+                                        snap);
+    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Deleted clip");
     updateEditActions();
 }
@@ -4339,7 +4363,12 @@ void MainWindow::deleteClip()
 void MainWindow::rippleDelete()
 {
     if (!m_timeline->hasSelection()) return;
+    // RM-1.2: same as deleteClip — Timeline reindexes, matte keys must follow.
+    TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
     m_timeline->rippleDeleteSelectedClip();
+    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries,
+                                        snap);
+    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Ripple deleted clip");
     updateEditActions();
 }
@@ -4353,7 +4382,14 @@ void MainWindow::copyClip()
 
 void MainWindow::pasteClip()
 {
+    // RM-1.2: paste inserts a clip → downstream indices shift; matte keys
+    // for clips after the insertion point must be bumped. The pasted clip
+    // itself is new and carries no matte entry (unmatched → no remap).
+    TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
     m_timeline->pasteClip();
+    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries,
+                                        snap);
+    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Pasted clip");
     updateEditActions();
 }
@@ -8070,6 +8106,10 @@ void MainWindow::onMobileExport()
                             });
                     connect(progress, &QProgressDialog::canceled,
                             m_renderQueue, &RenderQueue::stop);
+                    // RM-1.3: job.timeline != nullptr path — same carrier
+                    // re-sync requirement as File→Export above.
+                    syncTrackMatteEntriesToTimeline(
+                        m_timeline, m_trackMatteClipEntries);
                     statusBar()->showMessage(
                         QStringLiteral("モバイル書き出し: ") + cfg.outputPath);
                     m_renderQueue->addJob(job);
@@ -9918,7 +9958,14 @@ void MainWindow::openRenderQueueDialog()
                 static_cast<qint64>(m_timeline->totalDuration() * 1000000.0);
             m_renderQueueDialog->setDefaultTimelineRange(0, totalUs);
         }
+        // RM-1.4: let blank-source ("current project") queue entries
+        // carry the live edit-graph instead of resolving to nullptr.
+        m_renderQueueDialog->setLiveTimeline(m_timeline);
     }
+    // RM-1.4/RM-1.3: keep the live Timeline's matte carrier current so a
+    // "current project" queue job exports the same track matte the GUI
+    // preview shows (the dialog has no save step before submitting).
+    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     m_renderQueueDialog->show();
     m_renderQueueDialog->raise();
     m_renderQueueDialog->activateWindow();

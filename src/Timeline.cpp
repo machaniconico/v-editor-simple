@@ -1,4 +1,5 @@
 #include "Timeline.h"
+#include "TrackMatteKey.h"
 #include "ProxyManager.h"
 #include "UndoManager.h"
 #include "AudioMixer.h"
@@ -2968,6 +2969,8 @@ void Timeline::splitAtPlayhead()
 
 void Timeline::deleteSelectedClip()
 {
+    // RM-5: snapshot carrier keys BEFORE the delete so we can remap after.
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
     bool anyRemoved = false;
     // Walk every track and remove its selected clips (descending so indices
     // stay valid). Preserve downstream positions — we want the rest of the
@@ -2986,6 +2989,7 @@ void Timeline::deleteSelectedClip()
     for (auto *t : m_videoTracks) deleteFrom(t);
     for (auto *t : m_audioTracks) deleteFrom(t);
     if (anyRemoved) {
+        remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
         saveUndoState("Delete clip");
         updateInfoLabel();
     }
@@ -4632,6 +4636,44 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         [this, track](int /*insertIdx*/, int linkGroup, double dropTime) {
             handleCrossTrackLinkedDrop(track, linkGroup, dropTime);
         });
+    // RM-5: remap Timeline's carrier when clips are reordered within a track.
+    // clipMoved supplies (fromIndex, toIndex) after the mutation. Because
+    // moveClip is a pure permutation we can derive the exact old→new index map
+    // by direct arithmetic — no pre-mutation snapshot is needed:
+    //   clip at `from` → `to`
+    //   clips in [from+1..to] (if from<to) shift to [from..to-1]  (down by 1)
+    //   clips in [to..from-1] (if from>to) shift to [to+1..from]  (up by 1)
+    connect(track, &TimelineTrack::clipMoved, this,
+        [this, track](int fromIdx, int toIdx) {
+            if (m_trackMatteEntries.isEmpty()) return;
+            const int t = m_videoTracks.indexOf(track);
+            if (t < 0) return;   // audio track — no matte entries
+            // Build old→new index map for track t only.
+            QHash<QString, QString> oldToNew;
+            oldToNew.insert(trackMatteClipKey(t, fromIdx),
+                            trackMatteClipKey(t, toIdx));
+            if (fromIdx < toIdx) {
+                for (int i = fromIdx + 1; i <= toIdx; ++i)
+                    oldToNew.insert(trackMatteClipKey(t, i),
+                                    trackMatteClipKey(t, i - 1));
+            } else {
+                for (int i = toIdx; i < fromIdx; ++i)
+                    oldToNew.insert(trackMatteClipKey(t, i),
+                                    trackMatteClipKey(t, i + 1));
+            }
+            // Rewrite every affected entry.
+            QHash<QString, TimelineTrackMatteEntry> rebuilt;
+            rebuilt.reserve(m_trackMatteEntries.size());
+            for (auto it = m_trackMatteEntries.cbegin();
+                 it != m_trackMatteEntries.cend(); ++it) {
+                const QString newKey = oldToNew.value(it.key(), it.key());
+                TimelineTrackMatteEntry e = it.value();
+                e.matteSourceClipId = oldToNew.value(
+                    e.matteSourceClipId, e.matteSourceClipId);
+                rebuilt.insert(newKey, e);
+            }
+            m_trackMatteEntries = rebuilt;
+        });
 }
 
 void Timeline::captureLinkedDragPartners(TimelineTrack *source, int clipIdx)
@@ -4706,6 +4748,8 @@ void Timeline::clearLinkedDragState()
 void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime)
 {
     if (linkGroup <= 0 || !destTrack) return;
+    // RM-5: snapshot before the cross-track remove+insert changes clip indices.
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
 
     // Determine if dest is a video or audio track, and its index
     int destVideoIdx = m_videoTracks.indexOf(destTrack);
@@ -4758,6 +4802,8 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
 
             srcPartnerTrack->removeClipPreservingDownstream(ci);
             targetTrack->insertClipPreservingDownstream(plan.insertIdx, partnerClip, plan.newLeadIn);
+            // RM-5: remap carrier after cross-track move changed clip indices.
+            remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
             return;  // Only one partner per linkGroup on the other track type
         }
     }

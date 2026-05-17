@@ -64,6 +64,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/TextOverlayBake.cpp
     src/TrackMatteBake.h
     src/TrackMatteBake.cpp
+    src/TrackMatteKey.h
+    src/TrackMatteKey.cpp
     src/CodecDetector.cpp
     src/UndoManager.cpp
     src/Overlay.cpp

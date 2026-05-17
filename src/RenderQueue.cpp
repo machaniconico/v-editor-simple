@@ -2,6 +2,7 @@
 #include "TimelineFrameRenderer.h"
 #include "ProjectFile.h"
 #include "Timeline.h"
+#include "TrackMatteKey.h"
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -1088,11 +1089,15 @@ QString RenderQueue::findFFmpegBinary()
 
 // Resolve the Timeline a job renders. Priority:
 //   1. job.timeline (the additive in-memory seam) — used as-is, not owned.
+//      RM-1.5: track-matte wiring for THIS branch is NOT populated here —
+//      the producer must have synced the live Timeline's matte carrier
+//      (syncTrackMatteEntriesToTimeline) before submitting the job.
 //   2. ProjectFile::load(job.projectFilePath) into a fresh heap Timeline via
 //      the genuine Timeline::restoreFromProject path (the same call
 //      MainWindow::applyLoadedProjectData uses, MainWindow.cpp:3982). The
 //      returned Timeline is heap-owned; *ownedOut carries it so the caller
-//      deletes it after the render.
+//      deletes it after the render. Only THIS branch populates the matte
+//      carrier from persisted ProjectData (see the block below).
 Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
                                        Timeline **ownedOut)
 {
@@ -1115,25 +1120,42 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
                            data.playheadPos, data.markIn, data.markOut,
                            data.zoomLevel);
 
-    // TM-8: this parentless heap Timeline is the queue / file / batch
-    // export path. The SSOT renderFrameAt no longer walks QObject parents
-    // to a live MainWindow for track-matte wiring (it has none here — that
-    // was the C1 silent-drop: matte rendered in preview, vanished on this
-    // export path). Populate the Timeline's own intrinsic matte carrier
-    // straight from the persisted ProjectData so this export path applies
-    // the EXACT same track matte the GUI preview shows. ProjectData's
-    // QVector<TrackMatteClipEntry> is keyed by entry.clipId ==
-    // MainWindow::brushClipId("track:clip") == tlrender::renderClipId —
-    // the exact key trackMatteClipEntriesForTimeline's consumer expects.
+    // RM-1.5: this branch is reached ONLY for a parentless project-FILE
+    // load (job.timeline == nullptr). The job.timeline != nullptr paths
+    // (File→Export MainWindow.cpp, mobile export, the live-Timeline batch
+    // overload) early-return above at `if (job.timeline)` and therefore
+    // DEPEND on the producer having synced the live Timeline's matte
+    // carrier before submitting the job (RM-1.3 — MainWindow calls
+    // syncTrackMatteEntriesToTimeline right before addJob). This block
+    // does NOT cover those paths. Here we populate the freshly-rebuilt
+    // Timeline's intrinsic matte carrier straight from the persisted
+    // ProjectData so a file-path export applies the EXACT same track
+    // matte the GUI preview showed. ProjectData's
+    // QVector<TrackMatteClipEntry> is keyed by entry.clipId, written by
+    // MainWindow::brushClipId == trackMatteClipKey (src/TrackMatteKey.h);
+    // we re-canonicalise each parseable "track:clip" id through the
+    // shared key so a hand-edited / legacy project can't desync the
+    // consumer (tlrender::renderClipId uses the same formula).
     QHash<QString, TimelineTrackMatteEntry> matteEntries;
     matteEntries.reserve(data.trackMatteClipEntries.size());
+    auto canonicalKey = [](const QString &raw) -> QString {
+        const int colon = raw.indexOf(QLatin1Char(':'));
+        if (colon <= 0)
+            return raw;
+        bool okT = false, okC = false;
+        const int t = raw.left(colon).toInt(&okT);
+        const int c = raw.mid(colon + 1).toInt(&okC);
+        if (okT && okC && t >= 0 && c >= 0)
+            return trackMatteClipKey(t, c);
+        return raw;
+    };
     for (const TrackMatteClipEntry &entry : data.trackMatteClipEntries) {
         if (entry.clipId.isEmpty())
             continue;
         TimelineTrackMatteEntry e;
         e.matteType = entry.matteType;
-        e.matteSourceClipId = entry.matteSourceClipId;
-        matteEntries.insert(entry.clipId, e);
+        e.matteSourceClipId = canonicalKey(entry.matteSourceClipId);
+        matteEntries.insert(canonicalKey(entry.clipId), e);
     }
     tl->setTrackMatteEntries(matteEntries);
 

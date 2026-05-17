@@ -18,6 +18,7 @@
 #include "TextManager.h"
 #include "PlaybackTypes.h"
 #include "Overlay.h"
+#include "TrackMatteKey.h"
 #include "SnapEngine.h"
 #include "MarkerData.h"
 #include "SpeedRampData.h"
@@ -595,7 +596,12 @@ public:
     void setTrackMatteEntries(const QHash<QString, TimelineTrackMatteEntry> &entries) {
         m_trackMatteEntries = entries;
     }
-    const QHash<QString, TimelineTrackMatteEntry> &trackMatteEntries() const {
+    // RM-3: return BY VALUE (a cheap Qt copy-on-write snapshot), NOT a
+    // const reference. The RenderQueue worker thread reads this while the
+    // GUI thread may call setTrackMatteEntries(); handing back a reference
+    // let a reader observe a half-reassigned QHash (data race). A value
+    // return atomically detaches a stable snapshot for the reader.
+    QHash<QString, TimelineTrackMatteEntry> trackMatteEntries() const {
         return m_trackMatteEntries;
     }
 
